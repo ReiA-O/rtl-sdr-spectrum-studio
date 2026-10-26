@@ -157,11 +157,31 @@ impl DemoSource{
     }
 }
 
+fn normalized_library_path(path:PathBuf)->PathBuf {
+    // Canonical Windows paths carry the extended-length prefix required by
+    // LoadLibraryExW for long extraction folders, including environment overrides.
+    path.canonicalize().unwrap_or(path)
+}
 pub fn dll_path(project:&Path)->PathBuf {
-    std::env::var_os("STUDIO_RTLSDR_DLL").map(PathBuf::from).unwrap_or_else(||{
+    normalized_library_path(std::env::var_os("STUDIO_RTLSDR_DLL").map(PathBuf::from).unwrap_or_else(||{
         let portable=project.join("drivers/rtlsdr/rtlsdr.dll");
         if portable.is_file(){portable}else{project.join("tools/driver-setup-20261026/rtl-sdr-blog-V1.4.0/x64/rtlsdr.dll")}
-    })
+    }))
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+    #[test]
+    fn long_library_paths_are_normalized_without_loading_a_device() {
+        let root=std::env::temp_dir().join(format!("spectrum-dll-path-{}",std::process::id()));
+        let a=root.join("a".repeat(90));let b=a.join("b".repeat(90));let c=b.join("c".repeat(90));
+        std::fs::create_dir_all(&c).unwrap();let dll=c.join("rtlsdr.dll");std::fs::write(&dll,[]).unwrap();
+        assert!(dll.to_string_lossy().len()>260);
+        let normalized=normalized_library_path(dll.clone());assert_eq!(normalized,dll.canonicalize().unwrap());
+        #[cfg(windows)] assert!(normalized.to_string_lossy().starts_with(r"\\?\"));
+        std::fs::remove_file(dll).unwrap();for dir in [c,b,a,root]{std::fs::remove_dir(dir).unwrap();}
+    }
 }
 
 #[cfg(test)]mod tests{use super::*;#[test]fn integer_numeric_configuration_does_not_silently_revert(){assert_eq!(correction_ppm(&json!({"ppm":10.0})).unwrap(),10);assert_eq!(correction_ppm(&json!({"ppm":-12})).unwrap(),-12);assert!(correction_ppm(&json!({"ppm":0.5})).is_err());assert_eq!(device_index(&json!({})).unwrap(),0);assert!(device_index(&json!({"device_index":4294967296u64})).is_err());}}

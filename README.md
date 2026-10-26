@@ -14,6 +14,8 @@ RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観
 
 詳しい動作と制約は [SPEC.md](docs/SPEC.md) にあります。密度表示はソフトウェアのFFT集計であり、専用測定器の捕捉率・測定精度と同等という意味ではありません。
 
+継続確認が必要な点は [KNOWN_LIMITS.md](docs/KNOWN_LIMITS.md) に整理しています。
+
 ## 実行・ビルド
 
 配布用ZIPを使う場合は、Windows 10/11 x64と通常のブラウザーを用意し、ZIPをすべて書込み可能な場所へ展開して`start-studio.cmd`を開きます。Rust・Python・Node・Build Toolsの追加は不要です。別PCでは受信機のInterface 0用WinUSBドライバー設定が必要です。ドライバーの導入や受信開始は自動実行しません。
