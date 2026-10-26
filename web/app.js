@@ -1,0 +1,633 @@
+/* Local UI only. The receiver, validation, analysis and recording live on the server. */
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+  const clamp = (value, lo, hi) => Math.max(lo, Math.min(hi, value));
+  const num = id => Number($(id).value);
+  const mhz = hz => finite(hz) / 1e6;
+  const colors = ['#64d7ec','#e6bf70','#bc9ce4','#75d6a9','#e99aa6','#8cafea','#d5d78b','#7cc6bf'];
+  let state = null, frame = null, connectionError = false, actionInFlight = 0, preferredSource = null;
+  let fileData = {files: [], presets: []}, vfoSignature = '', userMarkerSignature = '', drag = null, hover = null;
+  let audioEnabled = false, audioContext = null, audioGain = null, audioSequence = 0, audioNextTime = 0;
+  let audioSources = [], lastAudioVfo = null, audioReceivedAt = 0;
+  let layout = {spectrum_ratio: .6, vfo_width: 340, bottom_ratio: .5};
+  let extraConditions = [], seenNotifications = new Set(), tuningTimer = null, frameFailures = 0, lastDeviceError = null;
+  let frameTimer = null, framePending = false, frameRefreshRequested = false;
+  let actionQueue = Promise.resolve(), stateEpoch = 0;
+  let userSelectionIntent, userSelectionGeneration = 0, userSelectionPending = false, userSelectionPromise = Promise.resolve(true);
+  let vfoSelectionIntent, vfoSelectionGeneration = 0, vfoSelectionPromise = Promise.resolve(true), canvasGestureTarget = 'empty';
+  const dirtyForms = new Set();
+
+  function toast(message, type = 'info', duration = 4800) {
+    if (!message) return;
+    const el = document.createElement('div'); el.className = `toast ${type}`; el.textContent = String(message);
+    $('toastRegion').append(el); setTimeout(() => el.remove(), duration);
+    while ($('toastRegion').children.length > 4) $('toastRegion').firstElementChild.remove();
+  }
+  function notice(message, type = 'warning') {
+    $('noticeText').textContent = String(message); $('noticeBar').className = `notice-bar ${type}`; $('noticeBar').hidden = !message;
+  }
+  function setValue(id, value, force = false) {
+    const el = $(id); if (!el || value === undefined || value === null) return;
+    if (!force && (document.activeElement === el || (el.form && dirtyForms.has(el.form.id)))) return;
+    if (el.type === 'checkbox') el.checked = Boolean(value); else el.value = String(value);
+  }
+  function asText(id, value) { const el = $(id); if (el) el.textContent = value; }
+  function dbText(value) { return Number.isFinite(Number(value)) && value !== null ? Number(value).toFixed(1) : '—'; }
+  function formatHz(hz, digits = 2) {
+    hz = finite(hz, NaN); if (!Number.isFinite(hz)) return '—';
+    const abs = Math.abs(hz); return abs >= 1e6 ? `${(hz/1e6).toFixed(digits)} MHz` : abs >= 1e3 ? `${(hz/1e3).toFixed(digits)} kHz` : `${hz.toFixed(digits)} Hz`;
+  }
+  function formatBytes(bytes) { return bytes >= 1e9 ? `${(bytes/1e9).toFixed(2)} GB` : bytes >= 1e6 ? `${(bytes/1e6).toFixed(1)} MB` : bytes >= 1e3 ? `${(bytes/1e3).toFixed(1)} kB` : `${finite(bytes)} B`; }
+  function inputLocked() { return Boolean(state && (state.locks?.input || state.trigger?.armed || state.recording?.iq_active || state.trigger?.recording)); }
+  function selectedVfo() { return (vfoSelectionIntent===undefined?null:state?.vfos?.find(v=>String(v.id)===String(vfoSelectionIntent))) || state?.vfos?.find(v => v.selected) || state?.vfos?.find(v => String(v.id) === String(state.selected_vfo_id)) || null; }
+  function wireId(id) { return state?.vfos?.find(v=>String(v.id)===String(id))?.id ?? id; }
+  function linkedVfo(id) { return id === '' ? null : wireId(id); }
+  function userMarkers() { return (state?.measurement?.manual_markers || []).filter(m=>m&&typeof m==='object'&&m.id!=null); }
+  function selectedUserMarker() { const id=userSelectionIntent===undefined?state?.measurement?.selected_user_marker_id:userSelectionIntent;return id==null?null:userMarkers().find(m=>String(m.id)===String(id)) || null; }
+  function userMarkerId(id) { return userMarkers().find(m=>String(m.id)===String(id))?.id ?? id; }
+  function isUserMarker(marker) { return marker?.kind==='user'; }
+  function markerLabel(marker,index=0) { return String(marker?.label || (isUserMarker(marker)?`U${marker.id}`:`A${marker?.rank || index+1}`)); }
+  function userMarkerSelected(marker) { return isUserMarker(marker)&&String(marker.id)===String(selectedUserMarker()?.id); }
+  function focusSpectrum() { $('spectrumCanvas').focus({preventScroll:true}); }
+  function redrawMarkerControls() { renderMeasurements(frame?.measurements || {});drawSpectrum(); }
+  function cancelPendingVfoTune() { clearTimeout(tuningTimer);delete $('spectrumCanvas').dataset.pendingFrequency;delete $('spectrumCanvas').dataset.pendingVfo; }
+  function selectUserMarker(id, options = {}) {
+    const target=id==null?null:userMarkerId(id),generation=++userSelectionGeneration;
+    if(target!=null)cancelPendingVfoTune();
+    userSelectionIntent=target;userSelectionPending=true;redrawMarkerControls();
+    const operation=action('user_marker_select',{id:target},{forceVfos:false});
+    const completion=operation.then(result=>{if(generation===userSelectionGeneration){userSelectionIntent=undefined;userSelectionPending=false;userSelectionPromise=Promise.resolve(true);redrawMarkerControls();if(result&&options.focus!==false)focusSpectrum();}return result;});
+    userSelectionPromise=completion;return completion;
+  }
+  function activateVfo(id, options = {}) {
+    const target=wireId(id),generation=++vfoSelectionGeneration,actual=state?.vfos?.find(v=>v.selected)?.id ?? state?.selected_vfo_id;
+    const needsClear=Boolean(selectedUserMarker()||userSelectionPending||state?.measurement?.selected_user_marker_id!=null);
+    vfoSelectionIntent=target;
+    const cleared=needsClear?selectUserMarker(null,{focus:false}):Promise.resolve(true);
+    const operation=String(actual)===String(target)?cleared:action('select_vfo',{id:target},{guard:()=>cleared});
+    const completion=operation.then(result=>{if(generation===vfoSelectionGeneration){vfoSelectionIntent=undefined;vfoSelectionPromise=Promise.resolve(true);if(result&&options.focus!==false)focusSpectrum();}return result;});
+    vfoSelectionPromise=completion;return completion;
+  }
+  async function userMarkerAction(name, extra = {}) { const marker=selectedUserMarker(),selection=userSelectionPromise;if(!marker)return null;return action(name,{id:marker.id,...extra},{forceVfos:false,guard:()=>selection}); }
+  async function seekUserPeak(direction) { const result=await userMarkerAction('user_marker_peak',{direction});if(result)focusSpectrum(); }
+  function levelUnit() { return state?.calibration?.unit === 'dBm' ? 'dBm' : 'dBFS'; }
+  function markerLevel(marker) { return marker?.[levelUnit() === 'dBm' ? 'level_dbm' : 'level_dbfs']; }
+  function validLevel(value) { return value !== null && value !== undefined && Number.isFinite(Number(value)); }
+  function renderCalibration(force = false) {
+    const c = state?.calibration || {}, absolute = c.valid === true && c.absolute_available === true, unit = levelUnit();
+    const option = $('levelUnit').querySelector('[value="absolute"]'); option.disabled = !absolute;
+    setValue('levelUnit', unit === 'dBm' ? 'absolute' : 'relative', force);
+    $('calibrationClear').disabled = !c.loaded;
+    $('calibrationStatus').className = `badge ${c.loaded && !absolute ? 'invalid' : absolute ? 'live' : ''}`;
+    asText('calibrationStatus', absolute ? '有効（条件一致）' : c.loaded ? '条件不一致' : '未読込');
+    asText('calibrationLabel', c.label || (c.loaded ? '校正情報を読み込み済み' : '校正情報は読み込まれていません'));
+    asText('calibrationReason', c.reason || (absolute ? '絶対レベルへ切り替えられます。' : '相対レベルで表示します。'));
+    asText('calibrationOffset', c.loaded && validLevel(c.offset_db) ? `${Number(c.offset_db).toFixed(3)} dB` : '—');
+    asText('referenceUnit', unit);
+    asText('levelUnitLabel', unit === 'dBm' ? '校正情報適用 dBm / RBW' : '相対 dBFS / RBW');
+    asText('densityUnitLabel', `${unit} / RBW`); asText('waterfallUnitLabel', `${unit} / RBW`);
+  }
+
+  async function getJson(path) {
+    const response = await fetch(path, {cache:'no-store'});
+    const json = await response.json();
+    if (!response.ok) throw new Error(json.error || `接続エラー (${response.status})`);
+    return json;
+  }
+  function action(name, data = {}, options = {}) {
+    actionInFlight++;stateEpoch++;updatePresetLoadState();
+    const operation=actionQueue.then(async()=>{if(options.guard&&!await options.guard())return null;return performAction(name,typeof data==='function'?data():data,options);});
+    const completion=operation.finally(()=>{actionInFlight--;stateEpoch++;updatePresetLoadState();});
+    actionQueue=completion.catch(()=>null);return completion;
+  }
+  async function performAction(name, data, options) {
+    try {
+      let response = await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:name, ...data})});
+      let json = await response.json();
+      if ((!response.ok || json.ok === false) && name === 'set_input' && Array.isArray(json.impacted_vfos) && json.impacted_vfos.length && !data.confirm_impacted) {
+        const names = json.impacted_vfos.map(v => typeof v === 'object' ? (v.name || `VFO ${v.id}`) : `VFO ${v}`).join('、');
+        if (window.confirm(`中心周波数を変更すると、${names} が取得帯域外になるため無効になります。変更しますか？`)) {
+          response = await fetch('/api/action', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:name, ...data, confirm_impacted:true})});
+          json = await response.json();
+        } else return null;
+      }
+      if (!response.ok || json.ok === false) throw new Error(json.error || json.message || `操作できません (${response.status})`);
+      if (options.form) dirtyForms.delete(options.form);
+      if (json.state) applyState(json.state, Boolean(options.forceState), options.forceVfos !== false); else await refreshState(Boolean(options.forceState),true);
+      requestFrame();
+      if (options.message) toast(options.message);
+      return json;
+    } catch (error) {
+      toast(error.message || String(error), 'error', 6500); return null;
+    }
+  }
+
+  function updateLinks(id, selected, force) {
+    const select = $(id); if (!select || (!force && (document.activeElement === select || (select.form && dirtyForms.has(select.form.id))))) return;
+    const old = selected ?? select.value;
+    const options = [{value:'', label:'独立した帯域'}, ...(state?.vfos || []).map(v => ({value:String(v.id), label:`VFO ${v.id} · ${mhz(v.frequency_hz).toFixed(4)} MHz`}))];
+    select.replaceChildren(...options.map(o => { const el = document.createElement('option'); el.value=o.value; el.textContent=o.label; return el; }));
+    select.value = old === null ? '' : String(old);
+  }
+  function applyState(next, force = false, forceVfos = false) {
+    if (!next || typeof next !== 'object') return;
+    const recovering=connectionError;
+    const previousUnit = levelUnit(); state = next; connectionError = false;
+    const levelChanged = previousUnit !== levelUnit();
+    if (levelChanged) { frame = null; requestFrame(); }
+    if(recovering&&$('noticeText').textContent.startsWith('アプリとの接続が切れています'))notice('');
+    const running = Boolean(state.running), replay = state.source === 'replay';
+    const i = state.input || {}, a = state.analysis || {}, d = state.display || {}, t = state.trigger || {}, m = state.measurement || {};
+    $('statusDot').className = `status-dot ${running ? 'running' : state.device?.error ? 'error' : ''}`;
+    asText('sessionStatus', replay ? (running ? 'IQを再生中' : 'IQ再生・停止中') : running ? '受信中' : '停止中');
+    $('sourceBadge').className = `badge ${replay ? 'replay' : running ? 'live' : ''}`;
+    asText('sourceBadge', replay ? 'REPLAY' : state.source === 'demo' ? 'DEMO' : 'LIVE');
+    asText('deviceName', state.device?.name || 'RTL-SDR');
+    asText('receiveLabel', running ? '停止' : replay ? '再生開始' : '受信開始'); asText('receiveIcon', running ? '■' : '▶');
+    $('receiveButton').className = `button ${running ? 'stopping' : 'primary'}`;
+    $('sourceSelect').disabled = running || replay;
+    if (!replay) { const source=state.source==='demo'?'demo':'live';if(running)preferredSource=source;setValue('sourceSelect',preferredSource || source,force); }
+    setValue('centerMHz', mhz(i.center_hz), force); setValue('spanMHz', mhz(d.span_hz ?? i.sample_rate), force);
+    setValue('fftMode', a.fft_mode || 'rbw', force); setValue('rbwHz', a.rbw_hz ?? a.target_rbw_hz ?? a.enbw_hz ?? 750, force);
+    setValue('fftSize', a.fft_size, force); setValue('refLevel', d.ref_level ?? a.ref_level, force || levelChanged); setValue('rangeDb', d.range_db ?? a.range_db, force);
+    setValue('gainDb', i.gain_db, force); setValue('agc', i.agc, force); setValue('ppm', i.ppm, force);
+    setValue('sampleRate', i.sample_rate, force); setValue('inputMode', i.mode || 'auto', force);
+    setValue('windowType', a.window, force); setValue('overlap', a.overlap, force); setValue('averageSeconds', a.average_seconds, force);
+    setValue('detector', a.detector ?? d.detector, force); setValue('densityMetric', a.density_metric, force); setValue('waterfallRowSeconds', a.waterfall_row_seconds ?? .1, force);
+    const traces = d.traces || {};
+    for (const [key, id] of Object.entries({live:'traceLive',max:'traceMax',min:'traceMin',avg:'traceAvg'})) setValue(id, traces[key] ?? (key === 'live'), force);
+    setValue('persistenceMode', a.persistence_mode, force); setValue('persistenceUnit', a.persistence_unit, force);
+    setValue('persistenceSeconds', a.persistence_seconds, force); setValue('persistenceFrames', a.persistence_frames, force);
+    setValue('switchPolicy', a.switch_policy, force); setValue('statsMode', a.stats_mode, force);
+    updateLinks('measurementLink', m.link_vfo, force); updateLinks('triggerLink', t.link_vfo, force);
+    setValue('measurementLowMHz', mhz(m.low_hz), force); setValue('measurementHighMHz', mhz(m.high_hz), force); setValue('obwPercent', m.obw_percent ?? 99, force);
+    setValue('markerCount', m.marker_count ?? 6, force); setValue('markerMode', m.marker_mode || 'auto', force); setValue('markerFollow', m.marker_follow ?? true, force); setValue('deltaReference', m.delta_reference ?? 0, force);
+    for (const [key,id] of Object.entries({mode:'triggerMode',metric:'triggerMetric',threshold_db:'thresholdDb',hysteresis_db:'hysteresisDb',pre_seconds:'preSeconds',post_seconds:'postSeconds',min_duration_s:'minDurationSeconds',rearm_s:'rearmSeconds',logic:'triggerLogic'})) setValue(id,t[key],force);
+    setValue('triggerLowMHz', mhz(t.low_hz), force); setValue('triggerHighMHz', mhz(t.high_hz), force);
+    if ((force || !dirtyForms.has('triggerForm')) && document.activeElement?.closest('#conditionList') === null) {
+      const nextConditions = Array.isArray(t.conditions) ? t.conditions : [];
+      if (JSON.stringify(extraConditions) !== JSON.stringify(nextConditions)) { extraConditions = nextConditions.map(c => ({...c})); renderConditions(); }
+    }
+    const locked = inputLocked(),centerLocked=locked || Boolean(state.locks?.center_sample_rate);
+    for (const id of ['gainDb','agc','ppm','inputMode','inputApply']) $(id).disabled = locked || replay;
+    for (const id of ['centerMHz','sampleRate']) $(id).disabled = centerLocked || replay;
+    $('lockIndicator').hidden = !centerLocked;
+    $('lockIndicator').textContent = locked ? 'IQ待機・保存中：入力条件をロック' : 'WAV録音中：中心周波数・サンプルレートをロック';
+    const actual = i.gain_actual_db ?? i.effective_gain_db ?? state.device?.gain_db_actual;
+    asText('gainActual', state.source==='demo' ? '実効 —（合成信号）' : i.agc ? '実効ゲイン：AGC' : actual==null ? '実効 —' : `${running?'実効':'最終実効'} ${finite(actual).toFixed(1)} dB`);
+    asText('iqBadge', state.recording?.iq_active || t.recording ? '記録中' : t.armed ? 'ARMED' : '待機');
+    $('iqBadge').className = `badge ${state.recording?.iq_active || t.recording ? 'recording' : ''}`;
+    asText('iqButton', state.recording?.iq_active && !t.armed ? '■ IQ停止' : '● IQ保存');
+    $('iqButton').disabled = t.armed || (!running && !state.recording?.iq_active);
+    $('armButton').textContent = t.armed ? '待機解除' : 'トリガ待機'; $('armButton').classList.toggle('armed',Boolean(t.armed)); $('armButton').disabled = !running && !t.armed;
+    asText('triggerState', t.state || (t.armed ? '待機中' : 'Disarmed'));
+    asText('triggerPreAvailable', `プリバッファ ${finite(t.available_pre_seconds).toFixed(2)} s`);
+    asText('triggerSummary', `${t.metric === 'integrated' ? 'Power' : 'Peak'} / ${finite(t.threshold_db,-55).toFixed(1)} dBFS · ${t.mode === 'auto' ? 'Auto' : 'One-Shot'}`);
+    asText('recordingElapsed', state.recording?.elapsed_seconds != null ? `${finite(state.recording.elapsed_seconds).toFixed(1)} s` : '');
+    asText('triggerCapacity', `確保済みプリトリガ ${finite(t.available_pre_seconds).toFixed(3)} s ／ 設定 ${finite(t.pre_seconds).toFixed(2)} s。${locked ? '入力条件はロック中です。' : 'Arm開始から入力条件をロックします。'}`);
+    const perf = state.performance || {};
+    asText('processingStatus', `処理 ${perf.load_percent != null ? finite(perf.load_percent).toFixed(0)+'%' : perf.processing_ms != null ? finite(perf.processing_ms).toFixed(1)+' ms' : '—'}`);
+    asText('sampleCounter', `${finite(perf.valid_frames ?? perf.fft_frames ?? frame?.density?.valid_frames).toLocaleString()} FFT`);
+    asText('gapReadout', `欠落 ${finite(perf.dropped_samples ?? perf.gap_samples).toLocaleString()} samples`);
+    const actualMode=state.device?.mode_actual || i.mode;
+    const modeLabel=actualMode==='direct_q'?'Direct Q':actualMode==='direct_i'?'Direct I':actualMode==='auto'?'入力モード自動':'チューナー受信';
+    asText('footerStatus', state.device?.error ? `受信機：${state.device.error}` : replay ? '保存IQを再解析中 · ライブ受信とは排他' : running ? `${state.source === 'demo' ? '合成信号' : 'RTL-SDR'} · ${formatHz(state.device?.sample_rate ?? i.sample_rate,3).replace('Hz','S/s')} · ${i.mode==='auto'&&actualMode!=='auto'?'自動 → ':''}${modeLabel}` : '受信は停止中です');
+    const provisional=String(state.device?.usable_bandwidth_status || '').startsWith('provisional');
+    asText('receiverInfo', `${state.device?.name || 'RTL-SDR'} ／ ${state.device?.connected ? '接続確認済み' : '未接続または停止中'}。判定帯域 ${formatHz(state.device?.usable_bandwidth_hz ?? i.usable_bandwidth_hz ?? i.sample_rate,3)}${provisional?'（暫定）':''}。${modeLabel}。${locked ? '入力ロック中。' : ''}`);
+    $('replayPanel').hidden = !replay;
+    if (replay) {
+      const r = state.replay || {}; asText('replayName', r.name || r.path || '保存IQ');
+      $('replaySeek').max = finite(r.duration_seconds ?? r.total_seconds,1); setValue('replaySeek',r.position_seconds ?? 0,force);
+      asText('replayPosition',`${finite(r.position_seconds).toFixed(2)} s`); asText('replayDuration',`${finite(r.duration_seconds ?? r.total_seconds).toFixed(2)} s`);
+    }
+    if (state.layout && !drag?.layout) applyLayout(state.layout, false);
+    renderCalibration(force); renderVfos(force || forceVfos); renderMeasurements(frame?.measurements || {}); updateFftVisibility();updatePresetLoadState();
+    const pv = a.persistence_mode === 'off' ? 'OFF' : a.persistence_mode === 'infinite' ? 'Infinite' : a.persistence_mode === 'window' ? '時間窓' : '指数減衰';
+    asText('persistenceReadout',`${pv}${['off','infinite'].includes(a.persistence_mode) ? '' : ` · ${a.persistence_unit === 'frames' ? finite(a.persistence_frames).toLocaleString()+' FFT' : finite(a.persistence_seconds,1).toFixed(2)+' s'}`}`);
+    for (const item of state.notifications || []) {
+      const message = typeof item === 'string' ? item : item.message || item.text;
+      const key = typeof item === 'string' ? item : item.id ?? `${item.timestamp || ''}:${message}`;
+      if (!seenNotifications.has(key)) { seenNotifications.add(key); toast(message, item.level || item.type || 'info'); }
+    }
+    if (seenNotifications.size > 300) seenNotifications = new Set([...seenNotifications].slice(-150));
+    if (state.device?.error) notice(state.device.error, 'error');
+    else if(lastDeviceError&&$('noticeText').textContent===lastDeviceError)notice('');
+    lastDeviceError=state.device?.error || null;
+    const vfo = selectedVfo();
+    if (String(vfo?.id) !== String(lastAudioVfo)) { flushAudio(); audioSequence=0; lastAudioVfo=vfo?.id; }
+    updateAudioCaption();
+  }
+
+  function renderVfos(force = false) {
+    const vfos = state?.vfos || [];
+    for(const card of $('vfoList').querySelectorAll('[data-vfo]')) {
+      const v=vfos.find(item=>String(item.id)===card.dataset.vfo);if(!v)continue;
+      const rec=Boolean(v.wav_recording),stopped=v.enabled===false;
+      const selected=Boolean(v.selected||String(v.id)===String(state?.selected_vfo_id));
+      const status=card.querySelector('.vfo-state');if(status)status.textContent=stopped?'停止':state?.running?'復調中':'待機（有効）';
+      const record=card.querySelector('[data-vfo-action=record]');if(record){record.disabled=!rec&&(stopped||!state?.running);record.textContent=rec?'■ WAV停止':'● WAV';record.classList.toggle('active',rec);}
+      card.classList.toggle('selected',selected);card.classList.toggle('stopped',stopped);
+      const select=card.querySelector('[data-vfo-action=select]');if(select){select.classList.toggle('selected',selected);select.textContent=selected?'選択中':'選択';}
+    }
+    const signature = JSON.stringify({running:Boolean(state?.running),vfos:vfos.map(v => ({...v, audio_level:undefined, level_dbfs:undefined, sample_count:undefined}))});
+    if (!force && (signature === vfoSignature || document.activeElement?.closest('.vfo-card'))) return;
+    vfoSignature=signature;
+    if (!vfos.length) { $('vfoList').innerHTML='<div class="vfo-empty">「＋ VFO」で受信する局を追加</div>'; return; }
+    $('vfoList').innerHTML = vfos.map((v,index) => {
+      const active = Boolean(v.selected || String(v.id) === String(state.selected_vfo_id));
+      const stopped = v.enabled === false, rec=Boolean(v.wav_recording), vfoStatus=stopped?'停止':state?.running?'復調中':'待機（有効）';
+      return `<article class="vfo-card ${active?'selected':''} ${stopped?'stopped':''}" data-vfo="${escapeHtml(v.id)}"><header class="vfo-card-header"><div class="vfo-name"><span class="vfo-color" style="background:${colors[index%colors.length]}"></span><strong>VFO ${escapeHtml(v.id)}</strong>${rec?'<span class="badge recording">REC</span>':''}</div><div class="vfo-header-actions"><button class="vfo-select ${active?'selected':''}" data-vfo-action="select">${active?'選択中':'選択'}</button><button class="vfo-delete" data-vfo-action="delete" aria-label="VFO ${escapeHtml(v.id)}を削除">×</button></div></header><div class="vfo-fields"><label>局周波数<div class="input-unit"><input data-vfo-field="frequency" type="number" step="0.001" value="${mhz(v.frequency_hz).toFixed(6)}" aria-label="VFO ${escapeHtml(v.id)} 周波数"><span>MHz</span></div></label><label>復調<select data-vfo-field="mode" aria-label="VFO ${escapeHtml(v.id)} 復調方式">${['AM','NFM','WFM'].map(mode=>`<option ${v.mode===mode?'selected':''}>${mode}</option>`).join('')}</select></label><label>復調帯域幅<div class="input-unit"><input data-vfo-field="bandwidth" type="number" step="0.1" min="0.1" value="${(finite(v.bandwidth_hz)/1000).toFixed(2)}" aria-label="VFO ${escapeHtml(v.id)} 帯域幅"><span>kHz</span></div></label><label>状態<span class="vfo-state">${vfoStatus}</span></label></div><div class="vfo-actions"><button class="button" data-vfo-action="apply">適用</button><button class="button ${rec?'record active':'record'}" data-vfo-action="record" ${!rec&&(stopped||!state?.running)?'disabled':''}>${rec?'■ WAV停止':'● WAV'}</button>${stopped?'<button class="button" data-vfo-action="resume">再開</button>':''}<select data-vfo-field="wav-format" aria-label="WAV形式"><option value="PCM16" ${v.wav_format!=='PCM24'?'selected':''}>PCM16</option><option value="PCM24" ${v.wav_format==='PCM24'?'selected':''}>PCM24</option></select></div>${v.stopped_reason?`<div class="vfo-warning">${escapeHtml(v.stopped_reason)}</div>`:''}</article>`;
+    }).join('');
+  }
+  async function vfoAction(event) {
+    const button = event.target.closest('[data-vfo-action]'); if (!button) return;
+    const card=button.closest('[data-vfo]'), key=card.dataset.vfo;
+    const vfo=state?.vfos?.find(v=>String(v.id)===key); if (!vfo) return;
+    const id=vfo.id;
+    if(button.dataset.vfoAction!=='select'&&selectedUserMarker()&&!await selectUserMarker(null,{focus:false}))return;
+    switch(button.dataset.vfoAction) {
+      case 'select': flushAudio(); await activateVfo(id); break;
+      case 'delete': if (!vfo.wav_recording || confirm(`VFO ${id} の録音を終了して削除しますか？`)) await action('delete_vfo',{id}); break;
+      case 'resume': await action('resume_vfo',{id}); break;
+      case 'apply': {
+        const patch={frequency_hz: Number(card.querySelector('[data-vfo-field=frequency]').value)*1e6,bandwidth_hz:Number(card.querySelector('[data-vfo-field=bandwidth]').value)*1000,mode:card.querySelector('[data-vfo-field=mode]').value,wav_format:card.querySelector('[data-vfo-field=wav-format]').value};
+        await action('update_vfo',{id,patch}); break;
+      }
+      case 'record': {
+        if(vfo.wav_recording) await action('wav_stop',{id});
+        else { const r=await action('update_vfo',{id,patch:{wav_format:card.querySelector('[data-vfo-field=wav-format]').value}}); if(r) await action('wav_start',{id}); }
+        break;
+      }
+    }
+  }
+
+  function measurementMarkers(measurement = {}) {
+    const received=Array.isArray(measurement.markers)?measurement.markers:[];
+    return [...received.filter(m=>!isUserMarker(m)),...userMarkers().map(config=>{
+      const measured=received.find(m=>isUserMarker(m)&&String(m.id)===String(config.id));
+      const current=measured&&Math.abs(finite(measured.frequency_hz)-finite(config.frequency_hz))<.51?measured:null;
+      return {...(current || {}),kind:'user',id:config.id,label:`U${config.id}`,frequency_hz:config.frequency_hz,level_dbfs:current?.level_dbfs ?? null,level_dbm:current?.level_dbm ?? null,reason:current?.reason || (current?'':'測定値の更新待ち')};
+    })];
+  }
+  function renderUserMarkerControls(markers = []) {
+    const users=userMarkers(),selected=selectedUserMarker(),unit=levelUnit();
+    const signature=JSON.stringify(users.map(m=>({id:m.id,frequency_hz:m.frequency_hz,selected:String(m.id)===String(selected?.id)})));
+    if(signature!==userMarkerSignature){
+      userMarkerSignature=signature;
+      $('userMarkerList').innerHTML=users.length?users.map(m=>`<button class="user-marker-chip ${String(m.id)===String(selected?.id)?'selected':''}" data-user-marker-select="${escapeHtml(m.id)}" aria-pressed="${String(m.id)===String(selected?.id)}" aria-label="ユーザMarker U${escapeHtml(m.id)} を選択" title="${mhz(m.frequency_hz).toFixed(6)} MHz">U${escapeHtml(m.id)}</button>`).join(''):'<span class="muted">自動ピーク A / ユーザ U</span>';
+    }
+    for(const id of ['userMarkerDeselect','userMarkerPeakLeft','userMarkerPeakRight','userMarkerPeakMax','userMarkerDelete'])$(id).disabled=!selected;
+    $('userMarkerReadout').classList.toggle('selected',Boolean(selected));
+    $('userMarkerReadout').setAttribute('aria-busy',String(userSelectionPending));
+    if(selected){
+      const measured=markers.find(m=>isUserMarker(m)&&String(m.id)===String(selected.id));
+      const current=measured&&Math.abs(finite(measured.frequency_hz)-finite(selected.frequency_hz))<.51?measured:null;
+      asText('userMarkerName',`U${selected.id}`);
+      asText('userMarkerFrequency',`${mhz(selected.frequency_hz).toFixed(6)} MHz`);
+      asText('userMarkerLevel',`${dbText(markerLevel(current))} ${unit}`);
+      const offset=finite(selected.frequency_hz)-finite(state?.input?.center_hz);
+      asText('userMarkerOffset',`中心から Δf ${offset>=0?'+':''}${(offset/1000).toFixed(3)} kHz`);
+      asText('userMarkerStatus',userSelectionPending?'選択を切替中…':current?.reason || (current?'クリックで配置 · ← → は隣接Peak':'測定値の更新待ち'));
+      asText('plotModeHint',`U${selected.id} 操作：クリックで配置 / ← → で隣接Peak　VFOの「選択」ボタンでVFO操作へ`);
+    }else{
+      asText('userMarkerName','U 未選択');asText('userMarkerFrequency','周波数 — MHz');asText('userMarkerLevel',`レベル — ${unit}`);asText('userMarkerOffset','中心から Δf — kHz');asText('userMarkerStatus','追加または U をクリックして選択');
+      asText('plotModeHint','VFO：ドラッグ / ホイール / ← →　帯域幅：端をドラッグ　Shiftクリック：U追加');
+    }
+  }
+  function renderMeasurements(m = {}) {
+    const unit=levelUnit(),absolute=unit==='dBm';
+    $('channelPower').innerHTML=`${dbText(m[absolute?'cp_dbm':'cp_dbfs'])}<small>${unit}</small>`;
+    $('channelPowerAverage').innerHTML=`${dbText(m[absolute?'cp_avg_dbm':'cp_avg_dbfs'])}<small>${unit}</small>`;
+    $('obwValue').innerHTML=`${m.obw_hz!=null?(finite(m.obw_hz)/1000).toFixed(2):'—'}<small>kHz</small>`;
+    asText('obwLabel',`OBW ${finite(state?.measurement?.obw_percent,99)}%`);
+    const markers=measurementMarkers(m);
+    const delta=$('deltaReference'),labels=markers.length?markers.map(markerLabel):['A1'],count=labels.length;
+    if(Array.from(delta.options,o=>o.textContent).join('|')!==labels.join('|')&&document.activeElement!==delta){const chosen=delta.value;delta.replaceChildren(...labels.map((label,k)=>{const o=document.createElement('option');o.value=k;o.textContent=label;return o;}));delta.value=Number(chosen)<count?chosen:'0';}
+    $('markerReadout').innerHTML=markers.filter(p=>!isUserMarker(p)).slice(0,8).map((p,k)=>`<span class="auto-marker"><b>${escapeHtml(markerLabel(p,k))}</b>${mhz(p.frequency_hz).toFixed(5)} · ${dbText(markerLevel(p))}</span>`).join('');
+    const base=markers[finite(state?.measurement?.delta_reference)] || markers[0];
+    $('markerTable').innerHTML=markers.length?`<table><thead><tr><th>Marker</th><th>MHz</th><th>${unit}</th><th>中心Δ kHz</th><th>基準Δ kHz</th><th>Δ dB</th></tr></thead><tbody>${markers.map((p,k)=>`<tr class="${isUserMarker(p)?'user-marker-row':''} ${userMarkerSelected(p)?'selected-marker-row':''}"><td>${isUserMarker(p)?`<button class="marker-table-select" data-user-marker-select="${escapeHtml(p.id)}" aria-pressed="${userMarkerSelected(p)}">${escapeHtml(markerLabel(p,k))}</button>`:escapeHtml(markerLabel(p,k))}</td><td>${mhz(p.frequency_hz).toFixed(6)}</td><td>${dbText(markerLevel(p))}</td><td>${((finite(p.frequency_hz)-finite(state?.input?.center_hz))/1000).toFixed(3)}</td><td>${base?((p.frequency_hz-base.frequency_hz)/1000).toFixed(3):'—'}</td><td>${base&&validLevel(markerLevel(p))&&validLevel(markerLevel(base))?(markerLevel(p)-markerLevel(base)).toFixed(2):'—'}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">受信後にMarker値を表示します。</p>';
+    renderUserMarkerControls(markers);
+  }
+
+  function canvasSize(canvas) {
+    const rect=canvas.getBoundingClientRect(), ratio=Math.min(devicePixelRatio || 1,2);
+    const width=Math.max(2,Math.round(rect.width)),height=Math.max(2,Math.round(rect.height));
+    if(canvas.width!==Math.round(width*ratio)||canvas.height!==Math.round(height*ratio)){canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio);}
+    const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);return {ctx,width,height};
+  }
+  function plotAxes(canvas, levelAxis = true, limits = null) {
+    const s=canvasSize(canvas),{ctx,width,height}=s;
+    const p={left:levelAxis?54:43,right:13,top:15,bottom:29,width:0,height:0};p.width=Math.max(1,width-p.left-p.right);p.height=Math.max(1,height-p.top-p.bottom);
+    const center=finite(state?.input?.center_hz,32.256e6),span=finite(state?.display?.span_hz,state?.input?.sample_rate || 2.048e6);
+    const low=center-span/2,high=center+span/2,top=limits?limits.top:finite(state?.display?.ref_level,state?.analysis?.ref_level ?? -20),range=limits?limits.range:finite(state?.display?.range_db,state?.analysis?.range_db ?? 100);
+    ctx.fillStyle='#0b141c';ctx.fillRect(0,0,width,height);ctx.font='9px Consolas,monospace';ctx.lineWidth=1;ctx.strokeStyle='#20323f';ctx.fillStyle='#668499';
+    for(let k=0;k<=8;k++){const x=p.left+p.width*k/8;ctx.beginPath();ctx.moveTo(x+.5,p.top);ctx.lineTo(x+.5,p.top+p.height);ctx.stroke();ctx.textAlign='center';ctx.fillText(((low+span*k/8)/1e6).toFixed(span<100000?4:3),x,height-11);}
+    if(levelAxis) for(let k=0;k<=5;k++){const y=p.top+p.height*k/5;ctx.beginPath();ctx.moveTo(p.left,y+.5);ctx.lineTo(p.left+p.width,y+.5);ctx.stroke();ctx.textAlign='right';ctx.fillText((top-range*k/5).toFixed(0),p.left-8,y+3);}
+    ctx.textAlign='right';ctx.fillStyle='#4f7085';ctx.fillText('MHz',width-5,height-1);
+    return {...s,p,low,high,span,top,range,x:hz=>p.left+(hz-low)/span*p.width,y:db=>p.top+(top-db)/range*p.height};
+  }
+  function drawSpectrum() {
+    const c=$('spectrumCanvas'),s=plotAxes(c),{ctx,p}=s;
+    const spectrum=frame?.spectrum || {},freq=spectrum.f_hz || [];
+    $('spectrumEmpty').hidden=Boolean(freq.length);
+    const measurements=state?.measurement || {};
+    const roiLow=finite(measurements.low_hz,NaN),roiHigh=finite(measurements.high_hz,NaN);
+    ctx.save();ctx.beginPath();ctx.rect(p.left,p.top,p.width,p.height);ctx.clip();
+    if(Number.isFinite(roiLow)&&Number.isFinite(roiHigh)){ctx.fillStyle='#507a9b12';ctx.fillRect(s.x(roiLow),p.top,s.x(roiHigh)-s.x(roiLow),p.height);ctx.strokeStyle='#678ea04d';ctx.setLineDash([3,4]);for(const f of [roiLow,roiHigh]){ctx.beginPath();ctx.moveTo(s.x(f),p.top);ctx.lineTo(s.x(f),p.top+p.height);ctx.stroke();}ctx.setLineDash([]);}
+    (state?.vfos || []).forEach((v,k)=>{
+      let f=finite(v.frequency_hz),bw=finite(v.bandwidth_hz);if(drag?.id===String(v.id)){f=drag.frequency_hz;bw=drag.bandwidth_hz;}
+      const selected=Boolean(v.selected||String(v.id)===String(state?.selected_vfo_id)),color=colors[k%colors.length];
+      ctx.fillStyle=color+(selected?'1d':'0a');ctx.fillRect(s.x(f-bw/2),p.top,s.x(f+bw/2)-s.x(f-bw/2),p.height);
+      ctx.strokeStyle=color+(v.enabled===false?'55':selected?'dd':'77');ctx.lineWidth=selected?1.3:1;
+      for(const edge of [f-bw/2,f+bw/2]){ctx.beginPath();ctx.moveTo(s.x(edge),p.top);ctx.lineTo(s.x(edge),p.top+p.height);ctx.stroke();if(selected){ctx.fillStyle=color;ctx.fillRect(s.x(edge)-2,p.top+27,4,11);}}
+      ctx.beginPath();ctx.moveTo(s.x(f),p.top);ctx.lineTo(s.x(f),p.top+p.height);ctx.stroke();ctx.fillStyle=color;ctx.font='10px Consolas,monospace';ctx.textAlign='center';ctx.fillText(`V${v.id}`,s.x(f),p.top+11);
+    });
+    const traces=state?.display?.traces || {live:true};
+    for(const [key,field,color] of [['min','min_db','#a896df'],['max','max_db','#e9c16a'],['avg','avg_db','#d4e6ed'],['live','live_db','#5ad7e8']]) {
+      if(!traces[key] || !Array.isArray(spectrum[field]) || !freq.length)continue;
+      ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=key==='live'?1.15:1;let started=false;
+      spectrum[field].forEach((db,k)=>{const f=freq[k];if(f==null||db==null||!Number.isFinite(db)){started=false;return;}const x=s.x(f),y=clamp(s.y(db),p.top-10,p.top+p.height+10);if(!started){ctx.moveTo(x,y);started=true;}else ctx.lineTo(x,y);});ctx.stroke();
+    }
+    const markers=measurementMarkers(frame?.measurements);ctx.font='9px Consolas,monospace';
+    markers.forEach((m,k)=>{
+      const db=markerLevel(m),x=s.x(m.frequency_hz),user=isUserMarker(m),selected=userMarkerSelected(m),label=markerLabel(m,k);
+      if(user){
+        ctx.strokeStyle=selected?'#ffa4df':'#c087c388';ctx.lineWidth=selected?1.5:1;ctx.setLineDash(selected?[]:[4,4]);ctx.beginPath();ctx.moveTo(x,p.top);ctx.lineTo(x,p.top+p.height);ctx.stroke();ctx.setLineDash([]);
+        const width=ctx.measureText(label).width+10;ctx.fillStyle=selected?'#f3a3d8':'#493448';ctx.fillRect(x-width/2,p.top+17,width,15);ctx.fillStyle=selected?'#25131f':'#f1c4e3';ctx.textAlign='center';ctx.fillText(label,x,p.top+28);
+      }
+      if(!validLevel(db))return;
+      const y=clamp(s.y(db),p.top+(user?43:20),p.top+p.height-3);ctx.fillStyle=user?(selected?'#ffd0ee':'#d59bce'):'#f3d08a';ctx.beginPath();ctx.moveTo(x,y-1);ctx.lineTo(x-4,y-8);ctx.lineTo(x+4,y-8);ctx.closePath();ctx.fill();
+      if(!user){ctx.textAlign='center';ctx.fillText(label,x,y-12);}
+    });
+    if(hover && !drag){ctx.strokeStyle='#7da2b350';ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(hover.x,p.top);ctx.lineTo(hover.x,p.top+p.height);ctx.stroke();ctx.setLineDash([]);}
+    ctx.restore();
+    asText('spanReadout',`${(s.low/1e6).toFixed(4)} — ${(s.high/1e6).toFixed(4)} MHz`);
+    return s;
+  }
+  const palette=new Uint8ClampedArray(256*4);
+  const stops=[[0,[9,17,27]],[.12,[31,29,72]],[.3,[49,68,142]],[.48,[24,143,169]],[.65,[57,197,158]],[.8,[205,211,87]],[.92,[239,144,64]],[1,[255,221,151]]];
+  for(let k=0;k<256;k++){const f=k/255;let index=1;while(index<stops.length-1&&stops[index][0]<f)index++;const a=stops[index-1],b=stops[index],q=(f-a[0])/(b[0]-a[0]);for(let j=0;j<3;j++)palette[k*4+j]=Math.round(a[1][j]+(b[1][j]-a[1][j])*q);palette[k*4+3]=255;}
+  const heatmaps={density:document.createElement('canvas'),waterfall:document.createElement('canvas')};
+  function decodedBytes(encoded) { const raw=atob(encoded || '');return Uint8Array.from(raw,c=>c.charCodeAt(0)); }
+  function renderDensityHistory(data = {}) {
+    const windowMode=['window','time_window'].includes(state?.analysis?.persistence_mode);
+    const el=$('densityHistory');el.hidden=!windowMode&&!data.window_truncated;
+    if(el.hidden)return;
+    const retained=Number.isFinite(data.window_frames_retained)?`${data.window_frames_retained.toLocaleString()} FFT`:'— FFT';
+    const seconds=Number.isFinite(data.window_seconds_retained)?`${data.window_seconds_retained.toFixed(3)} s / `:'';
+    const usage=Number.isFinite(data.window_history_bytes)?` · ${formatBytes(data.window_history_bytes)}`:'';
+    const capacity=Number.isFinite(data.window_capacity_seconds)?`（連続解析 ${data.window_capacity_seconds.toFixed(3)} s 目安）`:'';
+    const limit=Number.isFinite(data.window_history_limit_bytes)?` / 上限 ${formatBytes(data.window_history_limit_bytes)}${capacity}`:'';
+    const warning=data.window_truncated?'メモリ上限により時間窓を短縮 · ':data.window_memory_limit_expected?'指定窓が保持容量の目安を超過 · ':'';
+    el.className=`density-history${warning?' limited':''}`;
+    el.textContent=`${warning}実効保持 ${seconds}${retained}${usage}${limit}`;
+  }
+  function drawHeatmap(kind) {
+    const canvas=$(kind==='density'?'densityCanvas':'waterfallCanvas'),data=frame?.[kind];
+    const limits=kind==='density'&&data&&Number.isFinite(data.min_db)&&Number.isFinite(data.max_db)?{top:data.max_db,range:data.max_db-data.min_db}:null;
+    const s=plotAxes(canvas,kind==='density',limits);
+    if(!data?.data_b64||!data.width||!data.height)return;
+    const w=Math.trunc(data.width),h=Math.trunc(data.height);if(w*h>4194304||w<1||h<1)return;
+    let values;try{values=decodedBytes(data.data_b64);}catch{return;}if(values.length<w*h)return;
+    const off=heatmaps[kind];off.width=w;off.height=h;const ctx=off.getContext('2d'),image=ctx.createImageData(w,h);
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){const sy=data.invert_y||data.orientation==='bottom_high'?h-1-y:y;const v=values[sy*w+x],at=(y*w+x)*4;image.data[at]=palette[v*4];image.data[at+1]=palette[v*4+1];image.data[at+2]=palette[v*4+2];image.data[at+3]=255;}
+    ctx.putImageData(image,0,0);s.ctx.save();s.ctx.beginPath();s.ctx.rect(s.p.left,s.p.top,s.p.width,s.p.height);s.ctx.clip();s.ctx.imageSmoothingEnabled=false;
+    if(kind==='density') {
+      const top=finite(data.max_db,s.top),bottom=finite(data.min_db,s.top-s.range),y1=s.y(top),y2=s.y(bottom);
+      s.ctx.drawImage(off,s.p.left,y1,s.p.width,y2-y1);
+    } else {
+      s.ctx.drawImage(off,s.p.left,s.p.top,s.p.width,s.p.height);
+      if(Array.isArray(data.gap_rows))for(const row of data.gap_rows){const y=s.p.top+row/h*s.p.height,height=Math.max(2,s.p.height/h);s.ctx.fillStyle='#566471';s.ctx.fillRect(s.p.left,y,s.p.width,height);s.ctx.strokeStyle='#b0bdc477';for(let x=s.p.left;x<s.p.left+s.p.width;x+=11){s.ctx.beginPath();s.ctx.moveTo(x,y+height);s.ctx.lineTo(x+height,y);s.ctx.stroke();}}
+    }
+    s.ctx.restore();
+    if(kind==='density') {
+      asText('densityStats',`有効FFT ${finite(data.valid_frames).toLocaleString()}`);
+      const max=data.maximum_value;
+      asText('densityScale',Number.isFinite(max)?`相対色 · 最大 ${data.metric==='rate'?(max*100).toFixed(1)+'%':max.toFixed(data.weighted_hits?1:0)+(data.weighted_hits?' 相当':' hits')}`:data.metric==='rate'?'出現率':'ヒット数');
+      $('densityScale').title=`色は表示中の相対強度。${data.weighted_hits?'指数減衰した値は重み付き相当値。':''}${data.window_truncated?'履歴のメモリー上限に達しています。':''}`;
+    }
+    else {const seconds=finite(data.row_seconds,.1)*h;asText('waterfallTime',`${seconds.toFixed(1)} s`);}
+  }
+  function drawAll() { drawSpectrum();drawHeatmap('density');drawHeatmap('waterfall'); }
+  function acceptFrame(next) {
+    const unit=next.spectrum?.unit || next.unit;
+    if(unit && (String(unit).startsWith('dBm') !== (levelUnit()==='dBm')))return;
+    frame=next;renderMeasurements(next.measurements || {});renderDensityHistory(next.density || {});drawAll();
+    const a=state?.analysis || {},s=next.spectrum || {};
+    const fft=a.fft_size || next.fft_size,rbw=next.enbw_hz ?? s.enbw_hz ?? a.enbw_hz,bin=next.bin_hz ?? s.bin_hz ?? a.bin_hz;
+    asText('fftReadout',`FFT ${fft ? finite(fft).toLocaleString():'—'} · RBW ${rbw ? formatHz(rbw,1):'—'}${bin?' · bin '+formatHz(bin,1):''}`);
+  }
+
+  function plotFrequency(event) { const rect=$('spectrumCanvas').getBoundingClientRect(),s=plotAxesGeometry();return {x:event.clientX-rect.left,y:event.clientY-rect.top,hz:s.low+(event.clientX-rect.left-s.left)/s.width*s.span,s}; }
+  function plotAxesGeometry(){const rect=$('spectrumCanvas').getBoundingClientRect();const span=finite(state?.display?.span_hz,state?.input?.sample_rate||2048000),center=finite(state?.input?.center_hz,32256000);return {left:54,top:15,width:Math.max(1,rect.width-67),height:Math.max(1,rect.height-44),low:center-span/2,span};}
+  function beginVfoDrag(event) {
+    if(!state||event.button!==0)return;const p=plotFrequency(event);if(p.x<p.s.left||p.x>p.s.left+p.s.width||p.y<p.s.top||p.y>p.s.top+p.s.height)return;
+    canvasGestureTarget='empty';
+    if(event.shiftKey){canvasGestureTarget='user';if(event.detail<2)addManualMarker(p.hz);return;}
+    let userHit=null;for(const marker of userMarkers()){const x=p.s.left+(marker.frequency_hz-p.s.low)/p.s.span*p.s.width,distance=Math.abs(p.x-x);if(distance<8&&(!userHit||distance<userHit.distance))userHit={marker,distance};}
+    if(userHit&&p.y>=p.s.top+17&&p.y<=p.s.top+32){canvasGestureTarget='user';event.preventDefault();selectUserMarker(userHit.marker.id);return;}
+    if(selectedUserMarker()){
+      canvasGestureTarget='user';event.preventDefault();
+      if(userHit)selectUserMarker(userHit.marker.id);
+      else userMarkerAction('user_marker_move',{frequency_hz:Math.round(p.hz)}).then(result=>{if(result)focusSpectrum();});
+      return;
+    }
+    let best=null;
+    (state.vfos||[]).forEach(v=>{const x=p.s.left+(v.frequency_hz-p.s.low)/p.s.span*p.s.width,half=v.bandwidth_hz/2/p.s.span*p.s.width;for(const [kind,at] of [['center',x],['low',x-half],['high',x+half]]){const distance=Math.abs(p.x-at);if(distance<(kind==='center'?13:7)&&(!best||distance<best.distance))best={v,kind,distance};}});
+    if(!best){
+      if(userHit){canvasGestureTarget='user';event.preventDefault();selectUserMarker(userHit.marker.id);}return;
+    }
+    canvasGestureTarget='vfo';
+    const selection=(selectedUserMarker()||!best.v.selected)?activateVfo(best.v.id):Promise.resolve(true);
+    drag={id:String(best.v.id),kind:best.kind,frequency_hz:best.v.frequency_hz,bandwidth_hz:best.v.bandwidth_hz,initial_hz:p.hz,initial_frequency:best.v.frequency_hz,initial_bandwidth:best.v.bandwidth_hz,selection};
+    $('spectrumCanvas').setPointerCapture(event.pointerId);event.preventDefault();
+    focusSpectrum();
+  }
+  function moveVfo(event) {
+    const p=plotFrequency(event);hover={x:p.x,hz:p.hz};
+    if(drag?.id){if(drag.kind==='center')drag.frequency_hz=Math.round(drag.initial_frequency+p.hz-drag.initial_hz);else drag.bandwidth_hz=Math.max(1000,Math.round(2*Math.abs(p.hz-drag.initial_frequency)));}
+    $('cursorReadout').hidden=p.x<p.s.left||p.x>p.s.left+p.s.width;asText('cursorReadout',`${mhz(p.hz).toFixed(6)} MHz`);drawSpectrum();
+  }
+  async function finishVfo(event) {
+    if(!drag?.id)return;const moved=drag;drag=null;try{$('spectrumCanvas').releasePointerCapture(event.pointerId);}catch{}
+    if(!await moved.selection)return;
+    await action('update_vfo',{id:wireId(moved.id),patch:{frequency_hz:moved.frequency_hz,bandwidth_hz:moved.bandwidth_hz}});drawSpectrum();
+  }
+  function vfoKey(event) {
+    if(selectedUserMarker()&&['ArrowLeft','ArrowRight'].includes(event.key)){event.preventDefault();seekUserPeak(event.key==='ArrowLeft'?'left':'right');return;}
+    const v=selectedVfo();if(!v)return;const step=event.shiftKey?10000:event.altKey?100:1000;
+    const frequencyDelta=event.key==='ArrowLeft'?-step:event.key==='ArrowRight'?step:0,bandwidthDelta=['+','='].includes(event.key)?step:event.key==='-'?-step:0;
+    if(frequencyDelta||bandwidthDelta){event.preventDefault();const selection=selectedUserMarker()?activateVfo(v.id):vfoSelectionPromise;
+      action('update_vfo',()=>{const current=state?.vfos?.find(item=>String(item.id)===String(v.id)) || v;return {id:v.id,patch:frequencyDelta?{frequency_hz:current.frequency_hz+frequencyDelta}:{bandwidth_hz:Math.max(1000,current.bandwidth_hz+bandwidthDelta)}};},{guard:async()=>Boolean(await selection)&&state?.vfos?.some(item=>String(item.id)===String(v.id))});
+    }
+  }
+  function vfoWheel(event) {
+    if(!state)return;event.preventDefault();
+    if(event.ctrlKey){const factor=event.deltaY>0?1.15:1/1.15;action('set_display',()=>({display:{span_hz:clamp(finite(state.display?.span_hz,state.input?.sample_rate)*factor,1000,state.input.sample_rate)}}));return;}
+    const v=selectedVfo();if(!v)return;const step=event.shiftKey?10000:event.altKey?100:1000;
+    const selection=selectedUserMarker()?activateVfo(v.id,{focus:false}):vfoSelectionPromise;
+    const canvas=$('spectrumCanvas'),previous=canvas.dataset.pendingVfo===String(v.id)?finite(canvas.dataset.pendingFrequency,v.frequency_hz):v.frequency_hz;
+    clearTimeout(tuningTimer);const pending=previous+(event.deltaY<0?step:-step);canvas.dataset.pendingFrequency=pending;canvas.dataset.pendingVfo=v.id;
+    tuningTimer=setTimeout(()=>{delete canvas.dataset.pendingFrequency;delete canvas.dataset.pendingVfo;action('update_vfo',{id:v.id,patch:{frequency_hz:pending}},{guard:()=>selection});},120);
+  }
+
+  function applyLayout(values, saveLocal = true) {
+    layout={...layout,...values};layout.spectrum_ratio=clamp(finite(layout.spectrum_ratio,.6),.52,.75);layout.vfo_width=clamp(finite(layout.vfo_width,340),280,460);layout.bottom_ratio=clamp(finite(layout.bottom_ratio,.5),.3,.7);
+    const style=document.documentElement.style;style.setProperty('--spectrum-ratio',`${layout.spectrum_ratio*100}%`);style.setProperty('--vfo-width',`${layout.vfo_width}px`);style.setProperty('--bottom-ratio',`${layout.bottom_ratio*100}%`);
+    if(saveLocal)try{localStorage.setItem('spectrum-studio-layout',JSON.stringify(layout));}catch{}
+    requestAnimationFrame(drawAll);
+  }
+  function attachResize(id,kind) {
+    $(id).addEventListener('pointerdown',event=>{event.preventDefault();const current={...layout};drag={layout:kind,x:event.clientX,y:event.clientY,current};$(id).setPointerCapture(event.pointerId);});
+    $(id).addEventListener('pointermove',event=>{if(drag?.layout!==kind)return;const current=drag.current;
+      if(kind==='spectrum')applyLayout({spectrum_ratio:current.spectrum_ratio+(event.clientY-drag.y)/$('analysisWorkspace').clientHeight});
+      if(kind==='sidebar')applyLayout({vfo_width:current.vfo_width-(event.clientX-drag.x)});
+      if(kind==='bottom')applyLayout({bottom_ratio:current.bottom_ratio+(event.clientX-drag.x)/$('lowerPanels').clientWidth});
+    });
+    const finish=event=>{if(drag?.layout!==kind)return;drag=null;try{$(id).releasePointerCapture(event.pointerId);}catch{}action('set_layout',{layout:{...layout}});};
+    $(id).addEventListener('pointerup',finish);$(id).addEventListener('pointercancel',finish);
+    $(id).addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key))return;event.preventDefault();const plus=['ArrowRight','ArrowDown'].includes(event.key)?1:-1;if(kind==='spectrum')applyLayout({spectrum_ratio:layout.spectrum_ratio+plus*.025});if(kind==='sidebar')applyLayout({vfo_width:layout.vfo_width-plus*10});if(kind==='bottom')applyLayout({bottom_ratio:layout.bottom_ratio+plus*.025});action('set_layout',{layout:{...layout}});});
+  }
+
+  function flushAudio(){for(const source of audioSources){try{source.stop();}catch{}}audioSources=[];audioNextTime=0;}
+  function updateAudioCaption(){const v=selectedVfo();asText('audioStatus',audioEnabled?(v?`VFO ${v.id} · ${v.mode} · ${mhz(v.frequency_hz).toFixed(4)} MHz${performance.now()-audioReceivedAt>2000?' · 音声待ち':''}`:'聴取するVFOを選択してください'):'選択中の1局だけをスピーカーへ出力');}
+  async function toggleAudio(){
+    if(!audioEnabled){try{audioContext ||= new (window.AudioContext||window.webkitAudioContext)();if(!audioGain){audioGain=audioContext.createGain();audioGain.gain.value=num('volume');audioGain.connect(audioContext.destination);}await audioContext.resume();audioEnabled=true;audioSequence=0;}catch(error){toast(`音声を開始できません：${error.message}`,'error');return;}}
+    else{audioEnabled=false;flushAudio();}
+    $('audioButton').textContent=audioEnabled?'🔊 音声ON':'🔈 音声OFF';$('audioButton').classList.toggle('active',audioEnabled);$('audioButton').setAttribute('aria-pressed',String(audioEnabled));updateAudioCaption();
+  }
+  function playPcm(data){if(!audioEnabled||!audioContext||!data.data_b64)return;const bytes=decodedBytes(data.data_b64),n=Math.floor(bytes.length/2);if(!n)return;const sr=finite(data.sample_rate,32000),buffer=audioContext.createBuffer(1,n,sr),out=buffer.getChannelData(0),view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);for(let k=0;k<n;k++)out[k]=view.getInt16(k*2,true)/32768;
+    if(audioNextTime-audioContext.currentTime>.6)flushAudio();audioNextTime=Math.max(audioNextTime,audioContext.currentTime+.025);const source=audioContext.createBufferSource();source.buffer=buffer;source.connect(audioGain);source.start(audioNextTime);audioNextTime+=n/sr;audioSources.push(source);source.onended=()=>{audioSources=audioSources.filter(s=>s!==source);};audioReceivedAt=performance.now();updateAudioCaption();}
+
+  function showSettings(tab='receiver'){activateTab(tab);if(!$('settingsDialog').open)$('settingsDialog').showModal();if(tab==='presets')refreshFiles();}
+  function activateTab(tab){document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===tab;el.classList.toggle('active',active);el.setAttribute('aria-selected',String(active));});document.querySelectorAll('[data-tab-panel]').forEach(el=>el.hidden=el.dataset.tabPanel!==tab);}
+  function presetLoadReason() {
+    if(!state||connectionError)return 'アプリとの接続を確認してください。';
+    if(inputLocked())return 'IQ保存・トリガ待機を終了してから読み込めます。';
+    if(state.vfos?.some(v=>v.wav_recording))return 'WAV録音を終了してから読み込めます。';
+    if(state.source==='replay')return 'IQ再生を停止し、「ライブへ戻る」で再生を閉じてください。';
+    if(state.running)return '受信を停止してから読み込めます。現在の測定は継続しています。';
+    if(actionInFlight)return '操作の反映後に読み込めます。';
+    if(!$('presetSelect').value)return '保存した設定を選択してください。';
+    return '';
+  }
+  function updatePresetLoadState() { const reason=presetLoadReason();$('presetLoadButton').disabled=Boolean(reason);$('presetLoadButton').title=reason;asText('presetLoadReason',reason || '受信・Arm・録音を停止した状態で設定を読み込みます。'); }
+  function updateFftVisibility(){$('rbwField').hidden=$('fftMode').value==='manual';$('fftSizeField').hidden=$('fftMode').value!=='manual';}
+  function renderConditions(){
+    $('conditionList').innerHTML=extraConditions.map((c,k)=>`<div class="condition-row" data-condition="${k}"><select data-condition-field="metric" aria-label="条件 ${k+1} の判定"><option value="peak" ${c.metric!=='integrated'?'selected':''}>ピークレベル</option><option value="integrated" ${c.metric==='integrated'?'selected':''}>積算電力</option></select><input type="number" value="${finite(c.threshold_db,-55)}" step="1" data-condition-field="threshold_db" aria-label="条件 ${k+1} 閾値"><span>dBFS</span><button type="button" class="icon-button" data-condition-delete="${k}" aria-label="条件 ${k+1} を解除">×</button></div>`).join('');
+  }
+  async function addManualMarker(hz){const data=Number.isFinite(hz)?{frequency_hz:Math.round(hz)}:{};const result=await action('user_marker_add',data,{forceVfos:false});if(result)focusSpectrum();return result;}
+  function downloadLink(label,path){const link=document.createElement('a');link.className='button quiet';link.textContent=label;link.href=`/api/download?path=${encodeURIComponent(path)}`;link.download=String(path).split(/[\\/]/).pop();return link;}
+  async function refreshFiles(){
+    try{fileData=await getJson('/api/files');const files=fileData.files || [];
+      $('fileList').replaceChildren();if(!files.length){$('fileList').textContent='保存データはまだありません。';}
+      for(const file of files){
+        const row=document.createElement('div');row.className='file-item';
+        const info=document.createElement('div');info.className='file-info';
+        const title=document.createElement('strong');title.textContent=file.name || String(file.path).split(/[\\/]/).pop();
+        const sub=document.createElement('span');sub.textContent=`${file.kind || 'データ'} · ${formatBytes(file.size ?? file.bytes)} · ${file.path}`;
+        info.append(title,sub);row.append(info);
+        if(file.kind==='iq'||/\.(sigmf-meta|cu8|iq|cf32)$/i.test(file.path || '')){
+          const open=document.createElement('button');open.className='button';open.textContent='IQ再生';open.onclick=()=>openReplay(file.path);row.append(open);
+          if(/\.sigmf-meta$/i.test(file.path)) {row.append(downloadLink('IQ',file.path.replace(/\.sigmf-meta$/i,'.sigmf-data')),downloadLink('条件',file.path));}
+          else row.append(downloadLink('保存',file.path));
+        } else row.append(downloadLink('保存',file.path));
+        const copy=document.createElement('button');copy.className='button quiet';copy.textContent='パス';
+        copy.onclick=()=>{navigator.clipboard?.writeText(file.path).then(()=>toast('パスをコピーしました')).catch(()=>toast(file.path));};
+        row.append(copy);$('fileList').append(row);
+      }
+      const old=$('presetSelect').value;$('presetSelect').replaceChildren();const empty=document.createElement('option');empty.value='';empty.textContent='設定を選択';$('presetSelect').append(empty);for(const preset of fileData.presets || []){const op=document.createElement('option');op.value=typeof preset==='string'?preset:preset.name;op.textContent=op.value;$('presetSelect').append(op);}$('presetSelect').value=old;updatePresetLoadState();
+    }catch(error){$('fileList').textContent=`保存データを取得できません：${error.message}`;}
+  }
+  async function openReplay(path){const r=await action('replay_open',{path});if(r){$('filesDialog').close();flushAudio();audioSequence=0;toast('保存IQを開きました。再生開始で解析します。');}}
+
+  $('receiveButton').addEventListener('click',()=>action(state?.running?'stop':'start',state?.source==='replay'?{}:{source:$('sourceSelect').value}));
+  $('sourceSelect').addEventListener('change',()=>{preferredSource=$('sourceSelect').value;});
+  $('tuningForm').addEventListener('submit',async event=>{
+    event.preventDefault();
+    const center=num('centerMHz')*1e6;
+    const analysis={fft_mode:$('fftMode').value,rbw_hz:num('rbwHz'),fft_size:num('fftSize')};
+    const display={span_hz:num('spanMHz')*1e6,range_db:num('rangeDb')};
+    if(Math.abs(num('refLevel')-finite(state?.display?.ref_level,state?.analysis?.ref_level ?? -20))>1e-9){display.ref_level=num('refLevel');display.ref_level_unit=levelUnit();}
+    if (!$('centerMHz').disabled && Math.abs(center-finite(state?.input?.center_hz))>.01) { const r=await action('set_input',{input:{center_hz:center}});if(!r)return; }
+    const current=state?.analysis || {};
+    const changed=analysis.fft_mode!==(current.fft_mode || 'rbw') || (analysis.fft_mode==='manual'?analysis.fft_size!==current.fft_size:analysis.rbw_hz!==(current.rbw_hz ?? current.target_rbw_hz ?? current.enbw_hz ?? 750));
+    if(changed){const r=await action('set_analysis',{analysis});if(!r)return;}
+    await action('set_display',{display},{form:'tuningForm',message:'周波数・表示条件を適用しました'});
+  });
+  $('inputApply').addEventListener('click',()=>action('set_input',{input:{gain_db:num('gainDb'),agc:$('agc').checked,ppm:num('ppm')}},{message:'入力条件を適用しました'}));
+  $('fftMode').addEventListener('change',updateFftVisibility);
+  for(const [key,id] of Object.entries({live:'traceLive',max:'traceMax',min:'traceMin',avg:'traceAvg'})) $(id).addEventListener('change',()=>action('set_display',{display:{traces:{[key]:$(id).checked}}}));
+  $('detector').addEventListener('change',()=>action('set_analysis',{analysis:{detector:$('detector').value}}));
+  $('densityMetric').addEventListener('change',()=>action('set_analysis',{analysis:{density_metric:$('densityMetric').value}}));
+  $('waterfallRowSeconds').addEventListener('change',()=>action('set_analysis',{analysis:{waterfall_row_seconds:num('waterfallRowSeconds')}}));
+  $('addVfoButton').addEventListener('click',()=>action('add_vfo',{vfo:{frequency_hz:finite(state?.input?.center_hz,32000000),mode:'WFM',bandwidth_hz:200000}}));
+  $('vfoList').addEventListener('click',vfoAction);
+  $('vfoList').addEventListener('focusin',event=>{if(event.target.matches('input,select')&&selectedUserMarker())selectUserMarker(null,{focus:false});});
+  $('vfoList').addEventListener('change',event=>{if(event.target.dataset.vfoField==='mode'){const card=event.target.closest('.vfo-card');card.querySelector('[data-vfo-field=bandwidth]').value={AM:10,NFM:12.5,WFM:200}[event.target.value];}});
+  $('vfoList').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target.matches('input')){event.preventDefault();event.target.closest('.vfo-card').querySelector('[data-vfo-action=apply]').click();}});
+  $('audioButton').addEventListener('click',toggleAudio);$('volume').addEventListener('input',()=>{if(audioGain)audioGain.gain.setTargetAtTime(num('volume'),audioContext.currentTime,.02);});
+  $('iqButton').addEventListener('click',()=>action(state?.recording?.iq_active?'iq_stop':'iq_start'));
+  $('armButton').addEventListener('click',()=>action(state?.trigger?.armed?'disarm':'arm'));
+  $('settingsButton').addEventListener('click',()=>showSettings());$('presetsButton').addEventListener('click',()=>showSettings('presets'));$('measurementButton').addEventListener('click',()=>showSettings('measurement'));$('triggerSettingsButton').addEventListener('click',()=>showSettings('trigger'));
+  $('addUserMarkerButton').addEventListener('click',()=>addManualMarker());
+  const chooseUserMarker=event=>{const button=event.target.closest('[data-user-marker-select]');if(button)selectUserMarker(button.dataset.userMarkerSelect);};
+  $('userMarkerList').addEventListener('click',chooseUserMarker);$('markerTable').addEventListener('click',chooseUserMarker);
+  $('userMarkerDeselect').addEventListener('click',()=>selectUserMarker(null));
+  $('userMarkerPeakLeft').addEventListener('click',()=>seekUserPeak('left'));$('userMarkerPeakRight').addEventListener('click',()=>seekUserPeak('right'));$('userMarkerPeakMax').addEventListener('click',()=>seekUserPeak('max'));
+  $('userMarkerDelete').addEventListener('click',async()=>{const result=await userMarkerAction('user_marker_delete');if(result)focusSpectrum();});
+  document.querySelectorAll('[data-tab]').forEach(el=>el.addEventListener('click',()=>{activateTab(el.dataset.tab);if(el.dataset.tab==='presets')refreshFiles();}));
+  $('receiverForm').addEventListener('submit',async event=>{event.preventDefault();const input={sample_rate:num('sampleRate'),mode:$('inputMode').value},analysis={window:$('windowType').value,overlap:num('overlap'),average_seconds:num('averageSeconds')};const changed=input.sample_rate!==state?.input?.sample_rate || input.mode!==state?.input?.mode;const r=changed?await action('set_input',{input}):true;if(r)await action('set_analysis',{analysis},{form:'receiverForm',message:'入力・FFT条件を適用しました'});});
+  $('persistenceForm').addEventListener('submit',event=>{event.preventDefault();action('set_analysis',{analysis:{persistence_mode:$('persistenceMode').value,persistence_unit:$('persistenceUnit').value,persistence_seconds:num('persistenceSeconds'),persistence_frames:num('persistenceFrames'),switch_policy:$('switchPolicy').value,stats_mode:$('statsMode').value}},{form:'persistenceForm',message:'密度・残像の設定を適用しました'});});
+  $('measurementForm').addEventListener('submit',event=>{event.preventDefault();action('set_measurement',{measurement:{low_hz:num('measurementLowMHz')*1e6,high_hz:num('measurementHighMHz')*1e6,link_vfo:linkedVfo($('measurementLink').value),obw_percent:num('obwPercent'),marker_count:num('markerCount'),marker_mode:$('markerMode').value,marker_follow:$('markerFollow').checked,delta_reference:num('deltaReference')}},{form:'measurementForm',message:'測定条件を適用しました'});});
+  document.querySelectorAll('[data-obw]').forEach(el=>el.addEventListener('click',()=>{$('obwPercent').value=el.dataset.obw;dirtyForms.add('measurementForm');}));
+  $('addMarkerButton').addEventListener('click',()=>addManualMarker(num('manualMarkerMHz')*1e6));$('clearMarkersButton').addEventListener('click',async()=>{for(const marker of [...userMarkers()]){if(!await action('user_marker_delete',{id:marker.id},{forceVfos:false}))break;}});
+  $('triggerForm').addEventListener('submit',event=>{event.preventDefault();const conditions=Array.from($('conditionList').querySelectorAll('.condition-row')).map(row=>({metric:row.querySelector('[data-condition-field=metric]').value,threshold_db:Number(row.querySelector('[data-condition-field=threshold_db]').value)}));action('set_trigger',{trigger:{mode:$('triggerMode').value,metric:$('triggerMetric').value,threshold_db:num('thresholdDb'),hysteresis_db:num('hysteresisDb'),pre_seconds:num('preSeconds'),post_seconds:num('postSeconds'),min_duration_s:num('minDurationSeconds'),rearm_s:num('rearmSeconds'),logic:$('triggerLogic').value,low_hz:num('triggerLowMHz')*1e6,high_hz:num('triggerHighMHz')*1e6,link_vfo:linkedVfo($('triggerLink').value),conditions}},{form:'triggerForm',message:'トリガ条件を適用しました'});});
+  $('addConditionButton').addEventListener('click',()=>{extraConditions.push({metric:'peak',threshold_db:num('thresholdDb')});renderConditions();dirtyForms.add('triggerForm');});
+  $('conditionList').addEventListener('click',event=>{const b=event.target.closest('[data-condition-delete]');if(b){extraConditions.splice(Number(b.dataset.conditionDelete),1);renderConditions();dirtyForms.add('triggerForm');}});
+  $('conditionList').addEventListener('change',event=>{const row=event.target.closest('[data-condition]');if(row&&event.target.dataset.conditionField){extraConditions[Number(row.dataset.condition)][event.target.dataset.conditionField]=event.target.dataset.conditionField==='threshold_db'?Number(event.target.value):event.target.value;}});
+  $('calibrationFile').addEventListener('change',async event=>{
+    const file=event.target.files?.[0]; if(!file)return;
+    try {
+      if(file.size>120*1024)throw new Error('校正JSONは120 KiB以下のファイルを選択してください。');
+      let calibration;try{calibration=JSON.parse(await file.text());}catch{throw new Error('校正JSONを読み取れません。JSON形式を確認してください。');}
+      if(!calibration||Array.isArray(calibration)||typeof calibration!=='object')throw new Error('校正JSONの先頭はオブジェクトにしてください。');
+      await action('calibration_load',{calibration},{message:'校正情報を読み込みました。適用条件と有効状態を確認してください'});
+    }catch(error){toast(error.message,'error');}finally{event.target.value='';}
+  });
+  $('calibrationClear').addEventListener('click',()=>action('calibration_clear',{}, {message:'校正情報を解除し、相対レベルへ戻しました'}));
+  $('levelUnit').addEventListener('change',async()=>{const result=await action('set_level_unit',{unit:$('levelUnit').value});if(!result)renderCalibration(true);});
+  $('presetSaveForm').addEventListener('submit',async event=>{event.preventDefault();const r=await action('preset_save',{name:$('presetName').value.trim()},{message:'設定を保存しました'});if(r)refreshFiles();});
+  $('presetSelect').addEventListener('change',updatePresetLoadState);
+  $('presetLoadButton').addEventListener('click',async()=>{const reason=presetLoadReason();if(reason){updatePresetLoadState();return;}cancelPendingVfoTune();const r=await action('preset_load',{name:$('presetSelect').value},{forceState:true,message:'設定を読み込みました。受信・記録は手動で開始してください'});if(r)dirtyForms.clear();});
+  $('resetLayoutButton').addEventListener('click',()=>{applyLayout({spectrum_ratio:.6,vfo_width:340,bottom_ratio:.5});action('set_layout',{layout});});
+  $('filesButton').addEventListener('click',()=>{$('filesDialog').showModal();refreshFiles();});$('refreshFilesButton').addEventListener('click',refreshFiles);
+  $('replayOpenForm').addEventListener('submit',event=>{event.preventDefault();openReplay($('replayPath').value.trim());});
+  $('replaySeek').addEventListener('change',()=>{flushAudio();audioSequence=0;action('replay_seek',{seconds:num('replaySeek')});});
+  $('replayCloseButton').addEventListener('click',()=>{flushAudio();action('replay_close');});
+  $('noticeDismiss').addEventListener('click',()=>notice(''));
+  for(const form of ['tuningForm','receiverForm','persistenceForm','measurementForm','triggerForm']) $(form).addEventListener('input',()=>dirtyForms.add(form));
+  $('spectrumCanvas').addEventListener('pointerdown',beginVfoDrag);$('spectrumCanvas').addEventListener('pointermove',moveVfo);$('spectrumCanvas').addEventListener('pointerup',finishVfo);$('spectrumCanvas').addEventListener('pointercancel',()=>{drag=null;drawSpectrum();});
+  $('spectrumCanvas').addEventListener('pointerleave',()=>{if(!drag){hover=null;$('cursorReadout').hidden=true;drawSpectrum();}});
+  $('spectrumCanvas').addEventListener('keydown',vfoKey);$('spectrumCanvas').addEventListener('wheel',vfoWheel,{passive:false});
+  $('spectrumCanvas').addEventListener('dblclick',event=>{if(canvasGestureTarget!=='empty'||selectedUserMarker()||event.shiftKey)return;const p=plotFrequency(event);action('add_vfo',{vfo:{frequency_hz:Math.round(p.hz),mode:'WFM',bandwidth_hz:200000}});});
+  attachResize('spectrumResizer','spectrum');attachResize('sidebarResizer','sidebar');attachResize('bottomResizer','bottom');
+  new ResizeObserver(()=>requestAnimationFrame(drawAll)).observe($('workspace'));
+  window.addEventListener('resize',()=>requestAnimationFrame(drawAll));
+  try{const saved=JSON.parse(localStorage.getItem('spectrum-studio-layout'));if(saved)applyLayout(saved,false);}catch{}
+
+  async function refreshState(force=false,fromAction=false){const epoch=stateEpoch;try{const next=await getJson('/api/state');if(fromAction||(epoch===stateEpoch&&!actionInFlight))applyState(next,force);}catch(error){if(epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;}$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
+  async function stateLoop(){await refreshState();setTimeout(stateLoop,1000);}
+  function requestFrame(){clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}frameTimer=setTimeout(frameLoop,0);}
+  async function frameLoop(){
+    clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}framePending=true;
+    try{const f=await getJson('/api/frame');if(f)acceptFrame(f);if(frameFailures>=3&&$('noticeText').textContent==='解析表示を更新できません。再接続を待っています。')notice('');frameFailures=0;}
+    catch{frameFailures++;if(frameFailures===3&&state?.running&&!connectionError&&!state?.device?.error)notice('解析表示を更新できません。再接続を待っています。','error');}
+    finally{framePending=false;const delay=frameRefreshRequested?0:!state?.running?1000:document.hidden?500:125;frameRefreshRequested=false;frameTimer=setTimeout(frameLoop,delay);}
+  }
+  async function audioLoop(){if(audioEnabled&&state?.running){try{const data=await getJson(`/api/audio?after=${audioSequence}`);if(finite(data.sequence)<audioSequence)audioSequence=0;if(data.data_b64){playPcm(data);audioSequence=finite(data.sequence,audioSequence);}}catch{}}setTimeout(audioLoop,90);}
+  updateFftVisibility();drawAll();stateLoop();frameLoop();audioLoop();
+})();

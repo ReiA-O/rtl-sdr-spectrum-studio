@@ -1,0 +1,98 @@
+{
+  "analysis": {
+    "config": {
+      "average_seconds": 1.0,
+      "density_levels": 128,
+      "density_max_db": 0.0,
+      "density_metric": "rate",
+      "density_min_db": -140.0,
+      "detector": "sample",
+      "fft_size": 4096,
+      "max_density_history_mb": 64.0,
+      "overlap": 0.5,
+      "persistence_frames": 1000,
+      "persistence_mode": "exponential",
+      "persistence_seconds": 1.0,
+      "persistence_unit": "half_life",
+      "range_db": 30.0,
+      "ref_level": -55.0,
+      "sample_rate": 2048000.0,
+      "stats_mode": "persistence",
+      "switch_policy": "convert",
+      "waterfall_row_seconds": 0.1,
+      "waterfall_rows": 250,
+      "window": "hann"
+    },
+    "extra": {
+      "fft_mode": "rbw",
+      "rbw_hz": 600
+    }
+  },
+  "calibration": null,
+  "display": {
+    "range_db": 30,
+    "ref_level": -55.0,
+    "span_hz": 900000,
+    "traces": {
+      "avg": false,
+      "live": true,
+      "max": true,
+      "min": true
+    }
+  },
+  "input": {
+    "agc": false,
+    "center_hz": 32256000.0,
+    "device_index": 0,
+    "gain_db": 20.7,
+    "mode": "auto",
+    "ppm": 0,
+    "sample_rate": 2048000.0
+  },
+  "layout": {
+    "bottom_ratio": 0.5,
+    "spectrum_ratio": 0.6,
+    "vfo_width": 340
+  },
+  "measurement": {
+    "delta_reference": 0,
+    "high_hz": 32100000.0,
+    "link_vfo": null,
+    "low_hz": 31900000.0,
+    "manual_markers": [],
+    "marker_count": 6,
+    "marker_follow": true,
+    "marker_mode": "auto",
+    "obw_percent": 99.0
+  },
+  "preferred_source": "live",
+  "requested_level_unit": "relative",
+  "selected_vfo_id": 1,
+  "trigger": {
+    "conditions": [],
+    "high_hz": 32100000.0,
+    "hysteresis_db": 3.0,
+    "link_vfo": null,
+    "logic": "OR",
+    "low_hz": 31900000.0,
+    "metric": "peak",
+    "min_duration_s": 0.0,
+    "mode": "one_shot",
+    "post_seconds": 2.0,
+    "pre_seconds": 1.0,
+    "rearm_s": 0.2,
+    "threshold_db": -60.0
+  },
+  "version": 1,
+  "vfos": [
+    {
+      "bandwidth_hz": 200000.0,
+      "enabled": true,
+      "frequency_hz": 32008999.999999996,
+      "id": 1,
+      "mode": "WFM",
+      "stopped_reason": null,
+      "wav_format": "PCM16"
+    }
+  ]
+}

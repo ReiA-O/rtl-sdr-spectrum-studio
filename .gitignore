@@ -1,0 +1,51 @@
+# Runtime user data and private evidence
+/data/
+/verification/
+/sources/
+/revisions/
+/publication/
+/.cache/
+/dist/
+/native/target*/
+
+# Build-only downloaded assets and machine-local Cargo metadata
+/drivers/**/*.dll
+/tools/portable-support/sources/
+/tools/portable-support/cargo-metadata*.json
+/tools/portable-support/licenses/*.docx
+/tests/ui-static-boundaries.json
+
+# Python / editor / OS products
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+keys/
+secrets/
+*.pem
+*.key
+*.pfx
+*.p12
+*.token
+credentials*.json
+*-private.json
+
+# Captured media and executable outputs
+*.sigmf-data
+*.sigmf-meta
+*.cu8
+*.wav
+*.exe
+*.dll
+*.pdb
+*.zip

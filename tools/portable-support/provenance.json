@@ -1,0 +1,30 @@
+{
+  "assets": [
+    {
+      "upstream_url": "https://codeload.github.com/rtlsdrblog/rtl-sdr-blog/zip/refs/tags/V1.4.0",
+      "path": "sources/rtl-sdr-blog-V1.4.0-source.zip",
+      "bytes": 183324,
+      "sha256": "efaac50d53ea2f12d9853167ac9470bf4f04de944f17c5d52d2fd73a9ec24c18"
+    },
+    {
+      "upstream_url": "https://raw.githubusercontent.com/rtlsdrblog/rtl-sdr-blog/V1.4.0/COPYING",
+      "path": "licenses/rtl-sdr-COPYING-GPL-2.0.txt",
+      "bytes": 17987,
+      "sha256": "ab15fd526bd8dd18a9e77ebc139656bf4d33e97fc7238cd11bf60e2b9b8666c6"
+    },
+    {
+      "upstream_url": "https://visualstudio.microsoft.com/wp-content/uploads/2021/09/Visual-C-Runtime-2015-2022-License-1.docx",
+      "path": "licenses/Microsoft-VC-Runtime-2015-2022-License.docx",
+      "bytes": 39644,
+      "sha256": "f1e3d56ceb2ad68aae0711b910375009e651ac5530fa0760f0dea6e81e54fae1"
+    },
+    {
+      "upstream_url": "https://raw.githubusercontent.com/libusb/libusb/v1.0.29/COPYING",
+      "path": "licenses/libusb-COPYING-LGPL-2.1.txt",
+      "bytes": 26436,
+      "sha256": "5df07007198989c622f5d41de8d703e7bef3d0e79d62e24332ee739a452af62a"
+    }
+  ],
+  "retrieved_at": "2026-10-27T02:25:31.6430679+09:00",
+  "method": "Direct HTTPS retrieval from official upstream URLs; hashes recorded locally"
+}
