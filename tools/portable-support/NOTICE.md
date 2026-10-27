@@ -1,16 +1,23 @@
-# Third-party notices for the private portable development build
+# Third-party notices for the public preview
 
-本パッケージは個人用のWindows PCへ持ち出すための開発版。外部への公開・販売は行っていない。本体の公開用ライセンス選定や法的適合性の包括的な確認を完了したという表示ではない。
+公開pre-release `v0.4.0-preview.1` の第三者通知。アプリのオリジナル部分はGPL-3.0-or-later、第三者部分は各原ライセンスに従う。各権利者の著作権表示とライセンス本文を保持する。
 
-- **RTL-SDR Blog driver V1.4.0**: rtlsdr.dll は未変更の公式Windows x64 release由来。GPL-2.0-or-later。COPYING とV1.4.0のソースアーカイブを同梱する。ReleaseのSHA256とDLLの一致をpackagerで検査する。
-  - Release: https://github.com/rtlsdrblog/rtl-sdr-blog/releases/tag/V1.4.0
-  - Source: https://github.com/rtlsdrblog/rtl-sdr-blog/tree/V1.4.0
-- **libusb**: rtlsdr.dll内にlibusbの実装が含まれることを文字列と依存関係から確認した。外部libusb DLLは必要ない。LGPL-2.1-or-laterの本文を同梱。公式releaseバイナリー内の正確なlibusb版・ビルド設定は未確認で、公開配布前には対応ソースとビルド由来を確認する必要がある。
-  - https://github.com/libusb/libusb
-- **Microsoft Visual C++ runtime**: vcruntime140.dll は正規インストール済み Visual Studio Build Tools の VC/Redist/MSVC/x64 から取得し、アプリの隣に配置する。Microsoftのライセンス条件に従う。この配布用フォルダーだけを使用し、Windows/System32のDLLを抜き出さない。参照用のMicrosoft Visual C++ Runtime 2015-2022 License文書を同梱する。実際のファイル版はmanifestに記録する。
-  - https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files
-  - https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/
-- **Rust standard library**: 使用したツールチェーンの COPYRIGHT-library.html とライセンス本文を同梱する。
-- **Rust crates**: Cargo.lockに対応する Windows x64 の依存グラフ（build/proc-macro依存も含む）から、各crateの原ライセンス・著作権通知を licenses/rust-crates/ へ保全する。一覧と宣言は rust-crates.json を参照する。関係のない他OS専用のlock entryは含めない。
+- **RTL-SDR Blog V1.4.0**: `rtlsdr.dll`は固定タグV1.4.0のソースから作成したWindows x64版。RTL-SDRのCソースはGPL-2.0-or-later、一部buildファイルはGPL-3.0-or-later。GPL-3.0-or-laterの本アプリと配布する。原COPYING、固定ソースarchive、ビルド手順を対応ソースへ保全する。
+  - [公式タグのソース](https://github.com/rtlsdrblog/rtl-sdr-blog/tree/V1.4.0)
+- **libusb 1.0.30**: 公式source tarballを固定して`rtlsdr.dll`へ静的リンク。LGPL-2.1-or-later。原COPYING、全source、MSVC runtime選択の2行patch、適用・ビルド手順を対応ソースへ含める。C/header本体は変更していない。別のlibusb DLLを同梱する構成ではない。
+  - [公式安定版1.0.30](https://github.com/libusb/libusb/releases/tag/v1.0.30)
+- **Microsoft Visual C++ runtime**: CRTは`/MD`の動的リンク。公開ZIPには`vcruntime140.dll`、UCRT/API-set、その他Windows system DLLを同梱しない。利用者がMicrosoft公式のVisual C++ v14 Redistributable（x64）を別途導入する。アプリのビルドに用いたMSVCと同じかそれより新しい対応runtimeが必要。Microsoftの利用条件が適用され、本アプリのGPLへ変更しない。
+  - [Microsoft公式x64ランタイム](https://aka.ms/vc14/vc_redist.x64.exe)
+  - [Microsoftの対応版・導入案内](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
+- **Rust standard library**: 使用したtoolchainの`COPYRIGHT-library.html`と原ライセンス本文を同梱する。
+- **Rust crates**: Windows x64の依存グラフ（build/proc-macro依存を含む）に対応するcrateの原ライセンス・著作権通知を`licenses/rust-crates/`へ保全する。配布物の一覧・宣言は`rust-crates.json`を参照。対応ソースZIPには`Cargo.lock`に固定された全66 crateをvendorするため、他OS向けを含むソースも取得できる。
 
-署名付きインストーラー、独立したクリーンPCでの受入れ、外部公開は今回の成果に含めない。Windowsに標準搭載のUCRT/API-set DLLは同梱しない。WinUSB USBドライバーは別途必要で、パッケージは導入や変更を自動実行しない。
+[同じリリースの対応ソースZIP](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.0-preview.1) は、自作部分・全66 Rust crate・RTL-SDR/libusbの固定source archives・patch・ビルド手順を含む。source ZIP内の`SOURCE_BUILD.md`と`third-party-driver/README.md`から再ビルドできる。archiveとDLLのSHA256・toolchainはdriver用`BUILD-MANIFEST.json`に記録する。
+
+この公開プレビューで使うDLLは192,000 bytes、SHA256 `761de6ef2f57047f1dfbbf2346cb53247b2974f5d1fb11b64f9498b650cafc05`。libusbはstatic、CRTはdynamic。元の公式prebuilt DLLを再配布する構成から変更した。
+
+WinUSB USBドライバーはLIVE受信時に別途必要。パッケージはUSBドライバーの導入・変更や受信開始を自動実行しない。署名付きinstaller、独立したクリーンPC・屋外での受入れは未検証。
+
+## 過去の構成
+
+2026-10-27のprivate portable開発版では、未変更のRTL-SDR Blog公式x64 prebuilt DLLと正規VC/Redist由来の`vcruntime140.dll`を同梱した。その時点では本体の公開ライセンスが未選定で、公式DLL内に含まれるlibusbの正確な版・ビルド設定も未確認だった。旧成果物と履歴は保持する。公開プレビューでは固定ソースからのビルドへ切り替えて対応ソースを提供し、Microsoft runtimeを外部前提とする。旧prebuilt内のlibusb版は推測していない。

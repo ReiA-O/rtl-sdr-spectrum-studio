@@ -1,7 +1,15 @@
-# Project license selection pending
+# RTL-SDR Spectrum Studio — License
 
-このリポジトリのオリジナルコードに適用する公開用ライセンスは、まだ選定していません。本ファイルはMIT等のライセンス許諾を新たに付与するものではありません。privateなレビュー用ソースと、第三者へ公開・再配布できる成果物を区別してください。
+SPDX-License-Identifier: GPL-3.0-or-later
 
-第三者の著作物には各提供元の条件が適用されます。RTL-SDRドライバーはGPL-2.0-or-later、libusbはLGPL-2.1-or-later、Rustと依存crateにはそれぞれのライセンスがあります。MicrosoftランタイムにはMicrosoftの条件が適用されます。
+Copyright (C) 2026 ReiA-O
 
-原ライセンス本文は`tools/portable-support/licenses/`、出典と確認範囲は`tools/portable-support/NOTICE.md`にあります。パッケージ生成時は使用したRust標準ライブラリーとWindows依存crateの通知を同梱します。公開・販売・外部配布の前に、本体のライセンス、組合せ、対応ソース、依存バイナリーの由来を確認してください。
+RTL-SDR Spectrum Studioのオリジナルコード・文書・同梱デモについて、著作権が及ぶ範囲で、GNU General Public License version 3またはそれ以降の版を適用します。
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+GPL version 3全文は[LICENSE](LICENSE)。適用方法を含む公式情報は https://www.gnu.org/licenses/gpl-3.0.html を参照してください。
+
+第三者のコード・ライブラリー・Microsoftランタイムの権利は各権利者に帰属し、それぞれの原ライセンス・例外・通知を維持します。ライセンス一覧・出典は[third-party notices](tools/portable-support/NOTICE.md)、配布構成と対応ソースの取得・ビルド手順は[packaging](docs/PACKAGING.md)を参照してください。第三者のライセンスを本ファイルで変更するものではありません。

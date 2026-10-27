@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$BinaryPath,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBinarySha256,
@@ -9,6 +9,9 @@ param(
     [string]$CargoMetadataPath,
     [string]$RustCopyrightPath,
     [string]$DemoManifestPath,
+    [switch]$PublicRelease,
+    [string]$DriverDllPath,
+    [string]$DriverSourceDirectory,
     [string[]]$ForbiddenText = @()
 )
 $ErrorActionPreference = 'Stop'
@@ -73,7 +76,7 @@ if (!$OutputParent) { $OutputParent = Join-Path $project 'dist' }
 if (!$PresetPath) { $PresetPath = Join-Path $project 'presets\fm-measurement.json' }
 if (!$CargoMetadataPath) { $CargoMetadataPath = Join-Path $PSScriptRoot 'portable-support\cargo-metadata-windows.json' }
 if (!$RustCopyrightPath) { $RustCopyrightPath = Join-Path $env:USERPROFILE '.rustup\toolchains\stable-x86_64-pc-windows-msvc\share\doc\rust' }
-if (!$RuntimeDllPath) {
+if (!$PublicRelease -and !$RuntimeDllPath) {
     $redistRoot = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\18\BuildTools\VC\Redist\MSVC'
     $candidates = @(Get-ChildItem -LiteralPath $redistRoot -Directory | Where-Object Name -Match '^\d+\.\d+\.\d+$' | Sort-Object { [version]$_.Name } -Descending)
     foreach ($candidate in $candidates) {
@@ -83,6 +86,33 @@ if (!$RuntimeDllPath) {
 }
 $support = Join-Path $PSScriptRoot 'portable-support'
 $rtl = Join-Path $project 'drivers\rtlsdr\rtlsdr.dll'
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$sourceDriverFiles=@()
+if ($PublicRelease) {
+    if (!$DriverDllPath -or !$DriverSourceDirectory) { throw 'PublicRelease requires a source-built DriverDllPath and its DriverSourceDirectory.' }
+    $rtl=(Resolve-Path -LiteralPath $DriverDllPath).Path
+    $DriverSourceDirectory=(Resolve-Path -LiteralPath $DriverSourceDirectory).Path
+    $driverPins=@{
+        'build-driver.ps1'='2fcee3001efb6597b2261df2777b20811644e90495068e0236a6fb3260613789'
+        'BUILD-MANIFEST.json'='33a5407d9d3cd5cdc97885c38b18bd7437f6c9c4f75684cc3892bc5ca2b55959'
+        'libusb-1.0.30-msvc-md.patch'='c037cec053667dd640a4470f16d56d40fde31c2a7fc702117b5849201045f985'
+        'libusb-1.0.30.tar.bz2'='fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf'
+        'README.md'='80df047ee6357e72ac2d15cdf3e79a6fbbe35d6db264fd68b71f51662bff8161'
+        'rtl-sdr-blog-V1.4.0-source.zip'='efaac50d53ea2f12d9853167ac9470bf4f04de944f17c5d52d2fd73a9ec24c18'
+    }
+    $actualFiles=@(Get-ChildItem -LiteralPath $DriverSourceDirectory -File)
+    if (@(Get-ChildItem -LiteralPath $DriverSourceDirectory -Directory).Count -or $actualFiles.Count -ne $driverPins.Count) { throw 'Driver source directory must contain exactly the six approved source/build materials.' }
+    foreach ($name in $driverPins.Keys) {
+        $path=Join-Path $DriverSourceDirectory $name
+        $item=Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($item -isnot [IO.FileInfo] -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $driverPins[$name]) { throw "Unapproved driver source/build material: $name" }
+        $sourceDriverFiles+=@{path=$name;source_path=$path;bytes=$item.Length;sha256=$driverPins[$name]}
+    }
+    $sourceDriverManifest=[IO.File]::ReadAllText((Join-Path $DriverSourceDirectory 'BUILD-MANIFEST.json')) | ConvertFrom-Json
+    if ((Get-FileHash -LiteralPath $rtl -Algorithm SHA256).Hash.ToLowerInvariant() -cne $sourceDriverManifest.runtime_dll_sha256 -or (Get-Item -LiteralPath $rtl).Length -ne $sourceDriverManifest.runtime_dll_bytes) { throw 'Source-built driver differs from its approved build manifest.' }
+    $driverExpectedHash=$sourceDriverManifest.runtime_dll_sha256
+} elseif ($DriverDllPath -or $DriverSourceDirectory) { throw 'Custom source-built driver inputs require PublicRelease; private packaging retains its official archive check.' }
+
 $BinaryPath = (Resolve-Path -LiteralPath $BinaryPath).Path
 $assetManifest=[IO.File]::ReadAllText((Join-Path $support 'provenance.json')) | ConvertFrom-Json
 foreach ($asset in $assetManifest.assets) {
@@ -90,10 +120,15 @@ foreach ($asset in $assetManifest.assets) {
     if (!$assetPath.StartsWith($support+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid support asset path.' }
     if ((Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash -ne $asset.sha256) { throw "Support asset checksum mismatch: $($asset.path)" }
 }
-foreach ($required in @($BinaryPath,$PresetPath,$RuntimeDllPath,$rtl,(Join-Path $support 'licenses\rtl-sdr-COPYING-GPL-2.0.txt'),(Join-Path $support 'licenses\libusb-COPYING-LGPL-2.1.txt'),(Join-Path $support 'sources\rtl-sdr-blog-V1.4.0-source.zip'),(Join-Path $RustCopyrightPath 'COPYRIGHT-library.html'))) {
+$requiredRuntimeInputs=@()
+$requiredPublicLicenseInputs=@()
+if (!$PublicRelease) { $requiredRuntimeInputs+=@($RuntimeDllPath) }
+if ($PublicRelease) { $requiredPublicLicenseInputs+=@((Join-Path $project 'LICENSE'),(Join-Path $project 'LICENSE.md')) }
+foreach ($required in (@($BinaryPath,$PresetPath,$rtl,(Join-Path $support 'licenses\rtl-sdr-COPYING-GPL-2.0.txt'),(Join-Path $support 'licenses\libusb-COPYING-LGPL-2.1.txt'),(Join-Path $support 'sources\rtl-sdr-blog-V1.4.0-source.zip'),(Join-Path $RustCopyrightPath 'COPYRIGHT-library.html'))+$requiredRuntimeInputs+$requiredPublicLicenseInputs)) {
     if (!$required -or !(Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required packaging input missing: $required" }
 }
 if ((Get-FileHash -LiteralPath $BinaryPath -Algorithm SHA256).Hash -ne $ExpectedBinarySha256) { throw 'The application binary does not match the approved build SHA256.' }
+if (!$PublicRelease) {
 $driverArchive = Join-Path $project '.cache\driver\rtl-sdr-blog-V1.4.0-Release.zip'
 if ((Get-FileHash -LiteralPath $driverArchive -Algorithm SHA256).Hash -ne '7EF33F1304647F65E5E0FDE43637A73D54F076E91E651A3CECC4F55A17FD9815') { throw 'Driver release archive SHA256 mismatch.' }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -105,6 +140,7 @@ try {
     try { $driverExpectedHash=[BitConverter]::ToString($driverSha.ComputeHash($driverStream)).Replace('-','') } finally { $driverSha.Dispose();$driverStream.Dispose() }
     if ((Get-FileHash -LiteralPath $rtl -Algorithm SHA256).Hash -ne $driverExpectedHash) { throw 'The driver DLL differs from the verified official release archive.' }
 } finally { $driverZip.Dispose() }
+}
 
 function Get-PeInfo([string]$Path) {
     $bytes = [IO.File]::ReadAllBytes($Path)
@@ -137,12 +173,28 @@ function Get-PeInfo([string]$Path) {
     }
     return @{ machine='x86_64'; imports=@($imports | Sort-Object -Unique); file_version=[Diagnostics.FileVersionInfo]::GetVersionInfo($Path).FileVersion }
 }
-$peInfo = [ordered]@{ application=Get-PeInfo $BinaryPath; rtlsdr=Get-PeInfo $rtl; vcruntime=Get-PeInfo $RuntimeDllPath }
-foreach ($image in $peInfo.Values) {
-    foreach ($dependency in $image.imports) {
-        if ($dependency -notmatch '^(?i:api-ms-win-.*|ext-ms-win-.*|kernel32|ntdll|bcryptprimitives|ws2_32|vcruntime140|ucrtbase|advapi32|user32|shell32|ole32|secur32|userenv)\.dll$') { throw "Unexpected DLL dependency requires review: $dependency" }
+$peInfo = [ordered]@{ application=Get-PeInfo $BinaryPath; rtlsdr=Get-PeInfo $rtl }
+if (!$PublicRelease) { $peInfo['vcruntime']=Get-PeInfo $RuntimeDllPath }
+$dependencyResolution=@()
+$externalRuntimeDlls=@()
+foreach ($imageName in $peInfo.Keys) {
+    foreach ($dependency in $peInfo[$imageName].imports) {
+        if ($dependency -ieq 'vcruntime140.dll') {
+            $resolution=if ($PublicRelease) { 'external_prerequisite' } else { 'bundled' }
+            if ($PublicRelease) { $externalRuntimeDlls+=$dependency.ToLowerInvariant() }
+        } elseif ($dependency -match '^(?i:api-ms-win-.*|ext-ms-win-.*|kernel32|ntdll|bcryptprimitives|ws2_32|ucrtbase|msvcrt|advapi32|user32|shell32|ole32|secur32|userenv|setupapi|cfgmgr32|winusb)\.dll$') {
+            $resolution='windows_system'
+        } else { throw "Unexpected DLL dependency requires review: $dependency" }
+        $dependencyResolution+=@{image=$imageName;dll=$dependency;resolution=$resolution}
     }
 }
+$externalRuntimeDlls=@($externalRuntimeDlls | Sort-Object -Unique)
+$requiredPrerequisites=@()
+if ($externalRuntimeDlls.Count) {
+    $requiredPrerequisites+=@{id='microsoft-visual-cpp-v14-x64';name='Microsoft Visual C++ v14 Redistributable (x64)';version_requirement='latest supported v14, at least as recent as the MSVC build tools used for this build';official_download_url='https://aka.ms/vc14/vc_redist.x64.exe';official_documentation_url='https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170';required_dlls=$externalRuntimeDlls;included=$false}
+}
+$distribution=if ($PublicRelease) { 'public-portable-development' } else { 'private-portable-development' }
+$applicationLicense=if ($PublicRelease) { 'GPL-3.0-or-later' } else { $null }
 $presetBytes=[IO.File]::ReadAllBytes($PresetPath)
 $presetText=[Text.Encoding]::UTF8.GetString($presetBytes)
 $preset=$presetText | ConvertFrom-Json
@@ -169,7 +221,7 @@ function Copy-New([string]$Source,[string]$Relative) {
     [IO.File]::Copy($Source,$target,$false)
 }
 Copy-New $BinaryPath 'rtl-spectrum-studio.exe'
-Copy-New $RuntimeDllPath 'vcruntime140.dll'
+if (!$PublicRelease) { Copy-New $RuntimeDllPath 'vcruntime140.dll' }
 Copy-New $rtl 'drivers\rtlsdr\rtlsdr.dll'
 $presetName=[IO.Path]::GetFileName($PresetPath)
 Copy-New $PresetPath (Join-Path 'data\settings\presets' $presetName)
@@ -189,7 +241,7 @@ if ($demoBundle) {
     if ((Get-FileHash -LiteralPath (Join-Path $destination 'demo/manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $demoBundle.manifest_sha256) { throw 'Copied demo manifest changed during packaging.' }
 }
 
-Write-New 'studio-root.json' ('{"app_id":"rtl-sdr-spectrum-studio","layout_version":1,"distribution":"private-portable-development","package_version":"'+$PackageVersion+'"}'+"`n")
+Write-New 'studio-root.json' ('{"app_id":"rtl-sdr-spectrum-studio","layout_version":1,"distribution":"'+$distribution+'","package_version":"'+$PackageVersion+'"}'+"`n")
 $launcher=@'
 @echo off
 setlocal
@@ -254,9 +306,36 @@ if ($demoBundle) {
     $guide+="`n`nこのパッケージには保存IQのデモファイルを同梱していない。保存IQの再生は、アプリ内へSigMFのmetadataとdataを置き『保存データ』から開始する。`n"
 }
 
+if ($PublicRelease) {
+    $guide=$guide.Replace('# RTL-SDR Spectrum Studio - Windows portable development build','# RTL-SDR Spectrum Studio - 公開用GPL3開発版')
+    $guide=$guide.Replace('これは個人用の開発版。第三者への公開・配布用のライセンス選定や完全なクリーンPC受入れを済ませた意味ではない。','本体のオリジナルコード・文書・同梱デモは、権利が及ぶ範囲でGPL-3.0-or-later。LICENSE と LICENSE.md を参照。第三者の著作物には各提供元の条件が適用される。これは公開用の開発版で、クリーンな別PCや屋外ノートPCでの受入れ完了を意味しない。対応するソースとビルド手順: https://github.com/ReiA-O/rtl-sdr-spectrum-studio 。')
+    $runtimeGuide=@'
+
+## 初回起動前のMicrosoft Runtime導入
+
+この公開パッケージは `vcruntime140.dll` を同梱しない。起動前にMicrosoft公式の最新Visual C++ v14 Redistributable x64を導入する。すでに対応版が導入されているPCでは再導入は不要。
+公式ダウンロード: https://aka.ms/vc14/vc_redist.x64.exe
+公式の対応条件: https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
+実行に必要なRuntimeは、アプリのビルドに使ったMSVC Build Toolsと同じかそれより新しい版を使う。Runtimeの不足が表示された場合は上記の公式手順を使い、DLL配布サイトから取得しない。
+Microsoft Runtimeの導入は利用者が手動で行う。このアプリや起動スクリプトからダウンロード・インストールは実行しない。RuntimeにはMicrosoftの条件が適用され、本体のGPLへ変更しない。
+実機なしのIQ再生にもアプリ実行用Runtimeは必要。RTL-SDRのUSBドライバーは保存IQの再生には不要。
+'@
+    $guide=$guide.Replace('2. `start-studio.cmd` を開く。ローカルブラウザー画面が開く。','2. 下記のMicrosoft Runtimeを確認してから `start-studio.cmd` を開く。ローカルブラウザー画面が開く。')
+    $guide+=$runtimeGuide
+    Copy-New (Join-Path $project 'LICENSE') 'LICENSE'
+    $packageLicenseText=[IO.File]::ReadAllText((Join-Path $project 'LICENSE.md')).Replace('tools/portable-support/NOTICE.md','licenses/THIRD-PARTY-NOTICES.md').Replace('publication/repository/docs/PACKAGING.md','はじめに.md').Replace('docs/PACKAGING.md','はじめに.md')
+    Write-New 'LICENSE.md' $packageLicenseText
+}
 Write-New 'はじめに.md' $guide
-foreach ($item in Get-ChildItem -LiteralPath (Join-Path $support 'licenses') -File) { Copy-New $item.FullName (Join-Path 'licenses' $item.Name) }
-foreach ($item in Get-ChildItem -LiteralPath (Join-Path $support 'sources') -File) { Copy-New $item.FullName (Join-Path 'third-party-source' $item.Name) }
+foreach ($item in Get-ChildItem -LiteralPath (Join-Path $support 'licenses') -File) {
+    if ($PublicRelease -and $item.Name -match '^Microsoft-(?:VC|VS)-.*License\.(?:docx|txt|html)$') { continue }
+    Copy-New $item.FullName (Join-Path 'licenses' $item.Name)
+}
+if ($PublicRelease) {
+    foreach ($sourceDriverFile in $sourceDriverFiles) { Copy-New $sourceDriverFile.source_path (Join-Path 'third-party-source/driver' $sourceDriverFile.path) }
+} else {
+    foreach ($item in Get-ChildItem -LiteralPath (Join-Path $support 'sources') -File) { Copy-New $item.FullName (Join-Path 'third-party-source' $item.Name) }
+}
 Copy-New (Join-Path $RustCopyrightPath 'COPYRIGHT-library.html') 'licenses\rust-standard-library\COPYRIGHT-library.html'
 foreach ($item in Get-ChildItem -LiteralPath (Join-Path $RustCopyrightPath 'licenses') -File) { Copy-New $item.FullName (Join-Path 'licenses\rust-standard-library\licenses' $item.Name) }
 $crateNotices=@();$metadata=[IO.File]::ReadAllText($CargoMetadataPath) | ConvertFrom-Json
@@ -277,11 +356,15 @@ foreach ($crate in $metadata.packages | Where-Object { $_.source -and $reachable
 }
 Write-New 'licenses\rust-crates.json' (@{ resolved_windows_crates=$crateNotices;scope='Transitive reachable dependency graph from cargo metadata --offline --locked --filter-platform x86_64-pc-windows-msvc, including build/proc-macro dependencies.' } | ConvertTo-Json -Depth 12)
 Copy-New (Join-Path $support 'NOTICE.md') 'licenses\THIRD-PARTY-NOTICES.md'
-Copy-New (Join-Path $support 'provenance.json') 'licenses\upstream-provenance.json'
+if ($PublicRelease) {
+    Write-New 'licenses/upstream-provenance.json' (@{driver=$sourceDriverManifest;driver_materials=@($sourceDriverFiles | ForEach-Object { @{path=$_.path;bytes=$_.bytes;sha256=$_.sha256} });scope='Approved source-built driver; original source archives, patch and build recipe are in third-party-source/driver. Rust crate notices are listed separately.'} | ConvertTo-Json -Depth 12)
+} else {
+    Copy-New (Join-Path $support 'provenance.json') 'licenses\upstream-provenance.json'
+}
 $files=@(Get-ChildItem -LiteralPath $destination -File -Recurse | ForEach-Object { @{ path=$_.FullName.Substring($destination.Length+1).Replace('\','/');bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } })
-$manifest=@{ application='RTL-SDR Spectrum Studio';package_version=$PackageVersion;created_at=(Get-Date).ToString('o');architecture='windows-x64';web_assets='embedded in executable';startup_receive=$false;startup_arm=$false;startup_record=$false;user_data='New package-local data; approved AFG demo only when included; no private user recordings/session copied';approved_demo_included=($null -ne $demoBundle);approved_demo_manifest_sha256=$(if ($demoBundle) { $demoBundle.manifest_sha256 } else { $null });approved_demo_files=$approvedDemoFiles;initial_preset=$presetName;initial_preset_sha256=(Get-FileHash -LiteralPath $PresetPath -Algorithm SHA256).Hash.ToLowerInvariant();pe_images=$peInfo;files=$files }
+$manifest=@{ distribution=$distribution;application_license=$applicationLicense;source_built_driver=[bool]$PublicRelease;driver_sha256=$driverExpectedHash.ToLowerInvariant();vcruntime_included=(!$PublicRelease);required_prerequisites=$requiredPrerequisites;dependency_resolution=$dependencyResolution;application='RTL-SDR Spectrum Studio';package_version=$PackageVersion;created_at=(Get-Date).ToString('o');architecture='windows-x64';web_assets='embedded in executable';startup_receive=$false;startup_arm=$false;startup_record=$false;user_data='New package-local data; approved AFG demo only when included; no private user recordings/session copied';approved_demo_included=($null -ne $demoBundle);approved_demo_manifest_sha256=$(if ($demoBundle) { $demoBundle.manifest_sha256 } else { $null });approved_demo_files=$approvedDemoFiles;initial_preset=$presetName;initial_preset_sha256=(Get-FileHash -LiteralPath $PresetPath -Algorithm SHA256).Hash.ToLowerInvariant();pe_images=$peInfo;files=$files }
 Write-New 'package-manifest.json' ($manifest | ConvertTo-Json -Depth 14)
-$validation=@{ pe_x64_and_dependencies_checked=$true;approved_binary_hash_matches=$true;no_absolute_path_in_initial_preset=$true;privacy_utf8_utf16_all_files_checked=($ForbiddenText.Count -gt 0);privacy_term_count=$ForbiddenText.Count;existing_user_data_modified=$false;private_user_recordings_copied=$false;approved_demo_included=($null -ne $demoBundle);approved_demo_files=$approvedDemoFiles;application_started_by_packager=$false;hardware_operated_by_packager=$false;self_check_executed=$false;clean_windows_pc_tested=$false;outside_laptop_rf_tested=$false }
+$validation=@{ public_release=[bool]$PublicRelease;vcruntime_included=(!$PublicRelease);external_prerequisites_declared=($externalRuntimeDlls.Count -gt 0);pe_x64_and_dependencies_checked=$true;approved_binary_hash_matches=$true;no_absolute_path_in_initial_preset=$true;privacy_utf8_utf16_all_files_checked=($ForbiddenText.Count -gt 0);privacy_term_count=$ForbiddenText.Count;existing_user_data_modified=$false;private_user_recordings_copied=$false;approved_demo_included=($null -ne $demoBundle);approved_demo_files=$approvedDemoFiles;application_started_by_packager=$false;hardware_operated_by_packager=$false;self_check_executed=$false;clean_windows_pc_tested=$false;outside_laptop_rf_tested=$false }
 Write-New 'package-validation.json' ($validation | ConvertTo-Json -Depth 8)
 $privacyLatin1=[Text.Encoding]::GetEncoding(28591)
 foreach ($privacyFile in Get-ChildItem -LiteralPath $destination -File -Recurse) {
@@ -311,5 +394,5 @@ try {
         if ($actual -ne $expected) { throw "ZIP verification failed: $relative" }
     }
 } finally { $archive.Dispose() }
-$result=@{ package_folder=$destination;zip_path=$zipPath;zip_sha256=(Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant();zip_bytes=(Get-Item -LiteralPath $zipPath).Length;zip_all_entry_hashes_verified=$true;application_started=$false }
+$result=@{ distribution=$distribution;vcruntime_included=(!$PublicRelease);required_prerequisites=$requiredPrerequisites;package_folder=$destination;zip_path=$zipPath;zip_sha256=(Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant();zip_bytes=(Get-Item -LiteralPath $zipPath).Length;zip_all_entry_hashes_verified=$true;application_started=$false }
 $result | ConvertTo-Json -Depth 5

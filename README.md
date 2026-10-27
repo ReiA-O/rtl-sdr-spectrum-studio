@@ -2,11 +2,13 @@
 
 RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観測を行うWindows向け開発版です。Rust本体がローカルHTTPサーバーを動かし、exeに内蔵した画面を通常のブラウザーへ表示します。Pythonは数値比較・単体テスト用の参照実装で、アプリの実行には使いません。
 
-配布対象の最新デモ同梱ZIPは **`RTL-SDR-Spectrum-Studio-0.4.0-dev-demo-windows-x64-20261027-210450-328.zip`**（11,296,451 bytes、SHA256 `d04cde25fc4e250837dd80ff4a5d5c19838f40261dd5906428aba0ec967892de`）です。本体exeはv0.4.0と同一で、IQデモ・専用プリセット・案内を加えた配布構成です。[Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases) の`v0.4.0-demo`へprivateの下書きとして保存済みで、GitHub asset digestも上記SHA256と一致しています。公開化はしていません。
+**公開プレビュー `v0.4.0-preview.1`** の取得先は [Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.0-preview.1) です。Windows x64用のデモ同梱ZIPと、アプリ・全66 Rust crate・RTL-SDR/libusbの固定ソース・patch・ビルド手順を収めた対応ソースZIPを一緒に配布します。パッケージ版は **`0.4.0-public-preview.1`**、アプリ内部の版は **`0.4.0`** です。取得するassetの正確なファイル名とSHA256はリリースの案内・同梱manifestで確認してください。
 
-v0.4.0は、帯域を決めてピークを選び、VFOで復調し、対象局を含む原IQを保存する導線を中心にしています。受信用の中心DC補正を既定ONで追加しました。最終配布物で設定境界・API・50Ω終端の受信・DEMOの画面操作を確認しました。条件と未検証部分は [VALIDATION.md](docs/VALIDATION.md) に記載しています。
+v0.4.0は、帯域を決めてピークを選び、VFOで復調し、対象局を含む原IQを保存する導線を中心にしています。受信用の中心DC補正を既定ONで追加しました。これまでのv0.4.0開発版で設定境界・API・50Ω終端の受信・DEMOの画面操作を確認しました。条件と未検証部分は [VALIDATION.md](docs/VALIDATION.md) に記載しています。
 
-現在はレビュー用のソース一式です。公開・販売向けのライセンス選定や製品全体の受入れ完了を意味しません。[LICENSE.md](LICENSE.md) と [検証範囲](docs/VALIDATION.md) を先に確認してください。
+オリジナルコード・文書・同梱デモには **GPL-3.0-or-later** を適用します。第三者のコードは各原ライセンスを維持します。[LICENSE.md](LICENSE.md)・[NOTICE.md](NOTICE.md) と [検証範囲](docs/VALIDATION.md) を確認してください。これは開発中のpre-releaseで、製品全体の受入れ、別PCや屋外での動作、RFの絶対レベル校正を保証するものではありません。
+
+初回起動前に [Microsoft公式Visual C++ v14ランタイム（x64）](https://aka.ms/vc14/vc_redist.x64.exe) を導入してください。公開ZIPには`vcruntime140.dll`を同梱しません。
 
 ## 録音IQデモ
 
@@ -17,7 +19,7 @@ AFG3102から32 MHz・FM偏移±75 kHz・1 kHzの試験音を出力し、Studio�
 3. 「保存データ」から **`demo_afg_fm_32mhz.sigmf-meta`** の「IQ再生」を選び、上部の **「再生開始」** を押します。
 4. 音量を小さくし、「音声OFF」を押してONにすると試験音を出力します。終端で自動停止し、再生位置スライダーを先頭へ戻すと繰り返せます。「ライブへ戻る」で終了します。
 
-保存IQ再生はRTL-SDR・AFG・WinUSBを使わない経路です。最終ZIPでは受信DLLを無効化した模擬状態で再生14項目を確認しました。実USB抜去や清浄な別PCでの受入れ、実際のスピーカー聴感を確認した意味ではありません。実GUI9項目は先行デモ候補で確認し、最終版では案内の×操作を追記しただけでexe・IQ・metadata・プリセットの4点は同一hashです。
+保存IQ再生はRTL-SDR・AFG・WinUSBを使わない経路です。旧デモZIPでは受信DLLを無効化した模擬状態で再生14項目を確認しました。実USB抜去や清浄な別PCでの受入れ、実際のスピーカー聴感を確認した意味ではありません。実GUI9項目は先行デモ候補で確認し、当時の最終デモ版では案内の×操作を追記しただけでexe・IQ・metadata・プリセットの4点は同一hashです。
 
 FMでは最大のスペクトルピークが搬送中心とは限らないため、最初は同梱プリセットのVFO **32.000 MHz・WFM・200 kHz** で再生してください。手動FFT4096点、実効RBW375 Hzの設定です。既存の測定用初期プリセットは置き換えません。IQは`.sigmf-meta`と`.sigmf-data`をセットで扱い、復調音のWAVと区別します。
 
@@ -45,7 +47,9 @@ VFOの「受信・音声補助」を開き、AFC等を変更して「補助に�
 
 ## 実行・ビルド
 
-配布用ZIPを使う場合は、Windows 10/11 x64と通常のブラウザーを用意し、ZIPをすべて書込み可能な場所へ展開して`start-studio.cmd`を開きます。Rust・Python・Node・Build Toolsの追加は不要です。別PCでLIVE受信する場合は受信機のInterface 0用WinUSBドライバー設定が必要です。ドライバーの導入や受信開始は自動実行しません。
+配布用ZIPを使う場合は、Windows 10/11 x64と通常のブラウザーを用意します。初回起動前に [Microsoft公式 Visual C++ v14 Redistributable（x64）](https://aka.ms/vc14/vc_redist.x64.exe) を導入または更新し、ZIPをすべて書込み可能な場所へ展開して`start-studio.cmd`を開いてください。公開ZIPには`vcruntime140.dll`を同梱しません。ビルドに使ったMSVCと同じかそれより新しい対応ランタイムが必要です。Rust・Python・Node・Build Toolsは実行先には不要です。ランタイム導入は利用者が行い、アプリからの自動インストールは行いません。
+
+LIVE受信には受信機のInterface 0用WinUSBドライバー設定が別途必要です。保存IQの再生には受信機やWinUSBは不要ですが、アプリ用のMicrosoftランタイムは必要です。USBドライバーの導入や受信開始は自動実行しません。
 
 ソースからビルドするPCには、RustのMSVCツールチェーンとMicrosoft C++ Build Toolsが必要です。
 
@@ -54,7 +58,9 @@ VFOの「受信・音声補助」を開き、AFC等を変更して「補助に�
 .\start-studio.cmd
 ```
 
-受信DLLがなくても起動でき、画面には未接続状態が表示されます。LIVE受信に使う公式ドライバーの取得とパッケージ生成は [PACKAGING.md](docs/PACKAGING.md) を参照してください。DLL取得は明示実行で行い、USBドライバーのインストールや機器設定変更は行いません。
+受信DLLがなくても起動でき、画面には未接続状態が表示されます。公開プレビューの`rtlsdr.dll`は、RTL-SDR Blog **V1.4.0** と libusb **1.0.30** の固定ソースからビルドしたWindows x64版です。libusbを静的リンクし、Microsoft CRTを動的リンクしています。DLLのSHA256は `761de6ef2f57047f1dfbbf2346cb53247b2974f5d1fb11b64f9498b650cafc05`。ドライバーの対応ソースと再ビルド、パッケージ生成は [PACKAGING.md](docs/PACKAGING.md) を参照してください。WindowsのUSBドライバーのインストールや機器設定変更は行いません。
+
+ネット接続なしでソースから再ビルドする場合は、同じリリースの対応ソースZIPを展開し、先に`SOURCE_BUILD.md`を確認してください。通常のGitHub source archiveとは別に、全66 Rust crateをvendorし、RTL/libusbのソースarchive・MSVC設定patch・再現手順を含めています。
 
 起動時は受信・Arm・録音を停止しています。設定は`data/settings/`、新しいIQ/WAVは`data/recordings/`へ保存します。初回に同梱プリセットを読み込む場合は、受信停止中に`presets/fm-measurement.json`を設定プリセットとして配置するか、パッケージ生成時に初期値として同梱します。含まれる周波数やゲインは一つの実験条件で、屋外受信の万能設定ではありません。
 
@@ -99,3 +105,7 @@ PowerShellでは、例えば出力先を`verification/electrical-probe-001/resul
 - `tools/`: 明示実行のDLL取得・パッケージ生成。機器操作用の実験スクリプトは含めません。
 
 明示承認されたAFGデモIQだけを例外対象とし、個人の録音・個人設定・校正情報・機器IP／シリアル番号・開発環境の絶対パス・非公開の実験記録はリポジトリに含めません。更新版は別フォルダーへ展開し、既存の`data/`を上書き・削除しないでください。
+
+## 配布履歴
+
+2026-10-27の旧デモ同梱開発版 `RTL-SDR-Spectrum-Studio-0.4.0-dev-demo-windows-x64-20261027-210450-328.zip` は、11,296,451 bytes、SHA256 `d04cde25fc4e250837dd80ff4a5d5c19838f40261dd5906428aba0ec967892de` です。`v0.4.0-demo`のprivate下書きに保存した時点では、公開用ライセンスの選定が未完了でした。この履歴は保持し、現在の公開プレビューではGPL-3.0-or-laterの選定、対応ソースの同梱、ソースからビルドしたDLLへの変更、Microsoftランタイムの外部前提化を反映しています。旧ZIPのhashや検証結果を、公開プレビューZIPのhash・検証結果として扱わないでください。

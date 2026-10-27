@@ -1,0 +1,14 @@
+# RTL-SDR Spectrum Studio — Notices
+
+オリジナルコード・文書・同梱デモは、著作権が及ぶ範囲で **GPL-3.0-or-later** を適用します。本文と条件は [LICENSE.md](LICENSE.md) と [LICENSE](LICENSE) を参照してください。第三者の著作権・原ライセンス・通知は維持します。
+
+`v0.4.0-preview.1` はアプリ内部版 `0.4.0`、Windowsパッケージ版 `0.4.0-public-preview.1` の公開pre-releaseです。[リリースページ](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.0-preview.1) には、Windows x64用ZIPと、アプリ・全66 Rust crate・RTL-SDR/libusbの固定ソース・patch・手順を含む対応ソースZIPを用意します。
+
+- RTL-SDR Blog V1.4.0とlibusb 1.0.30からWindows x64の`rtlsdr.dll`をソースビルドします。libusbは静的リンク、Microsoft CRTは動的リンクです。
+- MicrosoftランタイムやWindows system DLLは公開ZIPに同梱しません。初回起動前に [Microsoft公式Visual C++ v14 Redistributable（x64）](https://aka.ms/vc14/vc_redist.x64.exe) を利用してください。Microsoftの利用条件が適用されます。
+- Rust標準ライブラリーと依存crateの原ライセンス・著作権通知を配布物へ保全します。詳しい出典は [第三者通知](tools/portable-support/NOTICE.md) にあります。
+- AFGで生成して収録した同梱IQの条件・再生方法は [デモ案内](demo/README.md) にあります。通常受信した個人の録音データは同梱しません。
+
+再ビルド・配布構成は [PACKAGING.md](docs/PACKAGING.md)、検証済みの範囲と未検証部分は [VALIDATION.md](docs/VALIDATION.md) を参照してください。
+
+2026-10-27以前のprivate開発版では公開ライセンスの選定が未完了で、公式prebuilt DLLとMicrosoftランタイムを同梱する構成でした。その経緯はREADMEとPACKAGINGの配布履歴に残し、この公開pre-releaseの構成と区別します。

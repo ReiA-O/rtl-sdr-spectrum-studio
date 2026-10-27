@@ -1,6 +1,26 @@
 # 検証範囲
 
-## AFG実録IQデモ同梱版
+## 公開プレビュー v0.4.0-preview.1 の配布検証
+
+アプリ内部版は0.4.0、配布版は0.4.0-public-preview.1です。アプリexeは前のv0.4.0と同一SHA256で、今回の変更はGPLライセンス宣言、配布script・文書、source-built driver、Microsoft runtime別導入です。過去の本体検証を新しいDLL・配布構成の検証と混同しません。
+
+| 対象 | 結果・限定範囲 |
+|---|---|
+| 新driverのsource build | RTL-SDR Blog V1.4.0＋libusb1.0.30。libusb静的・CRT /MD動的。x64、アプリが使う21exportを確認。別展開から同じrecipeでoffline再build成功。timestamp等のためbinary byte一致は主張しない |
+| 新driverのUSB実行 | 24項目成功。auto23,999,999 Hz→Direct Q／24,000,000 Hz→tunerと補正適用状態、Fs1.024／2.4 MS/s、要求gain−10／60 dB→reported0／49.6 dB、AGC reported null、PPM±500で有限sample取得。24 MHz境界は各2,228,224samples。AFG CH1 OFF・公称60 dB減衰経由、配線やAFG操作なし |
+| packager契約 | 128項目成功。public/private、新driverの正確な6source材料・hash・provenance、CRT非同梱、GPL本文、外部prerequisiteを確認。source欠落／改竄／余剰、DLL改竄、不明依存等を拒否。private既定の旧同梱bytesを保持。既存demo契約67項目も成功 |
+| 正確な公開ZIP | 下記ZIPの99entry CRC、manifest97filesの全bytes／SHA256一致・余剰なし、CRT非同梱・GPL・new driver・6source材料を確認。self-check exit0、内包UI／DLL読込成功。self-checkはreceiver／server／recordingを開始しない |
+
+正確な公開ZIPから展開した専用runtimeでREPLAY14項目も成功。IQ一覧・専用preset・WFM WAV主成分1000 Hz・PCM transport・EOF／seek／停止・設定復帰・同梱assets不変を確認しました。音声の数値／輸送経路の検査で、スピーカーの実聴ではありません。専用serverは終了し、元アプリは停止状態を保持しました。
+
+公開Windows ZIPは`RTL-SDR-Spectrum-Studio-0.4.0-public-preview.1-windows-x64-20261027-220010-601.zip`、11,859,622bytes、SHA256 `18922b48928efece87f961585f80e1ee3c13403549a42cca6cec6f2b65cf568c`です。driver SHA256は`761de6ef2f57047f1dfbbf2346cb53247b2974f5d1fb11b64f9498b650cafc05`。Microsoft公式Visual C++ v14 Runtime x64を別途導入する構成で、対応runtime導入済みのこのPCで実行しています。
+
+新driverの初期化中にはPLL not lockedログが出る経路もあります。sample取得・software読戻しをアナログPLL lock／実gainの独立測定として扱いません。新driverでのRF全域感度・SINAD・SFDR・圧縮・鏡像・平坦度・温度依存、clean Windows／別PC／屋外／実スピーカー聴感／長時間は未検証です。元アプリ・元設定・通常録音を保持し、専用検証runtimeを使っています。
+
+対応source ZIPは同じ公開commitから作り、全66crateとdriver全source／patch／recipeを含めます。最終source ZIPのhash・offline buildと正確公開ZIPのREPLAY結果は、[同じRelease](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.0-preview.1)の検証記録と照合してください。下段は旧privateデモ版と以前の本体試験の履歴です。
+
+
+## 旧private AFG実録IQデモ同梱版（履歴）
 
 AFG3102の32 MHz FM（偏移±75 kHz、1 kHz試験音）をStudioで収録し、明示承認されたIQだけを同梱した配布構成です。本体exeは既存v0.4.0と同一hashで、以下は従来のv0.4.0本体の合格数とは別に管理します。
 
