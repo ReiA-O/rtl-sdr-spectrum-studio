@@ -14,7 +14,7 @@
   let audioSources = [], lastAudioVfo = null, audioReceivedAt = 0;
   let layout = {spectrum_ratio: .6, vfo_width: 340, bottom_ratio: .5};
   let extraConditions = [], seenNotifications = new Set(), tuningTimer = null, frameFailures = 0, lastDeviceError = null;
-  let frameTimer = null, framePending = false, frameRefreshRequested = false;
+  let frameTimer = null, framePending = false, frameRefreshRequested = false, frameEpoch = 0, traceResetsPending = 0;
   let actionQueue = Promise.resolve(), stateEpoch = 0;
   let userSelectionIntent, userSelectionGeneration = 0, userSelectionPending = false, userSelectionPromise = Promise.resolve(true);
   let vfoSelectionIntent, vfoSelectionGeneration = 0, vfoSelectionPromise = Promise.resolve(true), canvasGestureTarget = 'empty';
@@ -312,6 +312,21 @@
     renderUserMarkerControls(markers);
   }
 
+  function clearTraceDisplayFrame(current) {
+    if(!current?.spectrum)return current;
+    return {...current,spectrum:{...current.spectrum,max_db:[],min_db:[],avg_db:[]}};
+  }
+  function updateTraceResetButton() { $('traceResetButton').setAttribute('aria-busy',String(traceResetsPending>0)); }
+  async function resetTraces() {
+    traceResetsPending++;updateTraceResetButton();
+    try {
+      const result=await action('trace_reset',{}, {forceVfos:false});
+      if(!result)return null;
+      frameEpoch++;frame=clearTraceDisplayFrame(frame);drawSpectrum();requestFrame();
+      toast('Max・Min・Averageをリセットしました');return result;
+    }finally{traceResetsPending--;updateTraceResetButton();}
+  }
+
   function canvasSize(canvas) {
     const rect=canvas.getBoundingClientRect(), ratio=Math.min(devicePixelRatio || 1,2);
     const width=Math.max(2,Math.round(rect.width)),height=Math.max(2,Math.round(rect.height));
@@ -351,7 +366,7 @@
       ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=key==='live'?1.15:1;let started=false;
       spectrum[field].forEach((db,k)=>{const f=freq[k];if(f==null||db==null||!Number.isFinite(db)){started=false;return;}const x=s.x(f),y=clamp(s.y(db),p.top-10,p.top+p.height+10);if(!started){ctx.moveTo(x,y);started=true;}else ctx.lineTo(x,y);});ctx.stroke();
     }
-    const markers=measurementMarkers(frame?.measurements);ctx.font='9px Consolas,monospace';
+    const markers=measurementMarkers(frame?.measurements).sort((a,b)=>Number(userMarkerSelected(a))-Number(userMarkerSelected(b)));ctx.font='9px Consolas,monospace';
     markers.forEach((m,k)=>{
       const db=markerLevel(m),x=s.x(m.frequency_hz),user=isUserMarker(m),selected=userMarkerSelected(m),label=markerLabel(m,k);
       if(user){
@@ -561,6 +576,7 @@
   $('inputApply').addEventListener('click',()=>action('set_input',{input:{gain_db:num('gainDb'),agc:$('agc').checked,ppm:num('ppm')}},{message:'入力条件を適用しました'}));
   $('fftMode').addEventListener('change',updateFftVisibility);
   for(const [key,id] of Object.entries({live:'traceLive',max:'traceMax',min:'traceMin',avg:'traceAvg'})) $(id).addEventListener('change',()=>action('set_display',{display:{traces:{[key]:$(id).checked}}}));
+  $('traceResetButton').addEventListener('click',resetTraces);
   $('detector').addEventListener('change',()=>action('set_analysis',{analysis:{detector:$('detector').value}}));
   $('densityMetric').addEventListener('change',()=>action('set_analysis',{analysis:{density_metric:$('densityMetric').value}}));
   $('waterfallRowSeconds').addEventListener('change',()=>action('set_analysis',{analysis:{waterfall_row_seconds:num('waterfallRowSeconds')}}));
@@ -623,9 +639,9 @@
   async function stateLoop(){await refreshState();setTimeout(stateLoop,1000);}
   function requestFrame(){clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}frameTimer=setTimeout(frameLoop,0);}
   async function frameLoop(){
-    clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}framePending=true;
-    try{const f=await getJson('/api/frame');if(f)acceptFrame(f);if(frameFailures>=3&&$('noticeText').textContent==='解析表示を更新できません。再接続を待っています。')notice('');frameFailures=0;}
-    catch{frameFailures++;if(frameFailures===3&&state?.running&&!connectionError&&!state?.device?.error)notice('解析表示を更新できません。再接続を待っています。','error');}
+    clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}framePending=true;const epoch=frameEpoch;
+    try{const f=await getJson('/api/frame');if(epoch===frameEpoch){if(f)acceptFrame(f);if(frameFailures>=3&&$('noticeText').textContent==='解析表示を更新できません。再接続を待っています。')notice('');frameFailures=0;}}
+    catch{if(epoch!==frameEpoch)return;frameFailures++;if(frameFailures===3&&state?.running&&!connectionError&&!state?.device?.error)notice('解析表示を更新できません。再接続を待っています。','error');}
     finally{framePending=false;const delay=frameRefreshRequested?0:!state?.running?1000:document.hidden?500:125;frameRefreshRequested=false;frameTimer=setTimeout(frameLoop,delay);}
   }
   async function audioLoop(){if(audioEnabled&&state?.running){try{const data=await getJson(`/api/audio?after=${audioSequence}`);if(finite(data.sequence)<audioSequence)audioSequence=0;if(data.data_b64){playPcm(data);audioSequence=finite(data.sequence,audioSequence);}}catch{}}setTimeout(audioLoop,90);}

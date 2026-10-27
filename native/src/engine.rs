@@ -565,11 +565,14 @@ impl Engine {
     }
     pub fn apply(&mut self,body:&Value)->Result<Value,ActionError>{
         self.apply_action(body)?;
-        if let Err(error)=self.save_last(){self.notify(&format!("設定の保存に失敗しました：{error}"),"warning");}
+        if text(body,"action","")!="trace_reset"{
+            if let Err(error)=self.save_last(){self.notify(&format!("設定の保存に失敗しました：{error}"),"warning");}
+        }
         Ok(self.state())
     }
     fn apply_action(&mut self,body:&Value)->Result<(),ActionError>{
         match text(body,"action",""){
+            "trace_reset"=>self.analyzer.reset_traces(),
             "set_input"=>{
                 let patch=&body["input"];let candidate=self.plan_input(patch,boolean(body,"confirm_impacted",false))?;
                 let changed=patch.as_object().unwrap().keys().any(|key|!same(&self.input[key.as_str()],&candidate[key.as_str()]));
@@ -769,6 +772,66 @@ impl Engine {
 mod tests{
     use super::*;
     fn engine()->Engine{Engine::new(std::env::temp_dir().join(format!("spectrum-engine-test-{}-{}",std::process::id(),Utc::now().timestamp_nanos_opt().unwrap()))).unwrap()}
+    fn trace_test_iq(samples:usize,amplitude:f64)->Vec<u8>{
+        (0..samples).flat_map(|k|{let phase=-std::f64::consts::TAU*256000.0*k as f64/2048000.0;
+            [(127.5+amplitude*phase.cos()).round()as u8,(127.5+amplitude*phase.sin()).round()as u8]}).collect()
+    }
+    fn assert_trace_seeded_from_live(frame:&Value){
+        for name in ["max_db","min_db","avg_db"]{assert_eq!(frame["spectrum"][name],frame["spectrum"]["live_db"],"{name}");}
+    }
+    #[test]
+    fn trace_reset_is_idempotent_when_empty_and_stopped_without_saving_settings(){
+        let mut e=engine();let initial=e.state();assert!(!e.project.exists());
+        e.apply(&json!({"action":"trace_reset"})).unwrap();e.apply(&json!({"action":"trace_reset"})).unwrap();
+        assert_eq!(e.state(),initial);assert!(!e.project.exists());
+        let empty=e.frame();for key in ["live_db","max_db","min_db","avg_db"]{
+            assert!(empty["spectrum"][key].as_array().unwrap().iter().all(|v|v.as_f64().is_some_and(|level|level.is_finite()&&level<=-290.0)));
+        }
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.process_block(0,&trace_test_iq(16384,20.0)).unwrap();e.on_stop("test");let state=e.state();
+        e.apply(&json!({"action":"trace_reset"})).unwrap();assert_eq!(e.state(),state);assert_trace_seeded_from_live(&e.frame());
+    }
+    #[test]
+    fn trace_reset_preserves_active_iq_wav_prebuffer_markers_and_stream(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.apply(&json!({"action":"iq_start"})).unwrap();
+        e.process_block(0,&trace_test_iq(16384,40.0)).unwrap();e.process_block(16384,&trace_test_iq(16384,8.0)).unwrap();
+        e.apply(&json!({"action":"user_marker_add","frequency_hz":32240000.0})).unwrap();
+        let before_frame=e.frame();let before=e.state();let before_config=e.configuration();
+        let pre=e.prebuffer.get(1.0,None).unwrap();let audio=e.audio(0);let last=e.last_sample;
+        let iq=e.iq.as_ref().unwrap().summary();let iq_samples=e.iq.as_ref().unwrap().samples_written;
+        let wav=e.vfos[0].wav.as_ref().unwrap();let wav_samples=wav.samples_written;
+        let wav_state=json!({"active":wav.active,"path":wav.path,"meta_path":wav.meta_path,"samples":wav.samples_written,"bytes":wav.bytes_written,"clips":wav.clipped_samples,"segments":wav.segments});
+        let files=[e.iq.as_ref().unwrap().data_path.clone().unwrap(),e.iq.as_ref().unwrap().meta_path.clone().unwrap(),wav.path.clone().unwrap(),wav.meta_path.clone().unwrap(),e.settings_dir().join("last-session.json")];
+        let bytes:Vec<Vec<u8>>=files.iter().map(|p|fs::read(p).unwrap()).collect();
+        let old_peak=before_frame["spectrum"]["max_db"].as_array().unwrap().iter().filter_map(Value::as_f64).fold(-300.0,f64::max);
+        e.apply(&json!({"action":"trace_reset"})).unwrap();e.apply(&json!({"action":"trace_reset"})).unwrap();
+        assert_eq!(e.state(),before);assert_eq!(e.configuration(),before_config);assert_eq!(e.prebuffer.get(1.0,None).unwrap(),pre);assert_eq!(e.audio(0),audio);assert_eq!(e.last_sample,last);
+        assert_eq!(e.iq.as_ref().unwrap().summary(),iq);let wav=e.vfos[0].wav.as_ref().unwrap();
+        assert_eq!(json!({"active":wav.active,"path":wav.path,"meta_path":wav.meta_path,"samples":wav.samples_written,"bytes":wav.bytes_written,"clips":wav.clipped_samples,"segments":wav.segments}),wav_state);
+        assert_eq!(files.iter().map(|p|fs::read(p).unwrap()).collect::<Vec<_>>(),bytes);
+        let after=e.frame();assert_trace_seeded_from_live(&after);
+        for key in ["density","waterfall","valid_frames","invalid_frames","gap_samples","sample_index"]{assert_eq!(after[key],before_frame[key],"{key}");}
+        for key in ["cp_dbfs","obw_hz","obw_low_hz","obw_high_hz","markers"]{assert_eq!(after["measurements"][key],before_frame["measurements"][key],"{key}");}
+        assert_eq!(after["measurements"]["cp_avg_dbfs"],after["measurements"]["cp_dbfs"]);
+        let reset_peak=after["spectrum"]["max_db"].as_array().unwrap().iter().filter_map(Value::as_f64).fold(-300.0,f64::max);assert!(reset_peak<old_peak-10.0);
+        e.process_block(last,&trace_test_iq(16384,4.0)).unwrap();assert!(e.running&&e.iq_active()&&e.wav_active());
+        assert_eq!(e.iq.as_ref().unwrap().samples_written,iq_samples+16384);assert!(e.vfos[0].wav.as_ref().unwrap().samples_written>wav_samples);
+        let continued=e.frame();let continued_peak=continued["spectrum"]["max_db"].as_array().unwrap().iter().filter_map(Value::as_f64).fold(-300.0,f64::max);assert!(continued_peak<old_peak-10.0);
+        e.on_stop("test");
+    }
+    #[test]
+    fn trace_reset_during_replay_preserves_armed_trigger_and_sample_timing(){
+        let mut e=engine();e.on_start("replay",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"set_trigger","trigger":{"pre_seconds":0.001,"threshold_db":10.0}})).unwrap();
+        e.process_block(0,&trace_test_iq(16384,20.0)).unwrap();e.apply(&json!({"action":"arm"})).unwrap();
+        e.process_block(16384,&trace_test_iq(16384,8.0)).unwrap();assert!(e.trigger.armed);assert!(e.trigger_last_frame.is_some());
+        let before=e.state();let trigger=e.trigger.snapshot();let trigger_frame=e.trigger_last_frame;let pre=e.prebuffer.get(1.0,None).unwrap();
+        let previous=e.frame();e.apply(&json!({"action":"trace_reset"})).unwrap();
+        assert_eq!(e.state(),before);assert_eq!(e.trigger.snapshot(),trigger);assert_eq!(e.trigger_last_frame,trigger_frame);assert_eq!(e.prebuffer.get(1.0,None).unwrap(),pre);
+        let after=e.frame();assert_trace_seeded_from_live(&after);assert_eq!(after["density"],previous["density"]);assert_eq!(after["waterfall"],previous["waterfall"]);assert_eq!(after["sample_index"],previous["sample_index"]);
+        e.on_stop("test");
+    }
     #[test]
     fn input_confirmation_and_all_routes_share_filter_bounds(){
         let mut e=engine();let old=e.input.clone();let err=e.plan_input(&json!({"center_hz":40e6}),false).unwrap_err();

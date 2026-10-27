@@ -190,6 +190,24 @@ impl Analyzer {
         self.avg_acc.iter().map(|p|p/divisor).collect()
     }
 
+    /// Restart only Max/Min/Average from the latest valid Live frame. The
+    /// sample clock, partially assembled FFT, density and waterfall continue.
+    pub fn reset_traces(&mut self) {
+        if self.last_frame_time.is_some() {
+            self.max_psd.clone_from(&self.last_psd);
+            self.min_psd.clone_from(&self.last_psd);
+            self.avg_acc.clone_from(&self.last_psd);
+            self.avg_weight=1.0;
+        } else {
+            self.max_psd.fill(0.0);
+            // Keep the normal first-frame sentinel internally; snapshot's
+            // finite guard renders the empty trace at the dB floor.
+            self.min_psd.fill(f64::INFINITY);
+            self.avg_acc.fill(0.0);
+            self.avg_weight=0.0;
+        }
+    }
+
     fn tau(&self) -> f64 {
         match self.config.persistence_unit.as_str() {
             "frames" => self.config.persistence_frames as f64*self.hop as f64/self.config.sample_rate/LN_2,
@@ -661,6 +679,57 @@ mod tests {
         let mut cfg=a.config.clone();cfg.persistence_mode="off".into();a.update_config(cfg).unwrap();a.process(&tone(2048,64000.0,4000.0,0.25),20000);assert_eq!(a.density_statistics().1,1.0);
         let mut cfg=a.config.clone();cfg.persistence_unit="time_constant".into();cfg.switch_policy="retain".into();assert_eq!(a.update_config(cfg).unwrap()["history_cleared"],true);assert_eq!(a.total_valid_frames,0);
         assert_eq!(fft_size_for_rbw(2048000.0,750.0,"hann"),4096);
+    }
+    #[test]
+    fn trace_reset_restarts_from_live_without_erasing_other_analysis_history(){
+        let cfg=Config{sample_rate:64000.0,fft_size:1024,..Config::default()};
+        let mut a=Analyzer::new(cfg);
+        a.process(&tone(4096,64000.0,4000.0,0.8),0);
+        a.process(&tone(4096,64000.0,4000.0,0.2),4096);
+        a.note_gap(37);
+        let mut partial=tone(3000,64000.0,4000.0,0.2);partial[0]=Complex32::new(f32::NAN,0.0);
+        a.process(&partial,8229);
+        let bin=a.config.fft_size/2+64;
+        let old_max=a.max_psd[bin];let live=a.last_psd.clone();
+        assert!(old_max>live[bin]*10.0);
+        assert!(!a.tail.is_empty());assert!(a.invalid_frames>0&&a.gap_samples>0);
+        let before=a.snapshot(64000.0,0.0,128);
+        let tail=a.tail.clone();let tail_start=a.tail_start;let expected=a.expected_next;
+        let counters=(a.total_valid_frames,a.invalid_frames,a.gap_samples,a.last_frame_time);
+        let config=serde_json::to_value(&a.config).unwrap();
+        a.reset_traces();
+        assert_eq!(a.max_psd,live);assert_eq!(a.min_psd,live);assert_eq!(a.average_psd(),live);
+        assert_eq!(a.last_psd,live);assert_eq!(a.tail,tail);assert_eq!(a.tail_start,tail_start);assert_eq!(a.expected_next,expected);
+        assert_eq!((a.total_valid_frames,a.invalid_frames,a.gap_samples,a.last_frame_time),counters);
+        assert_eq!(serde_json::to_value(&a.config).unwrap(),config);
+        let after=a.snapshot(64000.0,0.0,128);
+        for key in ["density","waterfall","valid_frames","invalid_frames","gap_samples"]{assert_eq!(after[key],before[key],"{key}");}
+        let measured=a.measurements(-16000.0,16000.0,0.0,99.0,6);
+        assert_eq!(measured["cp_avg_dbfs"],measured["cp_dbfs"]);
+        a.reset_traces();assert_eq!(a.snapshot(64000.0,0.0,128),after);
+        // Preserve phase at the input block boundary so this verifies the
+        // lower signal level rather than cancellation from a phase step.
+        let rotation=Complex32::from_polar(1.0,(TAU*4000.0*3000.0/64000.0).rem_euclid(TAU) as f32);
+        let continued_input:Vec<Complex32>=tone(2048,64000.0,4000.0,0.1).into_iter().map(|v|v*rotation).collect();
+        let continued=a.process(&continued_input,11229);
+        assert!(continued.frames_processed>0);
+        assert!(a.max_psd[bin]<=live[bin]*(1.0+1e-6));assert!(a.max_psd[bin]<old_max/4.0);
+        assert!((a.min_psd[bin]*a.enbw_hz-0.01).abs()<1e-6);
+        assert!(a.average_psd()[bin]>0.0&&a.average_psd()[bin]<live[bin]);
+        assert_eq!(a.gap_samples,counters.2);assert_eq!(a.invalid_frames,counters.1);
+    }
+    #[test]
+    fn trace_reset_before_first_fft_keeps_partial_input_and_has_no_fake_level(){
+        let mut a=Analyzer::new(Config{sample_rate:64000.0,fft_size:1024,..Config::default()});
+        let input=tone(1024,64000.0,4000.0,0.25);
+        a.process(&input[..512],0);a.reset_traces();a.reset_traces();
+        let empty=a.snapshot(64000.0,0.0,64);
+        for name in ["live_db","max_db","min_db","avg_db"]{
+            assert!(empty["spectrum"][name].as_array().unwrap().iter().all(|v|v.as_f64().is_some_and(|level|level.is_finite()&&level<=-290.0)));
+        }
+        assert_eq!(a.process(&input[512..],512).frames_processed,1);
+        assert_eq!(a.max_psd,a.last_psd);assert_eq!(a.min_psd,a.last_psd);assert_eq!(a.average_psd(),a.last_psd);
+        let bin=a.config.fft_size/2+64;assert!((a.last_psd[bin]*a.enbw_hz-0.0625).abs()<1e-6);
     }
     #[test]
     fn rbw_selector_respects_valid_fft_bounds_and_invalid_targets(){

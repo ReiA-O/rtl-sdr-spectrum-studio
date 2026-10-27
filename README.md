@@ -9,6 +9,7 @@ RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観
 - Spectrum・密度表示・Waterfall・複数VFOを同時表示。共通FFTから全有効フレームを集計します。
 - AM/NFM/WFMモノラル復調、選択VFOだけのスピーカー出力、VFO別WAV録音。
 - 中心周波数・Span・RBW/FFT・Ref Level・Rangeの調整、TraceとPersistence、測定用プリセット。
+- Spectrumの「ピークリセット」でMax／Min／Averageを同時にリセットし、受信や録音を続けたまま現在のLiveから再集計。
 - 自動ピークマーカーとユーザーマーカー、Channel Power、測定帯域内のOBW。
 - 生IQの手動保存、レベルトリガ、秒単位のプリ／ポストトリガ、保存IQの再生。
 
@@ -49,7 +50,7 @@ node tests\ui-static-boundaries.cjs
 python -m unittest discover -s tests -v
 ```
 
-JavaScriptテストはブラウザー・ネットワーク・実機を使わない16項目の状態遷移テストです。保存実機IQを明示指定するRustの追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。
+JavaScriptテストはブラウザー・ネットワーク・実機を使わない22項目の状態遷移テストです。Rustはlibrary52＋main4＝56項目。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。
 
 ## 構成
 
