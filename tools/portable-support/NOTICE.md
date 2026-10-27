@@ -1,6 +1,6 @@
 # Third-party notices for the public preview
 
-開発中のv0.5.0と、公開済みpre-release `v0.4.1-preview.1` の第三者通知。アプリのオリジナル部分はGPL-3.0-or-later、第三者部分は各原ライセンスに従う。各権利者の著作権表示とライセンス本文を保持する。v0.5.0の包装・総合検証・公開は準備中で、以下の旧版の配布情報を新しい版の完成証明とは扱わない。
+開発プレビュー `v0.5.0-preview.1` と、既存 `v0.4.1-preview.1` の第三者通知。アプリのオリジナル部分はGPL-3.0-or-later、第三者部分は各原ライセンスに従う。各権利者の著作権表示とライセンス本文を保持する。配布物の正確な名前・hash・検証結果はRelease添付の記録を参照し、旧版の配布情報を新しい版の完成証明とは扱わない。
 
 v0.5.0は本プロジェクトで実装したUSB/LSB復調と任意の変調方式推定を追加する。追加の機械学習モデルや依存ダウンロードは必要とせず、下記driver・runtime・crateのライセンス方針は継続する。推定は候補と観測根拠を示す補助で、方式・VFO Hz・受信中心を自動変更せず、校正済み判定精度を主張しない。操作と制約は配布案内のSSB／方式推定の説明を参照する。
 
@@ -18,7 +18,7 @@ v0.5.0は本プロジェクトで実装したUSB/LSB復調と任意の変調方�
 
 公開済みv0.4.1はアプリ内部0.4.1／パッケージ0.4.1-public-preview.1。driver・ランタイム方針・全66crateの対応source提供はv0.4.0-preview.1から変更しない。対応source ZIPのトップは`RTL-SDR-Spectrum-Studio-0.4.1-source/`で、`SOURCE_BUILD.md`とdriver recipeを入口にする。 軸のドラッグ/左右キーは影響VFOの自動停止を事前承認済みとして行い、一般手入力の確認は保持する。新規VFOは操作実行時点の中心へ配置して選択する。これらのUI変更でdriver/sourceライセンス条件は変更しない。
 
-v0.5.0のアプリ内部版は0.5.0、候補パッケージの既定は0.5.0-dev。対応sourceのトップは`RTL-SDR-Spectrum-Studio-0.5.0-source/`を予定し、新しい実装・UI・試験・文書を含めて照合する。最終の名前・hash・検証結果は確定後の配布案内に従う。既存v0.4.1のReleaseとassetは保持する。
+v0.5.0のアプリ内部版は0.5.0、公開パッケージ版は0.5.0-public-preview.1（ローカル包装の既定は0.5.0-dev）。対応sourceのトップは`RTL-SDR-Spectrum-Studio-0.5.0-source/`で、新しい実装・UI・試験・文書を含めて照合する。名前・hash・検証結果は配布案内に従う。既存v0.4.1のReleaseとassetは保持する。
 
 この公開プレビューで使うDLLは192,000 bytes、SHA256 `761de6ef2f57047f1dfbbf2346cb53247b2974f5d1fb11b64f9498b650cafc05`。libusbはstatic、CRTはdynamic。元の公式prebuilt DLLを再配布する構成から変更した。
 

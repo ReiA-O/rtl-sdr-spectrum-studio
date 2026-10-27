@@ -4,7 +4,7 @@
 
 アプリ内部版0.5.0／パッケージ版0.5.0-public-preview.1。2026-10-28に以下の最終実行物を確認しました。旧版の成功数を転用せず、実GUIと対応ソースの検証を分離しています。
 
-最終採用候補ZIPは`RTL-SDR-Spectrum-Studio-0.5.0-public-preview.1-windows-x64-20261028-010531-855.zip`、11,907,084bytes、SHA256 `4dfb14d86f7ecfa52f17cefe7799dbb6d37a68656cf38135e80fafe6eff0f5bd`。内包exeのSHA256は`3b2b1329d3bf35bc22d4351f6f9bf02ba930d00a32a18a269d2b545375eb01fb`です。推定パネルを開いたIQ再生でも全操作へ到達できるよう、サイドバー全体のスクロールを調整した版です。以下のREPLAY・方式推定はこの正確なexeを用いた専用展開先で確認し、試験前後のexeを照合しています。
+最終ZIPは`RTL-SDR-Spectrum-Studio-0.5.0-public-preview.1-windows-x64-20261028-011740-215.zip`、11,907,069bytes、SHA256 `a3659e55e533022f6c159934e20367db4fb3e04d07679cfad89d9097c54a9520`。内包exeのSHA256は`3b2b1329d3bf35bc22d4351f6f9bf02ba930d00a32a18a269d2b545375eb01fb`です。推定パネルを開いたIQ再生でも全操作へ到達できるよう、サイドバー全体のスクロールを調整した版です。以下のREPLAY・方式推定・GUIはこの正確なexeで確認しました。公開通知を確定して再包装した際は、exe・driver・プリセット・デモ等94ファイルのbyte不変を照合し、通知と包装metadataだけの差を分離しました。最終ZIPも別展開して自己診断と停止起動を確認しています。
 
 | 確認層 | 結果・限定範囲 |
 |---|---|

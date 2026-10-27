@@ -2,7 +2,7 @@
 
 これは開発PCで明示実行する手順です。受取側PCはMicrosoft公式Visual C++ v14ランタイム（x64）を用意してZIPを展開し、起動します。Rust/Python/Node/Build Toolsを必要としません。作成側にはRust MSVCとMicrosoft C++ Build Tools、Windows PowerShellが必要です。自動USBドライバー導入・受信開始・機器設定変更は行いません。
 
-v0.5.0はSSBと任意の方式推定を追加する検証中の候補です。下記の候補包装コマンドは公開操作ではありません。完成ZIP・対応ソースの検査と版ごとの結果を確認してから配布を判断します。v0.5.0の公開タグ、最終asset名・hash・合格件数は未確定です。
+v0.5.0はSSBと任意の方式推定を追加する開発プレビューです。下記の包装コマンドはローカルに配布物を作成します。公開版は `v0.5.0-preview.1`、パッケージ版は `0.5.0-public-preview.1`。完成ZIP・対応ソースの正確な名前・hash・検証結果はRelease添付の記録と照合してください。
 
 ## 1. テストとビルド
 
@@ -40,7 +40,7 @@ cargo build --manifest-path native\Cargo.toml --release --locked --bin rtl-spect
 
 公開版に用いるuser-spaceの`rtlsdr.dll`は、RTL-SDR Blog V1.4.0の固定ソースとlibusb 1.0.30の公式tarballからMSVCでビルドしたものです。libusbを静的リンクし、Microsoft CRTは`/MD`で動的リンクします。承認済みDLLは192,000 bytes、SHA256 `761de6ef2f57047f1dfbbf2346cb53247b2974f5d1fb11b64f9498b650cafc05` です。Windows USBドライバーの導入・変更は行いません。
 
-v0.5.0の対応ソースZIPは`RTL-SDR-Spectrum-Studio-0.5.0-source/`をトップとする構成を予定します。従来のv0.4.1では`RTL-SDR-Spectrum-Studio-0.4.1-source/`です。新しいSSB／推定の本体・UI・試験・文書も含め、最終ZIPと対応する内容を照合します。
+v0.5.0の対応ソースZIPは`RTL-SDR-Spectrum-Studio-0.5.0-source/`をトップとします。従来のv0.4.1では`RTL-SDR-Spectrum-Studio-0.4.1-source/`です。新しいSSB／推定の本体・UI・試験・文書も含め、固定コミットと対応する内容を照合します。
 
 - 自作コード・UI・テスト・ライセンス。
 - `Cargo.lock`に固定した全66 crateのvendorソースと原通知。
@@ -102,7 +102,7 @@ Windows ZIPとは別に、全対応ソースZIPも同じpre-releaseへ添付し�
 
 ## 4. 別工程の確認
 
-v0.5.0の最終実行物の検証は準備中です。SSB／推定の実装・単体検査と、包装した同じexeの再生API・実GUI・対応ソースの再ビルドを分けて記録します。特に次の追加項目を確認します。
+v0.5.0はSSB／推定の実装・単体検査と、同じ最終exeの再生API・実GUIを確認しました。対応ソースの再ビルド結果はRelease添付へ分けて記録します。追加の確認対象は次のとおりです。
 
 - USB/LSBで基準と片側帯域、幅1000/14100 Hz、RF 0 Hz、有効帯域の両端を正しく扱い、無効な変更で既存設定を壊さないこと。VFO連動の測定・トリガも同じ帯域を使うこと。
 - SSB適用とAFC OFFが一つの操作になり、APIでSSB+AFC ONを拒否すること。ピークは帯域内配置と表示し、基準の自動復元とは表示しないこと。原IQ・旧AM/FMプリセット・既存VFO絶対Hzを保持すること。
@@ -125,7 +125,7 @@ v0.4.1の最新仕様の追加純JS検査は音声9・終了9・周波数目盛�
 
 ## 配布履歴と今回の変更
 
-v0.5.0ではSSBと任意の変調方式推定を追加します。最終候補の包装・対応ソース・API・GUI検証は未完了で、v0.4.1の既存Releaseやhashを置き換えません。GPL方針、固定source-built driver、CRT別導入、全66 crateの対応source提供を継続する予定です。公開結果は確定後に[VALIDATION.md](VALIDATION.md)へ記録します。
+v0.5.0ではSSBと任意の変調方式推定を追加しました。包装・API・GUIの検証範囲は[VALIDATION.md](VALIDATION.md)、対応ソースの再ビルド結果はRelease添付の記録へ分離します。v0.4.1の既存Releaseとassetを保持し、GPL方針、固定source-built driver、CRT別導入、全66 crateの対応source提供を継続します。
 
 v0.4.0-preview.1の公開Windows ZIP・対応source ZIP・検証要約・SHA256SUMSは保持します。当時の起動診断・再生14項目・USB境界24項目・sourceオフラインビルドの成功は当時のartifactへ対応します。v0.4.1は画面と版番号を含む新exeのため、新しいZIP・source ZIPのhashと実行検証を別に記録します。driver `761de6ef…`・CRT別導入・66crateのsource提供は継続します。
 

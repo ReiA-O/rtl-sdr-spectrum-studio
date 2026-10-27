@@ -2,7 +2,7 @@
 
 オリジナルコード・文書・同梱デモは、著作権が及ぶ範囲で **GPL-3.0-or-later** を適用します。本文と条件は [LICENSE.md](LICENSE.md) と [LICENSE](LICENSE) を参照してください。第三者の著作権・原ライセンス・通知は維持します。
 
-開発中のアプリ内部版 `0.5.0` はUSB/LSB復調と任意の変調方式推定を追加する候補です。包装・総合検証・公開は準備中で、最終asset名・hashや合格件数は未確定です。追加機能の仕様と限界は [MODULATION.md](docs/MODULATION.md) に記載します。候補と観測根拠は受信補助であり、方式の自動切替や校正済み判定精度を意味しません。
+アプリ内部版 `0.5.0`、Windowsパッケージ版 `0.5.0-public-preview.1` はUSB/LSB復調と任意の変調方式推定を追加する開発プレビューです。配布asset名・hashはRelease添付の検証記録と照合してください。追加機能の仕様と限界は [MODULATION.md](docs/MODULATION.md) に記載します。候補と観測根拠は受信補助であり、方式の自動切替や校正済み判定精度を意味しません。
 
 公開済みの `v0.4.1-preview.1` はアプリ内部版 `0.4.1`、Windowsパッケージ版 `0.4.1-public-preview.1` のpre-releaseです。[リリースページ](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.1-preview.1) には、Windows x64用ZIPと、アプリ・全66 Rust crate・RTL-SDR/libusbの固定ソース・patch・手順を含む対応ソースZIPを用意します。これらはv0.4.1の成果物と履歴として保持し、v0.5.0の検証済み成果物とは扱いません。
 
