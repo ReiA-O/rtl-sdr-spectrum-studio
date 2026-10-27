@@ -2,9 +2,9 @@
 
 RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観測を行うWindows向け開発版です。Rust本体がローカルHTTPサーバーを動かし、exeに内蔵した画面を通常のブラウザーへ表示します。Pythonは数値比較・単体テスト用の参照実装で、アプリの実行には使いません。
 
-**公開プレビュー `v0.4.0-preview.1`** の取得先は [Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.0-preview.1) です。Windows x64用のデモ同梱ZIPと、アプリ・全66 Rust crate・RTL-SDR/libusbの固定ソース・patch・ビルド手順を収めた対応ソースZIPを一緒に配布します。パッケージ版は **`0.4.0-public-preview.1`**、アプリ内部の版は **`0.4.0`** です。取得するassetの正確なファイル名とSHA256はリリースの案内・同梱manifestで確認してください。
+**公開プレビュー `v0.4.1-preview.1`** の取得先は [Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.1-preview.1) です。Windows x64用のデモ同梱ZIPと、アプリ・全66 Rust crate・RTL-SDR/libusbの固定ソース・patch・ビルド手順を収めた対応ソースZIPを一緒に配布します。パッケージ版は **`0.4.1-public-preview.1`**、アプリ内部の版は **`0.4.1`** です。取得するassetの正確なファイル名とSHA256はリリースの案内・同梱manifestで確認してください。
 
-v0.4.0は、帯域を決めてピークを選び、VFOで復調し、対象局を含む原IQを保存する導線を中心にしています。受信用の中心DC補正を既定ONで追加しました。これまでのv0.4.0開発版で設定境界・API・50Ω終端の受信・DEMOの画面操作を確認しました。条件と未検証部分は [VALIDATION.md](docs/VALIDATION.md) に記載しています。
+v0.4.1は、帯域を決めてピークを選び、VFOで復調し、原IQを保存する受信経路を維持し、音声操作・終了操作・周波数表示を更新する版です。中心DC補正式、原IQの保存方式、ドライバーと同梱デモIQはv0.4.0から変更していません。旧版の数値検証はその条件での結果として保持し、新しい画面・配布実行物・RF gain反映の確認とは分けます。結果と未検証部分は [VALIDATION.md](docs/VALIDATION.md) に記載します。
 
 オリジナルコード・文書・同梱デモには **GPL-3.0-or-later** を適用します。第三者のコードは各原ライセンスを維持します。[LICENSE.md](LICENSE.md)・[NOTICE.md](NOTICE.md) と [検証範囲](docs/VALIDATION.md) を確認してください。これは開発中のpre-releaseで、製品全体の受入れ、別PCや屋外での動作、RFの絶対レベル校正を保証するものではありません。
 
@@ -17,11 +17,20 @@ AFG3102から32 MHz・FM偏移±75 kHz・1 kHzの試験音を出力し、Studio�
 1. ZIPを展開し、`start-studio.cmd`を起動します。
 2. 受信停止中に「プリセット」から **`AFG_FM_32MHz_demo`** を読み込み、**設定画面右上の×で閉じます**。この段階では受信開始を押しません。
 3. 「保存データ」から **`demo_afg_fm_32mhz.sigmf-meta`** の「IQ再生」を選び、上部の **「再生開始」** を押します。
-4. 音量を小さくし、「音声OFF」を押してONにすると試験音を出力します。終端で自動停止し、再生位置スライダーを先頭へ戻すと繰り返せます。「ライブへ戻る」で終了します。
+4. 音量を小さくし、「現在：音声OFF」を確認して「音声をONにする」を押すと試験音を出力します。終端で自動停止し、再生位置スライダーを先頭へ戻すと繰り返せます。「ライブへ戻る」で終了します。
 
 保存IQ再生はRTL-SDR・AFG・WinUSBを使わない経路です。旧デモZIPでは受信DLLを無効化した模擬状態で再生14項目を確認しました。実USB抜去や清浄な別PCでの受入れ、実際のスピーカー聴感を確認した意味ではありません。実GUI9項目は先行デモ候補で確認し、当時の最終デモ版では案内の×操作を追記しただけでexe・IQ・metadata・プリセットの4点は同一hashです。
 
 FMでは最大のスペクトルピークが搬送中心とは限らないため、最初は同梱プリセットのVFO **32.000 MHz・WFM・200 kHz** で再生してください。手動FFT4096点、実効RBW375 Hzの設定です。既存の測定用初期プリセットは置き換えません。IQは`.sigmf-meta`と`.sigmf-data`をセットで扱い、復調音のWAVと区別します。
+
+## v0.4.1の画面操作
+
+- 音声は「現在：音声ON/OFF」と、次に行う「音声をON/OFFにする」を別に表示します。開始処理が成功するまでONとは表示しません。ON設定でも受信停止・接続待ち・出力対象なしの場合は、その理由を補足表示します。
+- ヘッダーの「アプリ終了」で確認画面を承認し、受信・再生と録音の終了処理を行います。「終了しました。ブラウザーのタブを閉じてください。」を確認してからタブを閉じます。未適用の編集値は適用されません。タブを閉じるだけではサーバーは終了しません。
+- 周波数目盛り部分と周波数範囲表示の左右ドラッグ・同じ軸の左右キーは、受信中心だけを変更します。SpanとVFOの絶対周波数は固定し、帯域外になるVFOはダイアログを出さず自動停止します。この軸操作による停止は事前承認済みの操作として扱います。一般の手入力で中心を変える場合は、従来のD24の影響確認を継続します。ドラッグ中はプレビューで、指を離したときに適用します。録音・Arm待機・IQ再生中などの入力ロックは維持します。
+- 「VFOを追加」は、処理待ちの操作を実行する時点の最新の受信中心へ新しいVFOを配置し、そのVFOを選択します。追加操作で既存VFOの周波数や設定を変更しません。基本値はWFM・200 kHzで、有効帯域とRF 0 Hz以上に収まるよう必要時だけ帯域幅を縮めます。中心10 kHzでは最大20 kHzです。これは配置条件であり、狭い帯域でFM放送を完全に復調できる保証ではありません。
+- Spectrum・Density・Waterfallは同じ受信中心とSpanの周波数目盛りを使います。受信中心・Span・RF Gain等の入力条件や処理世代が変わった際は古い描画を破棄し、新しい条件のフレームへ切り替えます。
+- Densityの縦軸上限・下限は独立した手動設定です。RF GainやSpectrumのRef Level/Rangeを変えても、この範囲を自動変更しません。Gainは「入力に適用」後の実効値を確認してください。AGC・Direct入力や離散的な対応gain値では、要求値と実効条件が異なる場合があります。
 
 ## 主な機能
 
@@ -71,20 +80,23 @@ native\target\release\rtl-spectrum-studio.exe --self-check --project-dir .
 .\start-studio.cmd --port 8766
 ```
 
-通常は127.0.0.1だけで待受けます。外部CDN等を使わず、ネット接続を必要としない構成です。持出先の実機環境での確認は未実施です。終了前に受信と録音を止め、起動したコンソールでCtrl+Cを押してください。
+通常は127.0.0.1だけで待受けます。外部CDN等を使わず、ネット接続を必要としない構成です。持出先の実機環境での確認は未実施です。終了はヘッダーの「アプリ終了」で確認し、終了表示の後にタブを閉じます。コンソールから起動した場合はCtrl+Cでも正常終了できます。適用済み設定は通常の変更操作ごとに保存します。未適用の編集値を終了時に自動適用する動作はありません。
 
 ## テスト
 
 ```powershell
-cargo test --manifest-path native\Cargo.toml --all-targets
+cargo test --manifest-path native\Cargo.toml --all-targets --jobs 2
 node tests\ui-static-boundaries.cjs
 node tests\ui-reception-boundaries.cjs
 node --test tests\frontend-ui.test.cjs
+node --test tests\audio-ui-state.test.cjs tests\app-shutdown.test.cjs tests\frequency-axes-pan.test.cjs
 # Python参照テストを使う場合だけNumPyが必要
 python -m unittest discover -s tests -v
 ```
 
-v0.4.0はRust108件・JavaScript66件が合格しました。JavaScriptはブラウザー・ネットワーク・実機を使わない状態遷移テストで、中心補正の表示、録音中のロック、旧frame棄却、ピーク選局も含みます。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。数値境界と製品API・実機・GUIの結果は [VALIDATION.md](docs/VALIDATION.md) で区別します。
+最新仕様の追加純JavaScript検査は、音声状態9件（audio-ui-state）、終了処理9件（app-shutdown）、周波数目盛り・中心移動・VFO追加15件（frequency-axes-pan）の計33件です。既存回帰66件と合わせた構成は99件で、軸だけの自動承認と一般手入力D24の分離、最新中心へのVFO追加と新規選択、低中心周波数での帯域制限も対象です。最終候補での総合結果と実GUI・実機は [VALIDATION.md](docs/VALIDATION.md) へ分けて記録します。先行v0.4.1候補では追加29件＋回帰66件＝JS95件とNative108件が成功しましたが、その先行候補は今回の軸確認省略・新規VFO配置変更前です。
+
+旧v0.4.0ではRust108件・JavaScript66件が合格しました。JavaScriptはブラウザー・ネットワーク・実機を使わない状態遷移テストで、中心補正の表示、録音中のロック、旧frame棄却、ピーク選局も含みます。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。数値境界と製品API・実機・GUIの結果は [VALIDATION.md](docs/VALIDATION.md) で区別します。
 
 再現用の数値probeは次のように実行します。`<新規出力フォルダー>`は毎回異なる名前へ置き換え、Git対象外の`verification/`または`data/`内を使ってください。JSONに加えてPCM検査用の小さなWAVも作成します。同名JSONは上書きせず失敗するため、既存の結果がある場所へ再実行しないでください。DLL・サーバー・実機を操作しない合成IQの検査です。
 
@@ -107,5 +119,7 @@ PowerShellでは、例えば出力先を`verification/electrical-probe-001/resul
 明示承認されたAFGデモIQだけを例外対象とし、個人の録音・個人設定・校正情報・機器IP／シリアル番号・開発環境の絶対パス・非公開の実験記録はリポジトリに含めません。更新版は別フォルダーへ展開し、既存の`data/`を上書き・削除しないでください。
 
 ## 配布履歴
+
+[v0.4.0-preview.1](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.0-preview.1) は最初のGPL公開版です。Windows ZIPは11,859,622bytes、SHA256 `18922b48928efece87f961585f80e1ee3c13403549a42cca6cec6f2b65cf568c`、対応source ZIPは20,020,517bytes、SHA256 `8452cc924ce0006d38e27efc616dfe83257cc4849a797c9dbabdcf1036729490`。当時のUSB境界24項目・公開ZIP再生14項目・対応sourceのオフラインビルドと匿名取得の整合を確認しました。この旧版の成功数・hashをv0.4.1の新しい実行物の結果にはしません。
 
 2026-10-27の旧デモ同梱開発版 `RTL-SDR-Spectrum-Studio-0.4.0-dev-demo-windows-x64-20261027-210450-328.zip` は、11,296,451 bytes、SHA256 `d04cde25fc4e250837dd80ff4a5d5c19838f40261dd5906428aba0ec967892de` です。`v0.4.0-demo`のprivate下書きに保存した時点では、公開用ライセンスの選定が未完了でした。この履歴は保持し、現在の公開プレビューではGPL-3.0-or-laterの選定、対応ソースの同梱、ソースからビルドしたDLLへの変更、Microsoftランタイムの外部前提化を反映しています。旧ZIPのhashや検証結果を、公開プレビューZIPのhash・検証結果として扱わないでください。

@@ -18,8 +18,10 @@
       <button id="filesButton" class="button quiet">保存データ</button>
       <button id="presetsButton" class="button quiet" aria-haspopup="dialog">プリセット</button>
       <button id="settingsButton" class="button quiet" aria-haspopup="dialog">設定</button>
+      <button id="shutdownButton" type="button" class="button quiet" aria-controls="shutdownNotice" title="受信・録音を正常に終えてアプリ全体を終了します">アプリ終了</button>
     </div>
   </header>
+  <section id="shutdownNotice" class="shutdown-notice" role="status" aria-live="polite" hidden></section>
 
   <section class="tuning-strip" aria-label="周波数と表示の基本操作">
     <form id="tuningForm" class="tuning-form">
@@ -60,8 +62,8 @@
           <div id="userMarkerReadout" class="user-marker-readout"><strong id="userMarkerName">U 未選択</strong><span id="userMarkerFrequency">周波数 — MHz</span><span id="userMarkerLevel">レベル — dBFS</span><span id="userMarkerOffset">中心から Δf — kHz</span><span id="userMarkerStatus" class="muted">追加して配置できます</span></div>
           <div class="user-marker-peak-controls"><button id="userMarkerPeakLeft" class="button mini" disabled>← Peak</button><button id="userMarkerPeakRight" class="button mini" disabled>Peak →</button><button id="userMarkerPeakMax" class="button mini" disabled>最大Peak</button><button id="userMarkerTuneButton" class="button mini" disabled title="この周波数へ選択中VFOを同調">選局</button><button id="userMarkerDelete" class="text-button" disabled>削除</button></div>
         </div>
-        <div class="plot-wrap spectrum-wrap"><canvas id="spectrumCanvas" tabindex="0" role="img" aria-label="スペクトラム。ユーザMarker選択中はクリックで配置、左右キーで隣のピークへ。VFOの選択ボタンでVFO操作へ戻ります。ShiftクリックでユーザMarker追加"></canvas><div id="spectrumEmpty" class="empty-plot"><span class="empty-symbol">⌁</span><strong>信号を待っています</strong><span>受信開始、または保存したIQを開いてください</span></div><div id="cursorReadout" class="cursor-readout" hidden></div><div id="markerReadout" class="marker-readout"></div></div>
-        <div class="plot-hint"><span id="plotModeHint">VFO：ドラッグ / ホイール / ← →　帯域幅：端をドラッグ</span><span id="spanReadout">—</span></div>
+        <div class="plot-wrap spectrum-wrap"><canvas id="spectrumCanvas" tabindex="0" role="img" aria-label="スペクトラム。下の周波数目盛りを左右ドラッグすると受信中心だけを移動。ユーザMarker選択中はクリックで配置、左右キーで隣のピークへ。VFOの選択ボタンでVFO操作へ戻ります。ShiftクリックでユーザMarker追加"></canvas><div id="spectrumEmpty" class="empty-plot"><span class="empty-symbol">⌁</span><strong>信号を待っています</strong><span>受信開始、または保存したIQを開いてください</span></div><div id="cursorReadout" class="cursor-readout" hidden></div><div id="markerReadout" class="marker-readout"></div></div>
+        <div class="plot-hint"><span id="plotModeHint">VFO：ドラッグ / ホイール / ← →　帯域幅：端をドラッグ</span><span id="spanReadout" class="frequency-pan-handle" tabindex="0" role="slider" aria-label="受信中心周波数。左右ドラッグまたは左右キーで移動、スパンとVFO周波数は固定" aria-valuemin="10000" aria-valuemax="1766000000" title="左右ドラッグで受信中心を移動（スパンとVFO周波数は固定）">—</span></div>
       </section>
       <div id="spectrumResizer" class="row-resizer" role="separator" aria-label="Spectrumの高さを変更" aria-orientation="horizontal" tabindex="0"></div>
       <div class="lower-panels" id="lowerPanels">
@@ -73,8 +75,8 @@
     <div id="sidebarResizer" class="column-resizer" role="separator" aria-label="復調パネルの幅を変更" aria-orientation="vertical" tabindex="0"></div>
     <aside class="panel demod-panel" aria-labelledby="demodTitle">
       <div class="panel-heading"><div><span class="panel-index">04</span><h2 id="demodTitle">受信・復調</h2></div><button id="addVfoButton" class="button mini">＋ VFO</button></div>
-      <div class="audio-toolbar"><button id="audioButton" class="button audio-button" aria-pressed="false">🔈 音声OFF</button><label class="volume-control">音量<input id="volume" type="range" min="0" max="1" step="0.01" value="0.2" aria-label="スピーカー音量"></label></div>
-      <div id="audioStatus" class="audio-caption">選択中の1局だけをスピーカーへ出力</div>
+      <div class="audio-toolbar"><div class="audio-switch"><span id="audioState" class="audio-state" role="status" aria-live="polite" aria-atomic="true">現在：音声OFF</span><button id="audioButton" type="button" class="button audio-button" aria-pressed="false" aria-label="現在：音声OFF。音声をONにする" aria-describedby="audioStatus" title="現在：音声OFF。押すとONになります。">音声をONにする</button></div><label class="volume-control">音量<input id="volume" type="range" min="0" max="1" step="0.01" value="0.2" aria-label="スピーカー音量"></label></div>
+      <div id="audioStatus" class="audio-caption">スピーカー出力はOFFです。選択中の1局だけを出力します。</div>
       <div id="vfoList" class="vfo-list" aria-label="VFO設定。各局の受信・音声補助を開いて設定できます"><div class="vfo-empty">受信するVFOを追加してください</div></div>
       <section class="capture-section" aria-label="IQ記録とトリガ"><div class="section-label"><span>IQ記録</span><span id="iqBadge" class="badge">待機</span></div><div class="capture-buttons"><button id="iqButton" class="button">● IQ保存</button><button id="armButton" class="button trigger-button">トリガ待機</button><button id="triggerSettingsButton" class="button icon-button" aria-label="トリガ設定">⚙</button></div><div class="trigger-summary"><span id="triggerState">Disarmed</span><span id="triggerPreAvailable">プリバッファ — s</span></div><div class="trigger-level"><span id="triggerSummary">Peak / — dBFS</span><span id="recordingElapsed"></span></div></section>
       <section id="replayPanel" class="replay-section" hidden><div class="section-label"><span>IQ再生</span><button id="replayCloseButton" class="text-button">ライブへ戻る</button></div><div id="replayName" class="muted small-text"></div><input id="replaySeek" type="range" min="0" max="1" step="0.01" value="0" aria-label="IQの再生位置"><div class="replay-time"><span id="replayPosition">0.00 s</span><span id="replayDuration">— s</span></div></section>

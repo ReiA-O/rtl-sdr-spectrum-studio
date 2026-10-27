@@ -1,5 +1,42 @@
 # 検証範囲
 
+## v0.4.1-preview.1 — 操作フィードバック修正版
+
+アプリ内部版0.4.1／配布版0.4.1-public-preview.1。音声の現在状態と操作の分離、正常終了、3画面の共通周波数軸と入力変更後の旧frame破棄を対象とします。最新仕様では周波数目盛りのdrag/同軸キー操作を事前承認済みとして扱い、帯域外VFOは確認ダイアログなしで停止します。SpanとVFO絶対Hzは固定し、一般手入力のD24確認・録音lock・Density独立dB上下限は維持します。
+
+新規VFOはqueued追加処理の実行時点の最新中心へ配置し、その新VFOを選択します。既存VFOの設定は変えません。基本WFM/200 kHzで、有効帯域およびRF 0 Hz以上に収まる帯域へ縮めます。中心10 kHz時の最大20 kHzは配置の境界条件であり、FM放送の完全復調保証ではありません。
+
+最新仕様の追加純JS検査の構成は音声9・終了9・周波数/Pan/VFO追加15＝33件（既存回帰66と全99件）です。以下の先行候補の結果は、今回の軸確認省略・新規VFO配置仕様変更前です。新しいexe/packageの実行検証と区別します。
+
+### 最終v0.4.1パッケージの確認
+
+- Native108（104library＋4main、外部保存IQ fixture1件ignored）／JavaScript99（旧66＋audio9＋shutdown9＋pan/VFO15）が成功。Nativeの機能sourceは旧0.4.0と同じで、UIと自package版を更新しています。
+- 最終ZIPは`RTL-SDR-Spectrum-Studio-0.4.1-public-preview.1-windows-x64-20261027-233801-704.zip`、11,865,218bytes、SHA256 `4f59d29e5b53752b358766f738b4023bf1720256690f87edbaa0744d72370492`。exe SHA256 `aed72a0c3e1e5fea947954d7e4912cd6fcf037c5ee2cf61cc57caf287289eb99`。全entry/hash/privacy・別展開99files byte一致・self-check成功。
+- その同じ最終exeで実機gain3cases／12checks・15frames成功。manual要求／reported actualは0／20.7／49.6dB一致。背景Spectrum Live中央値は−79.25798／−75.77226／−68.09814dBFS、Density列の最頻row中央値は−78.203125／−74.921875／−66.171875dBFS。統計が異なるため両値の一致は要求しません。AFG CH1 OFF・公称60dB減衰の既存接続、未校正の内部雑音相対観測で、RFgain差／SNR／感度の校正ではありません。AFG・配線・OSdriverは変更していません。
+- 同じ最終exeのREPLAY14項目成功。WAV主成分1kHz・266,240samples・PCM端値0、元設定復帰、同梱assets hash不変。実スピーカー聴感ではありません。
+- 実IAB GUI15項目成功。音声現在ON/OFFと次操作、音量0での手動切替、左右dragのSpan600kHz固定と既存VFO絶対Hz不変、帯域外VFOのdialogなし停止、新規VFO最新中心配置＋選択、3画面768周波数列共有、一般手入力だけの確認／取消、正常終了取消／実行を確認。
+- GUI終了時のテスト用合成IQ32,768,000bytesとWAV256,000samples/32kHzはstop_reason=shutdownで確定。RIFFのframe数と実PCM byte長、SigMFの偶数byte数とmetadataを確認。終了表示・操作無効化、所有PID消失・8766閉鎖も確認。実測原データや配布ZIPを変更していません。
+
+対応source ZIPは同じ最終commitを固定し、vendorとdriver sourceを含めて別添します。正確なsource hashと空Cargo HOMEでのoffline build結果はRelease添付の`RELEASE-VALIDATION.json`を参照してください。別PC／屋外／長時間／実聴・全RF帯域の校正は未検証です。
+
+### 先行v0.4.1候補の結果（仕様変更前）
+
+| 確認層 | 結果・限定範囲 |
+|---|---|
+| Native | library104＋main4＝108 pass、外部保存IQ fixture1件は明示選択用ignored。機能sourceは旧0.4.0から不変で、自package版だけ変更 |
+| JavaScript | 旧回帰29＋20＋17と、新audio9／shutdown9／frequency axes/pan11＝95 pass。実GUIやHTTPとは別 |
+| gain／density純release probe | 同じRust実装へ既知cu8振幅を入力し11項目pass。Spectrum−11.8128dBに対してDensity−11.25dB、差0.5628dBはdensity1row0.625dB以内。gain変更で履歴0・全cell0・epoch更新、IQ中gain変更lockを確認。実受信機のRF gain試験とは別 |
+| 正確Windows ZIP | 全entry hash／privacy／source-built driver／CRT非同梱を確認、別展開99fileと元ZIPのbytes一致、self-check exit0。self-checkはreceiver／server／recordingを開始しない |
+
+確認対象ZIPは `RTL-SDR-Spectrum-Studio-0.4.1-public-preview.1-windows-x64-20261027-231523-529.zip`、11,864,329bytes、SHA256 `f52bd90c8810d98f8206f0f4aba67e15eed740ec84062ec3cb3a9b11b88649f1`。exe SHA256 `bcfb5eced2cae5c9018a783c1ca4dfa7882e714dc8e05d9955be806d18b3b2d5`。driverは旧公開版と同じ761de6ef…、MSVC Runtimeは外部前提です。
+
+Spectrum／Density／Waterfallの表示範囲と元周波数列を共通化しました。FFT binsは均等ですが、snapshotの集約列は非均等になる場合があります。熱画像のraster補間は代表600kHz／4096FFT／600pxで内部中心差最大275.10Hz＝約0.275pxで、全列の点ごとの完全一致は主張しません。RF分解能や校正精度の向上を意味しません。
+
+この先行f52候補では、USBの手動gain 0/20.7/49.6 dBの有限3ケースと保存デモのREPLAY14項目が成功し、元設定へ復帰しました。これらは上記bcfb…exeとf52…ZIPの結果で、最新の軸確認省略・新VFO配置を含む最終exe/packageの成功ではありません。
+
+最新仕様の最終候補について、実機gain適用・実GUI・正常終了・最終対応source buildの結果をこの節へ検証後に追記します。以降は旧v0.4.0の検証履歴です。旧版や先行候補の合格を新しい実行物の確認済みへ読み替えません。
+
+
 ## 公開プレビュー v0.4.0-preview.1 の配布検証
 
 アプリ内部版は0.4.0、配布版は0.4.0-public-preview.1です。アプリexeは前のv0.4.0と同一SHA256で、今回の変更はGPLライセンス宣言、配布script・文書、source-built driver、Microsoft runtime別導入です。過去の本体検証を新しいDLL・配布構成の検証と混同しません。

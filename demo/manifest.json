@@ -22,8 +22,8 @@
     {
       "path": "README.md",
       "destination": "demo/README.md",
-      "bytes": 2550,
-      "sha256": "315ecfaa8583094300723ec9273fdafecca5fd4885921db5279557b9904bdb14"
+      "bytes": 2805,
+      "sha256": "b5aec3f914f02ca644cfff18bf3a99cac22cee05ee06e50c479cbba36950cdc8"
     }
   ]
 }

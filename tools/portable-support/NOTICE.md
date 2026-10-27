@@ -1,6 +1,6 @@
 # Third-party notices for the public preview
 
-公開pre-release `v0.4.0-preview.1` の第三者通知。アプリのオリジナル部分はGPL-3.0-or-later、第三者部分は各原ライセンスに従う。各権利者の著作権表示とライセンス本文を保持する。
+公開pre-release `v0.4.1-preview.1` の第三者通知。アプリのオリジナル部分はGPL-3.0-or-later、第三者部分は各原ライセンスに従う。各権利者の著作権表示とライセンス本文を保持する。
 
 - **RTL-SDR Blog V1.4.0**: `rtlsdr.dll`は固定タグV1.4.0のソースから作成したWindows x64版。RTL-SDRのCソースはGPL-2.0-or-later、一部buildファイルはGPL-3.0-or-later。GPL-3.0-or-laterの本アプリと配布する。原COPYING、固定ソースarchive、ビルド手順を対応ソースへ保全する。
   - [公式タグのソース](https://github.com/rtlsdrblog/rtl-sdr-blog/tree/V1.4.0)
@@ -12,7 +12,9 @@
 - **Rust standard library**: 使用したtoolchainの`COPYRIGHT-library.html`と原ライセンス本文を同梱する。
 - **Rust crates**: Windows x64の依存グラフ（build/proc-macro依存を含む）に対応するcrateの原ライセンス・著作権通知を`licenses/rust-crates/`へ保全する。配布物の一覧・宣言は`rust-crates.json`を参照。対応ソースZIPには`Cargo.lock`に固定された全66 crateをvendorするため、他OS向けを含むソースも取得できる。
 
-[同じリリースの対応ソースZIP](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.0-preview.1) は、自作部分・全66 Rust crate・RTL-SDR/libusbの固定source archives・patch・ビルド手順を含む。source ZIP内の`SOURCE_BUILD.md`と`third-party-driver/README.md`から再ビルドできる。archiveとDLLのSHA256・toolchainはdriver用`BUILD-MANIFEST.json`に記録する。
+[同じリリースの対応ソースZIP](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.1-preview.1) は、自作部分・全66 Rust crate・RTL-SDR/libusbの固定source archives・patch・ビルド手順を含む。source ZIP内の`SOURCE_BUILD.md`と`third-party-driver/README.md`から再ビルドできる。archiveとDLLのSHA256・toolchainはdriver用`BUILD-MANIFEST.json`に記録する。
+
+この版はアプリ内部0.4.1／パッケージ0.4.1-public-preview.1。driver・ランタイム方針・全66crateの対応source提供はv0.4.0-preview.1から変更しない。対応source ZIPのトップは`RTL-SDR-Spectrum-Studio-0.4.1-source/`で、`SOURCE_BUILD.md`とdriver recipeを入口にする。 軸のドラッグ/左右キーは影響VFOの自動停止を事前承認済みとして行い、一般手入力の確認は保持する。新規VFOは操作実行時点の中心へ配置して選択する。これらのUI変更でdriver/sourceライセンス条件は変更しない。
 
 この公開プレビューで使うDLLは192,000 bytes、SHA256 `761de6ef2f57047f1dfbbf2346cb53247b2974f5d1fb11b64f9498b650cafc05`。libusbはstatic、CRTはdynamic。元の公式prebuilt DLLを再配布する構成から変更した。
 

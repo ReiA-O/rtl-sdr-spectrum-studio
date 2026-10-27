@@ -41,7 +41,7 @@ function context(initial = state()) {
       setAttribute(key,value){this[key]=value;},classList:{toggle(){}},querySelectorAll(){return [];}});
     return elements.get(id);
   };
-  const c = {state:initial,frame:{spectrum:{f_hz:[1],unit:'dBFS'}},connectionError:false,
+  const c = {state:initial,frame:{spectrum:{f_hz:[1],unit:'dBFS'}},connectionError:false,studioClosing:false,studioClosed:false,
     frontendChanging:false,frontendPendingValue:null,frameEpoch:3,stateEpoch:10,actionInFlight:0,
     preferredSource:null,dirtyForms:new Set(),extraConditions:[],seenNotifications:new Set(),drag:null,
     lastDeviceError:null,lastAudioConditions:'',audioSequence:0,lastAudioVfo:null,

@@ -10,17 +10,19 @@
   const colors = ['#64d7ec','#e6bf70','#bc9ce4','#75d6a9','#e99aa6','#8cafea','#d5d78b','#7cc6bf'];
   let state = null, frame = null, connectionError = false, actionInFlight = 0, preferredSource = null;
   let fileData = {files: [], presets: []}, vfoSignature = '', userMarkerSignature = '', drag = null, hover = null;
-  let audioEnabled = false, audioContext = null, audioGain = null, audioStreamGain = null, audioSequence = 0, audioNextTime = 0;
+  let audioEnabled = false, audioStarting = false, audioContext = null, audioGain = null, audioStreamGain = null, audioSequence = 0, audioNextTime = 0;
   let audioEpoch = 0, audioRemoteEpoch = null, lastAudioConditions = '';
   let audioSources = [], lastAudioVfo = null, audioReceivedAt = 0;
   let layout = {spectrum_ratio: .6, vfo_width: 340, bottom_ratio: .5};
   let extraConditions = [], seenNotifications = new Set(), tuningTimer = null, frameFailures = 0, lastDeviceError = null;
   let frameTimer = null, framePending = false, frameRefreshRequested = false, frameEpoch = 0, traceResetsPending = 0;
   let actionQueue = Promise.resolve(), stateEpoch = 0;
+  let studioClosing = false, studioClosed = false, stateTimer = null, audioTimer = null;
   let frontendChanging = false, frontendPendingValue = null;
   let userSelectionIntent, userSelectionGeneration = 0, userSelectionPending = false, userSelectionPromise = Promise.resolve(true);
   let vfoSelectionIntent, vfoSelectionGeneration = 0, vfoSelectionPromise = Promise.resolve(true), canvasGestureTarget = 'empty';
   let densityRangeDisplayContext = null, densityRangeEditContext = null, densityRangeEditGeneration = 0;
+  let frequencyPan = null, frequencyPanPending = false;
   const dirtyForms = new Set();
   const vfoEdits = new Map();
   const receptionDefaults = Object.freeze({afc_enabled:false,afc_max_hz:1000,squelch_enabled:false,squelch_dbfs:-60,squelch_hysteresis_db:3,squelch_hang_ms:300,audio_gain_db:0,limiter_enabled:true,limiter_ceiling_dbfs:-2,click_suppression_enabled:true,wav_audio:'demod'});
@@ -247,7 +249,65 @@
     if (!response.ok) throw new Error(json.error || `接続エラー (${response.status})`);
     return json;
   }
+  function renderStudioLifecycle(){
+    const button=$('shutdownButton'),panel=$('shutdownNotice');
+    button.disabled=studioClosing||studioClosed;button.textContent=studioClosed?'終了済み':studioClosing?'終了処理中…':'アプリ終了';
+    button.setAttribute('aria-busy',String(studioClosing));
+    panel.hidden=!studioClosing&&!studioClosed;panel.className=`shutdown-notice${studioClosed?' completed':''}`;
+    if(studioClosing)panel.textContent='進行中の操作を待ってから、アプリを終了します。';
+    if(studioClosed)panel.textContent='終了しました。ブラウザーのタブを閉じてください。';
+    document.body.classList.toggle('studio-closing',studioClosing);document.body.classList.toggle('studio-closed',studioClosed);
+  }
+  function shutdownConfirmation(snapshot){
+    const recording=Boolean(snapshot?.recording?.iq_active||snapshot?.trigger?.recording||snapshot?.trigger?.armed||snapshot?.vfos?.some(v=>v.wav_recording));
+    return `Studioを終了しますか？\n${recording?'IQ・WAVの録音、またはトリガ待機中です。保存を確定して終了します。':'受信・再生を停止して、アプリを終了します。'}\n未適用の入力・設定は適用されません。\n終了後はブラウザーのタブを閉じてください。`;
+  }
+  async function postStudioShutdown(){
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),15000);
+    try{
+      const response=await fetch('/api/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'shutdown'}),signal:controller.signal});
+      const result=await response.json();
+      if(!response.ok||result.ok!==true||result.shutdown!==true)throw new Error(result.error||result.message||`終了要求を確認できません (${response.status})`);
+    }finally{clearTimeout(timer);}
+  }
+  async function waitForStudioStop(){
+    for(let attempt=0;attempt<20;attempt++){
+      const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),1000);
+      try{await fetch('/api/health',{cache:'no-store',signal:controller.signal});}
+      catch(error){if(error?.name==='AbortError')return false;return true;}
+      finally{clearTimeout(timer);}
+      await new Promise(resolve=>setTimeout(resolve,150));
+    }
+    return false;
+  }
+  async function shutdownStudio(){
+    if(studioClosing||studioClosed)return false;
+    studioClosing=true;renderStudioLifecycle();cancelPendingVfoTune();
+    try{
+      await actionQueue;
+      const snapshot=await getJson('/api/state');
+      if(!window.confirm(shutdownConfirmation(snapshot))){studioClosing=false;renderStudioLifecycle();return false;}
+      asText('shutdownNotice','録音・受信処理を終了しています。完了までお待ちください。');
+      await postStudioShutdown();
+      if(!await waitForStudioStop())throw new Error('終了要求は送信しましたが、アプリの終了を確認できません。少し待って再操作してください。');
+      studioClosed=true;studioClosing=false;frameEpoch++;frameRefreshRequested=false;
+      clearTimeout(stateTimer);clearTimeout(frameTimer);clearTimeout(audioTimer);
+      audioEnabled=false;audioStarting=false;flushAudio();renderAudioControl();updateAudioCaption();
+      renderStudioLifecycle();
+      for(const control of document.querySelectorAll('button,input,select'))control.disabled=true;
+      for(const control of document.querySelectorAll('canvas,[role="separator"]'))control.setAttribute('aria-disabled','true');
+      $('statusDot').className='status-dot';asText('sessionStatus','終了しました');asText('sourceBadge','終了');asText('deviceName','');
+      asText('footerStatus','アプリは終了しました。ブラウザーのタブを閉じてください。');asText('footerRight','終了済み');
+      return true;
+    }catch(error){
+      studioClosing=false;renderStudioLifecycle();
+      const message=`終了を確認できませんでした：${error.message||error}`;
+      $('shutdownNotice').hidden=false;$('shutdownNotice').className='shutdown-notice error';asText('shutdownNotice',message);toast(message,'error',6500);
+      return false;
+    }
+  }
   function action(name, data = {}, options = {}) {
+    if(studioClosing||studioClosed)return Promise.resolve(null);
     actionInFlight++;stateEpoch++;updatePresetLoadState();
     const operation=actionQueue.then(async()=>{if(options.guard&&!await options.guard())return null;return performAction(name,typeof data==='function'?data():data,options);});
     const completion=operation.finally(()=>{actionInFlight--;stateEpoch++;updatePresetLoadState();});
@@ -285,10 +345,12 @@
   function applyState(next, force = false, forceVfos = false) {
     if (!next || typeof next !== 'object') return;
     const recovering=connectionError;
-    const previousUnit = levelUnit(),previousFrontend=frontendRouteKey(state); state = next; connectionError = false;
+    const previousUnit = levelUnit(),previousFrontend=frontendRouteKey(state);
+    const previousFrequency=JSON.stringify([state?.source,state?.input?.center_hz,state?.input?.sample_rate,state?.display?.span_hz,state?.input?.gain_db,state?.input?.agc,state?.input?.ppm,state?.input?.mode,state?.frontend_status?.epoch]);
+    state = next; connectionError = false;
     const levelChanged = previousUnit !== levelUnit();
     if (levelChanged) { frame = null; requestFrame(); }
-    if(previousFrontend!==frontendRouteKey(state)){frameEpoch++;frame=null;cancelPendingVfoTune();requestFrame();}
+    if(previousFrontend!==frontendRouteKey(state)||previousFrequency!==JSON.stringify([state?.source,state?.input?.center_hz,state?.input?.sample_rate,state?.display?.span_hz,state?.input?.gain_db,state?.input?.agc,state?.input?.ppm,state?.input?.mode,state?.frontend_status?.epoch])){frameEpoch++;frame=null;cancelPendingVfoTune();drawAll();requestFrame();}
     if(recovering&&$('noticeText').textContent.startsWith('アプリとの接続が切れています'))notice('');
     const running = Boolean(state.running), replay = state.source === 'replay';
     const i = state.input || {}, a = state.analysis || {}, d = state.display || {}, t = state.trigger || {}, m = state.measurement || {};
@@ -556,11 +618,28 @@
     if(canvas.width!==Math.round(width*ratio)||canvas.height!==Math.round(height*ratio)){canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio);}
     const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);return {ctx,width,height};
   }
+  function frequencyViewport(current, previewCenter = null) {
+    const fs=Math.max(1,finite(current?.input?.sample_rate,2048000));
+    const requested=finite(current?.display?.span_hz,fs),span=requested>0?Math.min(requested,fs):fs;
+    const center=Number.isFinite(previewCenter)?previewCenter:finite(current?.input?.center_hz,32256000);
+    return {center,span,low:center-span/2,high:center+span/2};
+  }
+  function plotGeometry(width,height,levelAxis=true) {
+    const p={left:levelAxis?54:43,right:13,top:15,bottom:29,width:0,height:0};
+    p.width=Math.max(1,Math.round(width)-p.left-p.right);p.height=Math.max(1,Math.round(height)-p.top-p.bottom);return p;
+  }
+  function heatmapFrequencyBounds(spectrum,width) {
+    const frequencies=spectrum?.f_hz;
+    if(!Array.isArray(frequencies)||frequencies.length!==width||!frequencies.every(Number.isFinite))return null;
+    if(width===1){const step=finite(spectrum.bin_hz,NaN);return step>0?{low:frequencies[0]-step/2,high:frequencies[0]+step/2}:null;}
+    for(let i=1;i<width;i++)if(frequencies[i]<=frequencies[i-1])return null;
+    const step=(frequencies[width-1]-frequencies[0])/(width-1);
+    return {low:frequencies[0]-step/2,high:frequencies[width-1]+step/2};
+  }
   function plotAxes(canvas, levelAxis = true, limits = null) {
     const s=canvasSize(canvas),{ctx,width,height}=s;
-    const p={left:levelAxis?54:43,right:13,top:15,bottom:29,width:0,height:0};p.width=Math.max(1,width-p.left-p.right);p.height=Math.max(1,height-p.top-p.bottom);
-    const center=finite(state?.input?.center_hz,32.256e6),span=finite(state?.display?.span_hz,state?.input?.sample_rate || 2.048e6);
-    const low=center-span/2,high=center+span/2,top=limits?limits.top:finite(state?.display?.ref_level,state?.analysis?.ref_level ?? -20),range=limits?limits.range:finite(state?.display?.range_db,state?.analysis?.range_db ?? 100);
+    const p=plotGeometry(width,height,levelAxis),view=frequencyViewport(state,frequencyPan?.preview_center_hz);
+    const {low,high,span}=view,top=limits?limits.top:finite(state?.display?.ref_level,state?.analysis?.ref_level ?? -20),range=limits?limits.range:finite(state?.display?.range_db,state?.analysis?.range_db ?? 100);
     ctx.fillStyle='#0b141c';ctx.fillRect(0,0,width,height);ctx.font='9px Consolas,monospace';ctx.lineWidth=1;ctx.strokeStyle='#20323f';ctx.fillStyle='#668499';
     for(let k=0;k<=8;k++){const x=p.left+p.width*k/8;ctx.beginPath();ctx.moveTo(x+.5,p.top);ctx.lineTo(x+.5,p.top+p.height);ctx.stroke();ctx.textAlign='center';ctx.fillText(((low+span*k/8)/1e6).toFixed(span<100000?4:3),x,height-11);}
     if(levelAxis) for(let k=0;k<=5;k++){const y=p.top+p.height*k/5;ctx.beginPath();ctx.moveTo(p.left,y+.5);ctx.lineTo(p.left+p.width,y+.5);ctx.stroke();ctx.textAlign='right';ctx.fillText((top-range*k/5).toFixed(0),p.left-8,y+3);}
@@ -602,7 +681,15 @@
     });
     if(hover && !drag){ctx.strokeStyle='#7da2b350';ctx.setLineDash([3,3]);ctx.beginPath();ctx.moveTo(hover.x,p.top);ctx.lineTo(hover.x,p.top+p.height);ctx.stroke();ctx.setLineDash([]);}
     ctx.restore();
-    asText('spanReadout',`${(s.low/1e6).toFixed(4)} — ${(s.high/1e6).toFixed(4)} MHz`);
+    const panReason=frequencyPanPolicy(state,connectionError,dirtyForms.has('tuningForm'));
+    asText('spanReadout',`${frequencyPan?'中心プレビュー · ':frequencyPanPending?'中心変更中 · ':'↔ '}${(s.low/1e6).toFixed(4)} — ${(s.high/1e6).toFixed(4)} MHz`);
+    $('spanReadout').title=panReason||'左右にドラッグして受信中心を移動（スパンとVFO周波数は固定）。← → キーでも移動できます。';
+    $('spanReadout').setAttribute('aria-disabled',String(Boolean(panReason)||frequencyPanPending));
+    $('spanReadout').setAttribute('aria-valuenow',String(frequencyPan?.preview_center_hz ?? state?.input?.center_hz ?? 0));
+    $('spanReadout').setAttribute('aria-valuetext',`${mhz(frequencyPan?.preview_center_hz ?? state?.input?.center_hz).toFixed(6)} MHz`);
+    $('spanReadout').setAttribute('aria-valuemin',String(state?.input?.mode==='tuner'?24000000:10000));
+    $('spanReadout').setAttribute('aria-valuemax',String(['direct_i','direct_q'].includes(state?.input?.mode)?28800000:1766000000));
+    $('spanReadout').classList.toggle('frequency-panning',Boolean(frequencyPan));
     return s;
   }
   const palette=new Uint8ClampedArray(256*4);
@@ -634,16 +721,18 @@
     const s=plotAxes(canvas,kind==='density',limits);
     if(!data?.data_b64||!data.width||!data.height)return;
     const w=Math.trunc(data.width),h=Math.trunc(data.height);if(w*h>4194304||w<1||h<1)return;
+    const frequencyBounds=heatmapFrequencyBounds(frame?.spectrum,w);if(!frequencyBounds)return;
     let values;try{values=decodedBytes(data.data_b64);}catch{return;}if(values.length<w*h)return;
     const off=heatmaps[kind];off.width=w;off.height=h;const ctx=off.getContext('2d'),image=ctx.createImageData(w,h);
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){const sy=data.invert_y||data.orientation==='bottom_high'?h-1-y:y;const v=values[sy*w+x],at=(y*w+x)*4;image.data[at]=palette[v*4];image.data[at+1]=palette[v*4+1];image.data[at+2]=palette[v*4+2];image.data[at+3]=255;}
     ctx.putImageData(image,0,0);s.ctx.save();s.ctx.beginPath();s.ctx.rect(s.p.left,s.p.top,s.p.width,s.p.height);s.ctx.clip();s.ctx.imageSmoothingEnabled=false;
+    const x1=s.x(frequencyBounds.low),x2=s.x(frequencyBounds.high);
     if(kind==='density') {
       const top=finite(data.max_db,s.top),bottom=finite(data.min_db,s.top-s.range),y1=s.y(top),y2=s.y(bottom);
-      s.ctx.drawImage(off,s.p.left,y1,s.p.width,y2-y1);
+      s.ctx.drawImage(off,x1,y1,x2-x1,y2-y1);
     } else {
-      s.ctx.drawImage(off,s.p.left,s.p.top,s.p.width,s.p.height);
-      if(Array.isArray(data.gap_rows))for(const row of data.gap_rows){const y=s.p.top+row/h*s.p.height,height=Math.max(2,s.p.height/h);s.ctx.fillStyle='#566471';s.ctx.fillRect(s.p.left,y,s.p.width,height);s.ctx.strokeStyle='#b0bdc477';for(let x=s.p.left;x<s.p.left+s.p.width;x+=11){s.ctx.beginPath();s.ctx.moveTo(x,y+height);s.ctx.lineTo(x+height,y);s.ctx.stroke();}}
+      s.ctx.drawImage(off,x1,s.p.top,x2-x1,s.p.height);
+      if(Array.isArray(data.gap_rows))for(const row of data.gap_rows){const y=s.p.top+row/h*s.p.height,height=Math.max(2,s.p.height/h);s.ctx.fillStyle='#566471';s.ctx.fillRect(x1,y,x2-x1,height);s.ctx.strokeStyle='#b0bdc477';for(let x=x1;x<x2;x+=11){s.ctx.beginPath();s.ctx.moveTo(x,y+height);s.ctx.lineTo(x+height,y);s.ctx.stroke();}}
     }
     s.ctx.restore();
     if(kind==='density') {
@@ -666,7 +755,100 @@
   }
 
   function plotFrequency(event) { const rect=$('spectrumCanvas').getBoundingClientRect(),s=plotAxesGeometry();return {x:event.clientX-rect.left,y:event.clientY-rect.top,hz:s.low+(event.clientX-rect.left-s.left)/s.width*s.span,s}; }
-  function plotAxesGeometry(){const rect=$('spectrumCanvas').getBoundingClientRect();const span=finite(state?.display?.span_hz,state?.input?.sample_rate||2048000),center=finite(state?.input?.center_hz,32256000);return {left:54,top:15,width:Math.max(1,rect.width-67),height:Math.max(1,rect.height-44),low:center-span/2,span};}
+  function plotAxesGeometry(){const rect=$('spectrumCanvas').getBoundingClientRect();return {...plotGeometry(rect.width,rect.height),...frequencyViewport(state,frequencyPan?.preview_center_hz)};}
+  function frequencyPanContext(current) {
+    return JSON.stringify([current?.source,current?.input?.center_hz,current?.input?.sample_rate,current?.input?.mode,current?.display?.span_hz]);
+  }
+  function frequencyPanPolicy(current,disconnected=false,dirty=false) {
+    if(!current||disconnected)return 'アプリとの接続を確認してください。';
+    if(current.source==='replay')return '保存IQの受信中心は変更できません。';
+    if(current.locks?.input||current.locks?.center_sample_rate||current.trigger?.armed||current.trigger?.recording||current.recording?.iq_active||current.vfos?.some(v=>v.wav_recording))return 'IQ・WAV保存とトリガ待機を終了してから中心を移動してください。';
+    if(dirty)return '未適用の周波数・表示設定を先に適用してください。';
+    if(!Number.isFinite(current.input?.center_hz)||!Number.isFinite(current.input?.sample_rate)||current.input.sample_rate<=0)return '受信中心とサンプルレートを確認してください。';
+    return '';
+  }
+  function frequencyPanPlan(current,gesture,clientX,disconnected=false,dirty=false) {
+    const error=frequencyPanPolicy(current,disconnected,dirty);if(error)return {error};
+    if(!gesture||frequencyPanContext(current)!==gesture.context)return {error:'受信条件が変わったため、中心移動を取り消しました。'};
+    if(!Number.isFinite(clientX)||!Number.isFinite(gesture.start_x)||!Number.isFinite(gesture.center)||!Number.isFinite(gesture.width)||gesture.width<=0||!Number.isFinite(gesture.span)||gesture.span<=0)return {error:'周波数軸の幅を確認してください。'};
+    const mode=current.input.mode,minimum=mode==='tuner'?24000000:10000,maximum=['direct_i','direct_q'].includes(mode)?28800000:1766000000;
+    const proposed=gesture.center-(clientX-gesture.start_x)/gesture.width*gesture.span;
+    if(!Number.isFinite(proposed))return {error:'周波数軸の移動量を確認してください。'};
+    const center=Math.round(clamp(proposed,minimum,maximum));
+    return {center_hz:center,span_hz:gesture.span,changed:center!==gesture.center,bounded:proposed<minimum||proposed>maximum};
+  }
+  function beginFrequencyPan(event,footer=false) {
+    if(event.button!==0)return false;
+    const geometry=plotAxesGeometry(),rect=$('spectrumCanvas').getBoundingClientRect();
+    const x=event.clientX-rect.left,y=event.clientY-rect.top;
+    if(!footer&&(x<geometry.left||x>geometry.left+geometry.width||y<geometry.top+geometry.height||y>rect.height))return false;
+    canvasGestureTarget='axis';event.preventDefault();
+    const reason=frequencyPanPolicy(state,connectionError,dirtyForms.has('tuningForm'));
+    if(reason||frequencyPanPending||frontendChanging||drag){toast(reason||'ほかの操作の完了を待ってください。','warning');return true;}
+    cancelPendingVfoTune();hover=null;$('cursorReadout').hidden=true;
+    frequencyPan={context:frequencyPanContext(state),center:state.input.center_hz,span:geometry.span,width:geometry.width,start_x:event.clientX,preview_center_hz:state.input.center_hz,capture:event.currentTarget||$('spectrumCanvas'),pointer_id:event.pointerId};
+    frequencyPan.capture.setPointerCapture(event.pointerId);$('spectrumCanvas').style.cursor='grabbing';$('spanReadout').focus({preventScroll:true});drawAll();return true;
+  }
+  function frequencyAxisHover(event) {
+    const geometry=plotAxesGeometry(),canvas=$('spectrumCanvas'),rect=canvas.getBoundingClientRect();
+    const x=event.clientX-rect.left,y=event.clientY-rect.top;
+    const inside=x>=geometry.left&&x<=geometry.left+geometry.width&&y>=geometry.top+geometry.height&&y<=rect.height;
+    canvas.style.cursor=inside?(frequencyPanPolicy(state,connectionError,dirtyForms.has('tuningForm'))?'not-allowed':'grab'):'';
+    if(inside){hover=null;$('cursorReadout').hidden=true;drawSpectrum();}return inside;
+  }
+  function moveFrequencyPan(event) {
+    if(!frequencyPan)return false;
+    const plan=frequencyPanPlan(state,frequencyPan,event.clientX,connectionError,dirtyForms.has('tuningForm'));
+    if(plan.error){cancelFrequencyPan();toast(plan.error,'warning');return true;}
+    frequencyPan.preview_center_hz=plan.center_hz;event.preventDefault();drawAll();return true;
+  }
+  function cancelFrequencyPan() {
+    if(!frequencyPan)return;
+    const previous=frequencyPan;frequencyPan=null;try{previous.capture.releasePointerCapture(previous.pointer_id);}catch{}$('spectrumCanvas').style.cursor='';drawAll();
+  }
+  async function finishFrequencyPan(event) {
+    if(!frequencyPan)return false;
+    const previous=frequencyPan,plan=frequencyPanPlan(state,previous,event.clientX,connectionError,dirtyForms.has('tuningForm'));cancelFrequencyPan();
+    if(plan.error){toast(plan.error,'warning');return true;}if(!plan.changed)return true;
+    await commitFrequencyPan(previous,plan.center_hz);return true;
+  }
+  async function commitFrequencyPan(previous,center) {
+    frequencyPanPending=true;drawAll();
+    try{return await action('set_input',{input:{center_hz:center},confirm_impacted:true},{forceVfos:false,message:'受信中心を移動しました。スパンとVFO周波数は固定し、帯域外のVFOは停止します',guard:()=>{
+      const reason=frequencyPanPolicy(state,connectionError,dirtyForms.has('tuningForm'));
+      if(reason||frontendChanging||frequencyPanContext(state)!==previous.context){toast(reason||'受信条件が変わったため、中心移動を取り消しました。','warning');return false;}return true;
+    }});}finally{frequencyPanPending=false;drawAll();}
+  }
+  async function frequencyPanKey(event) {
+    if(!['ArrowLeft','ArrowRight'].includes(event.key))return;event.preventDefault();
+    if(frequencyPanPending||frequencyPan||frontendChanging)return;
+    const view=frequencyViewport(state),step=event.shiftKey?10000:event.altKey?100:1000;
+    const previous={context:frequencyPanContext(state),center:view.center,span:view.span,width:view.span/step,start_x:0};
+    const plan=frequencyPanPlan(state,previous,event.key==='ArrowRight'?-1:1,connectionError,dirtyForms.has('tuningForm'));
+    if(plan.error){toast(plan.error,'warning');return;}if(plan.changed)await commitFrequencyPan(previous,plan.center_hz);
+  }
+  function centeredVfoPlan(current,disconnected=false) {
+    if(!current||disconnected)return {error:'アプリとの接続を確認してください。'};
+    const center=current.input?.center_hz,fs=current.input?.sample_rate;
+    if(!Number.isFinite(center)||center<=0||!Number.isFinite(fs)||fs<=0)return {error:'受信中心とサンプルレートを確認してください。'};
+    const declared=current.input?.usable_bandwidth_hz,usable=Number.isFinite(declared)&&declared>0?Math.min(declared,fs*.9):fs*.9;
+    const bandwidth=Math.floor(Math.min(200000,usable,center*2));
+    if(!Number.isFinite(bandwidth)||bandwidth<1000||bandwidth>=fs)return {error:'受信中心に1 kHz以上のVFO帯域を確保できません。受信条件を確認してください。'};
+    return {vfo:{frequency_hz:center,mode:'WFM',bandwidth_hz:bandwidth}};
+  }
+  async function addCenteredVfo() {
+    let previousIds=new Set();
+    try{
+      const result=await action('add_vfo',()=>{
+        const plan=centeredVfoPlan(state,connectionError);if(plan.error)throw new Error(plan.error);
+        previousIds=new Set((state?.vfos||[]).map(v=>String(v.id)));return {vfo:plan.vfo};
+      });
+      if(!result)return null;
+      const added=(result.state?.vfos||state?.vfos||[]).filter(v=>!previousIds.has(String(v.id))),created=added[added.length-1];
+      if(created){const selected=await activateVfo(created.id,{focus:false});if(selected)toast(`VFO ${created.id}を受信中心へ追加しました${created.bandwidth_hz<200000?'。復調帯域幅は有効受信帯域に合わせて縮めています':''}`);}
+      return result;
+    }catch(error){toast(error.message||String(error),'error');return null;}
+  }
   function beginVfoDrag(event) {
     if(!state||event.button!==0)return;const p=plotFrequency(event);if(p.x<p.s.left||p.x>p.s.left+p.s.width||p.y<p.s.top||p.y>p.s.top+p.s.height)return;
     canvasGestureTarget='empty';
@@ -743,11 +925,27 @@
     for(const source of sources){try{source.stop(stream&&audioContext?end+.001:undefined);}catch{}}
     if(stream)setTimeout(()=>{try{stream.disconnect();}catch{}},20);
   }
-  function updateAudioCaption(){const v=selectedVfo();asText('audioStatus',audioEnabled?(v?`VFO ${v.id} · ${v.mode} · ${mhz(v.frequency_hz).toFixed(4)} MHz${performance.now()-audioReceivedAt>2000?' · 音声待ち':''}`:'聴取するVFOを選択してください'):'選択中の1局だけをスピーカーへ出力');}
+  function renderAudioControl(){
+    const current=`現在：音声${audioEnabled?'ON':'OFF'}`,next=audioEnabled?'音声をOFFにする':'音声をONにする',button=$('audioButton');
+    asText('audioState',current);$('audioState')?.classList.toggle('active',audioEnabled);
+    button.textContent=audioStarting?'音声を開始中…':next;button.disabled=audioStarting;button.classList.toggle('active',audioEnabled);
+    button.setAttribute('aria-pressed',String(audioEnabled));button.setAttribute('aria-busy',String(audioStarting));
+    button.setAttribute('aria-label',`${current}。${audioStarting?'音声を開始中':next}`);button.title=audioStarting?`${current}。ブラウザーの音声開始を待っています。`:`${current}。押すと${audioEnabled?'OFF':'ON'}になります。`;
+  }
+  function updateAudioCaption(){
+    const v=selectedVfo();let caption='スピーカー出力はOFFです。選択中の1局だけを出力します。';
+    if(audioEnabled)caption=connectionError?'接続待ちです。音声の再開を待っています。':!state?.running?'受信・再生の開始待ちです。':v?`VFO ${v.id} · ${v.mode} · ${mhz(v.frequency_hz).toFixed(4)} MHz${performance.now()-audioReceivedAt>2000?' · 音声待ち':''}`:'聴取するVFOを選択してください';
+    asText('audioStatus',caption);
+  }
   async function toggleAudio(){
-    if(!audioEnabled){try{audioContext ||= new (window.AudioContext||window.webkitAudioContext)();if(!audioGain){audioGain=audioContext.createGain();audioGain.gain.value=num('volume');audioGain.connect(audioContext.destination);}await audioContext.resume();audioEnabled=true;audioSequence=0;}catch(error){toast(`音声を開始できません：${error.message}`,'error');return;}}
-    else{audioEnabled=false;flushAudio();}
-    $('audioButton').textContent=audioEnabled?'🔊 音声ON':'🔈 音声OFF';$('audioButton').classList.toggle('active',audioEnabled);$('audioButton').setAttribute('aria-pressed',String(audioEnabled));updateAudioCaption();
+    if(audioStarting||studioClosing||studioClosed)return;
+    if(!audioEnabled){
+      audioStarting=true;renderAudioControl();
+      try{audioContext ||= new (window.AudioContext||window.webkitAudioContext)();if(!audioGain){audioGain=audioContext.createGain();audioGain.gain.value=num('volume');audioGain.connect(audioContext.destination);}await audioContext.resume();if(studioClosing||studioClosed)return;if(audioContext.state&&audioContext.state!=='running')throw new Error('ブラウザーの音声出力が停止しています。もう一度ONにしてください。');audioEnabled=true;audioSequence=0;}
+      catch(error){audioEnabled=false;flushAudio();if(!studioClosed)toast(`音声を開始できません：${error.message}`,'error');}
+      finally{audioStarting=false;}
+    }else{audioEnabled=false;flushAudio();}
+    if(!studioClosed){renderAudioControl();updateAudioCaption();}
   }
   function playPcm(data){
     if(!audioEnabled||!audioContext||!audioPacketMatchesState(data))return;
@@ -830,13 +1028,13 @@
   $('densityMetric').addEventListener('change',()=>action('set_analysis',{analysis:{density_metric:$('densityMetric').value}}));
   $('densityRangeForm').addEventListener('input',beginDensityRangeEdit);$('densityRangeForm').addEventListener('submit',submitDensityRange);
   $('waterfallRowSeconds').addEventListener('change',()=>action('set_analysis',{analysis:{waterfall_row_seconds:num('waterfallRowSeconds')}}));
-  $('addVfoButton').addEventListener('click',()=>action('add_vfo',{vfo:{frequency_hz:finite(state?.input?.center_hz,32000000),mode:'WFM',bandwidth_hz:200000}}));
+  $('addVfoButton').addEventListener('click',addCenteredVfo);
   $('vfoList').addEventListener('click',vfoAction);
   $('vfoList').addEventListener('input',markVfoEdited);
   $('vfoList').addEventListener('focusin',event=>{if(event.target.matches('input,select')&&selectedUserMarker())selectUserMarker(null,{focus:false});});
   $('vfoList').addEventListener('change',event=>{markVfoEdited(event);if(event.target.dataset.vfoField==='mode'){const card=event.target.closest('.vfo-card');card.querySelector('[data-vfo-field=bandwidth]').value={AM:10,NFM:12.5,WFM:200}[event.target.value];}});
   $('vfoList').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target.matches('input')){event.preventDefault();event.target.closest('.vfo-card').querySelector(event.target.dataset.receptionField?'[data-vfo-action=reception-apply]':'[data-vfo-action=apply]').click();}});
-  $('audioButton').addEventListener('click',toggleAudio);$('volume').addEventListener('input',()=>{if(audioGain)audioGain.gain.setTargetAtTime(num('volume'),audioContext.currentTime,.02);});
+  $('audioButton').addEventListener('click',toggleAudio);$('shutdownButton').addEventListener('click',shutdownStudio);$('volume').addEventListener('input',()=>{if(audioGain)audioGain.gain.setTargetAtTime(num('volume'),audioContext.currentTime,.02);});
   $('iqButton').addEventListener('click',()=>action(state?.recording?.iq_active?'iq_stop':'iq_start'));
   $('armButton').addEventListener('click',()=>action(state?.trigger?.armed?'disarm':'arm'));
   $('settingsButton').addEventListener('click',()=>showSettings());$('presetsButton').addEventListener('click',()=>showSettings('presets'));$('measurementButton').addEventListener('click',()=>showSettings('measurement'));$('triggerSettingsButton').addEventListener('click',()=>showSettings('trigger'));
@@ -880,24 +1078,25 @@
   $('replayCloseButton').addEventListener('click',()=>{flushAudio();action('replay_close');});
   $('noticeDismiss').addEventListener('click',()=>notice(''));
   for(const form of ['tuningForm','receiverForm','persistenceForm','measurementForm','triggerForm','densityRangeForm']) $(form).addEventListener('input',()=>dirtyForms.add(form));
-  $('spectrumCanvas').addEventListener('pointerdown',beginVfoDrag);$('spectrumCanvas').addEventListener('pointermove',moveVfo);$('spectrumCanvas').addEventListener('pointerup',finishVfo);$('spectrumCanvas').addEventListener('pointercancel',()=>{drag=null;drawSpectrum();});
+  $('spectrumCanvas').addEventListener('pointerdown',event=>{if(!beginFrequencyPan(event))beginVfoDrag(event);});$('spectrumCanvas').addEventListener('pointermove',event=>{if(!moveFrequencyPan(event)){if(drag||!frequencyAxisHover(event))moveVfo(event);}});$('spectrumCanvas').addEventListener('pointerup',event=>{if(frequencyPan)finishFrequencyPan(event);else finishVfo(event);});$('spectrumCanvas').addEventListener('pointercancel',()=>{cancelFrequencyPan();drag=null;drawSpectrum();});
   $('spectrumCanvas').addEventListener('pointerleave',()=>{if(!drag){hover=null;$('cursorReadout').hidden=true;drawSpectrum();}});
   $('spectrumCanvas').addEventListener('keydown',vfoKey);$('spectrumCanvas').addEventListener('wheel',vfoWheel,{passive:false});
   $('spectrumCanvas').addEventListener('dblclick',event=>{if(canvasGestureTarget!=='empty'||selectedUserMarker()||event.shiftKey)return;const p=plotFrequency(event);action('add_vfo',{vfo:{frequency_hz:Math.round(p.hz),mode:'WFM',bandwidth_hz:200000}});});
+  $('spanReadout').addEventListener('pointerdown',event=>beginFrequencyPan(event,true));$('spanReadout').addEventListener('pointermove',moveFrequencyPan);$('spanReadout').addEventListener('pointerup',finishFrequencyPan);$('spanReadout').addEventListener('pointercancel',cancelFrequencyPan);$('spanReadout').addEventListener('keydown',frequencyPanKey);
   attachResize('spectrumResizer','spectrum');attachResize('sidebarResizer','sidebar');attachResize('bottomResizer','bottom');
   new ResizeObserver(()=>requestAnimationFrame(drawAll)).observe($('workspace'));
   window.addEventListener('resize',()=>requestAnimationFrame(drawAll));
   try{const saved=JSON.parse(localStorage.getItem('spectrum-studio-layout'));if(saved)applyLayout(saved,false);}catch{}
 
-  async function refreshState(force=false,fromAction=false){const epoch=stateEpoch;try{const next=await getJson('/api/state');if(fromAction||(epoch===stateEpoch&&!actionInFlight))applyState(next,force);}catch(error){if(epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;flushAudio();renderVfos();}renderFrontend();$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
-  async function stateLoop(){await refreshState();setTimeout(stateLoop,1000);}
-  function requestFrame(){clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}frameTimer=setTimeout(frameLoop,0);}
+  async function refreshState(force=false,fromAction=false){if(studioClosed)return;const epoch=stateEpoch;try{const next=await getJson('/api/state');if(!studioClosed&&(fromAction||(epoch===stateEpoch&&!actionInFlight)))applyState(next,force);}catch(error){if(studioClosed||studioClosing||epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;flushAudio();renderVfos();}renderFrontend();$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
+  async function stateLoop(){if(studioClosed)return;await refreshState();if(!studioClosed)stateTimer=setTimeout(stateLoop,1000);}
+  function requestFrame(){if(studioClosed)return;clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}frameTimer=setTimeout(frameLoop,0);}
   async function frameLoop(){
-    clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}framePending=true;const epoch=frameEpoch;
-    try{const f=await getJson('/api/frame');if(epoch===frameEpoch){if(f)acceptFrame(f);if(frameFailures>=3&&$('noticeText').textContent==='解析表示を更新できません。再接続を待っています。')notice('');frameFailures=0;}}
-    catch{if(epoch!==frameEpoch)return;frameFailures++;if(frameFailures===3&&state?.running&&!connectionError&&!state?.device?.error)notice('解析表示を更新できません。再接続を待っています。','error');}
-    finally{framePending=false;const delay=frameRefreshRequested?0:!state?.running?1000:document.hidden?500:125;frameRefreshRequested=false;frameTimer=setTimeout(frameLoop,delay);}
+    if(studioClosed)return;clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}framePending=true;const epoch=frameEpoch;
+    try{const f=await getJson('/api/frame');if(!studioClosed&&epoch===frameEpoch){if(f)acceptFrame(f);if(frameFailures>=3&&$('noticeText').textContent==='解析表示を更新できません。再接続を待っています。')notice('');frameFailures=0;}}
+    catch{if(studioClosed||studioClosing||epoch!==frameEpoch)return;frameFailures++;if(frameFailures===3&&state?.running&&!connectionError&&!state?.device?.error)notice('解析表示を更新できません。再接続を待っています。','error');}
+    finally{framePending=false;if(!studioClosed){const delay=frameRefreshRequested?0:!state?.running?1000:document.hidden?500:125;frameRefreshRequested=false;frameTimer=setTimeout(frameLoop,delay);}}
   }
-  async function audioLoop(){if(audioEnabled&&state?.running&&!connectionError){const epoch=audioEpoch;try{const data=await getJson(`/api/audio?after=${audioSequence}`);if(epoch===audioEpoch&&audioEnabled&&state?.running&&!connectionError&&audioPacketMatchesState(data)){if(finite(data.sequence)<audioSequence)audioSequence=0;playPcm(data);if(data.data_b64)audioSequence=finite(data.sequence,audioSequence);}}catch{}}setTimeout(audioLoop,90);}
-  renderFrontend();updateFftVisibility();drawAll();stateLoop();frameLoop();audioLoop();
+  async function audioLoop(){if(studioClosed)return;if(audioEnabled&&state?.running&&!connectionError){const epoch=audioEpoch;try{const data=await getJson(`/api/audio?after=${audioSequence}`);if(!studioClosed&&epoch===audioEpoch&&audioEnabled&&state?.running&&!connectionError&&audioPacketMatchesState(data)){if(finite(data.sequence)<audioSequence)audioSequence=0;playPcm(data);if(data.data_b64)audioSequence=finite(data.sequence,audioSequence);}}catch{}}if(!studioClosed)audioTimer=setTimeout(audioLoop,90);}
+  renderFrontend();renderAudioControl();updateFftVisibility();drawAll();stateLoop();frameLoop();audioLoop();
 })();
