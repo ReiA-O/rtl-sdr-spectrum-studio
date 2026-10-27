@@ -18,6 +18,7 @@
   let actionQueue = Promise.resolve(), stateEpoch = 0;
   let userSelectionIntent, userSelectionGeneration = 0, userSelectionPending = false, userSelectionPromise = Promise.resolve(true);
   let vfoSelectionIntent, vfoSelectionGeneration = 0, vfoSelectionPromise = Promise.resolve(true), canvasGestureTarget = 'empty';
+  let densityRangeDisplayContext = null, densityRangeEditContext = null, densityRangeEditGeneration = 0;
   const dirtyForms = new Set();
 
   function toast(message, type = 'info', duration = 4800) {
@@ -90,6 +91,52 @@
     asText('levelUnitLabel', unit === 'dBm' ? '校正情報適用 dBm / RBW' : '相対 dBFS / RBW');
     asText('densityUnitLabel', `${unit} / RBW`); asText('waterfallUnitLabel', `${unit} / RBW`);
   }
+  function densityLevelContext() {
+    const unit=levelUnit(),offset=unit==='dBm'?state?.calibration?.offset_db:0;
+    return {unit,offset_db:validLevel(offset)?Number(offset):null};
+  }
+  function clearDensityDisplayFrame(current) { return current?{...current,density:null}:current; }
+  function renderDensityRange(force = false) {
+    const context=densityLevelContext(),previous=densityRangeDisplayContext;
+    const changed=previous&&(previous.unit!==context.unit||previous.offset_db!==context.offset_db);
+    if(changed&&dirtyForms.has('densityRangeForm')){
+      dirtyForms.delete('densityRangeForm');densityRangeEditContext=null;
+      toast('表示単位・校正の変更により、Densityの未適用範囲を取り消しました','warning');
+    }
+    if(force){dirtyForms.delete('densityRangeForm');densityRangeEditContext=null;}
+    densityRangeDisplayContext={...context};
+    const valid=context.offset_db!==null;
+    if(valid){setValue('densityMaxDb',finite(state?.analysis?.density_max_db,0)+context.offset_db,force||changed);setValue('densityMinDb',finite(state?.analysis?.density_min_db,-140)+context.offset_db,force||changed);}
+    else{setValue('densityMaxDb','',true);setValue('densityMinDb','',true);}
+    asText('densityMaxUnit',context.unit);asText('densityMinUnit',context.unit);
+    $('densityRangeApply').disabled=!state||!valid;
+    asText('densityRangeNote',valid?'変更時は密度履歴を再集計。Spectrum・Waterfall・受信は維持します。':'校正オフセットが未確認のため、範囲を適用できません。');
+    if(changed){frameEpoch++;frame=clearDensityDisplayFrame(frame);requestFrame();}
+  }
+  function beginDensityRangeEdit() {
+    if(!densityRangeEditContext&&densityRangeDisplayContext)densityRangeEditContext={...densityRangeDisplayContext};
+    densityRangeEditGeneration++;dirtyForms.add('densityRangeForm');
+  }
+  function densityRangePayload(minimumText,maximumText,context) {
+    if(typeof minimumText!=='string'||typeof maximumText!=='string'||!minimumText.trim()||!maximumText.trim())return {error:'Densityの上限・下限を両方入力してください。'};
+    const minimum=Number(minimumText),maximum=Number(maximumText);
+    if(!Number.isFinite(minimum)||!Number.isFinite(maximum)||maximum<=minimum)return {error:'Densityは有限の数値で、下限より大きい上限を指定してください。'};
+    if(!context||!['dBFS','dBm'].includes(context.unit)||!validLevel(context.offset_db))return {error:'Densityの表示単位・校正条件を確認してください。'};
+    const offset=context.unit==='dBm'?Number(context.offset_db):0,minDbfs=minimum-offset,maxDbfs=maximum-offset;
+    if(!Number.isFinite(minDbfs)||!Number.isFinite(maxDbfs)||!Number.isFinite(maxDbfs-minDbfs))return {error:'Densityの範囲が大きすぎます。'};
+    return {analysis:{density_min_db:minDbfs,density_max_db:maxDbfs,density_level_unit:'dBFS'}};
+  }
+  async function submitDensityRange(event) {
+    event.preventDefault();
+    if(!state||connectionError){toast('アプリとの接続を確認してください。','error');return null;}
+    const payload=densityRangePayload($('densityMinDb').value,$('densityMaxDb').value,densityRangeEditContext || densityRangeDisplayContext);
+    if(payload.error){toast(payload.error,'error');return null;}
+    const generation=densityRangeEditGeneration;
+    const changed=payload.analysis.density_min_db!==state.analysis?.density_min_db||payload.analysis.density_max_db!==state.analysis?.density_max_db;
+    const result=await action('set_analysis',payload,{form:'densityRangeForm',formIsCurrent:()=>generation===densityRangeEditGeneration,forceVfos:false});
+    if(result){if(generation===densityRangeEditGeneration)densityRangeEditContext=null;frameEpoch++;if(changed)frame=clearDensityDisplayFrame(frame);drawHeatmap('density');requestFrame();toast(dirtyForms.has('densityRangeForm')?'Densityの範囲を適用しました。追加の編集値は未適用です':'Densityの上下限を適用しました');}
+    return result;
+  }
 
   async function getJson(path) {
     const response = await fetch(path, {cache:'no-store'});
@@ -115,7 +162,7 @@
         } else return null;
       }
       if (!response.ok || json.ok === false) throw new Error(json.error || json.message || `操作できません (${response.status})`);
-      if (options.form) dirtyForms.delete(options.form);
+      if (options.form && (!options.formIsCurrent || options.formIsCurrent())) dirtyForms.delete(options.form);
       if (json.state) applyState(json.state, Boolean(options.forceState), options.forceVfos !== false); else await refreshState(Boolean(options.forceState),true);
       requestFrame();
       if (options.message) toast(options.message);
@@ -204,7 +251,7 @@
       asText('replayPosition',`${finite(r.position_seconds).toFixed(2)} s`); asText('replayDuration',`${finite(r.duration_seconds ?? r.total_seconds).toFixed(2)} s`);
     }
     if (state.layout && !drag?.layout) applyLayout(state.layout, false);
-    renderCalibration(force); renderVfos(force || forceVfos); renderMeasurements(frame?.measurements || {}); updateFftVisibility();updatePresetLoadState();
+    renderCalibration(force);renderDensityRange(force);renderVfos(force || forceVfos);renderMeasurements(frame?.measurements || {});updateFftVisibility();updatePresetLoadState();
     const pv = a.persistence_mode === 'off' ? 'OFF' : a.persistence_mode === 'infinite' ? 'Infinite' : a.persistence_mode === 'window' ? '時間窓' : '指数減衰';
     asText('persistenceReadout',`${pv}${['off','infinite'].includes(a.persistence_mode) ? '' : ` · ${a.persistence_unit === 'frames' ? finite(a.persistence_frames).toLocaleString()+' FFT' : finite(a.persistence_seconds,1).toFixed(2)+' s'}`}`);
     for (const item of state.notifications || []) {
@@ -387,6 +434,11 @@
   for(let k=0;k<256;k++){const f=k/255;let index=1;while(index<stops.length-1&&stops[index][0]<f)index++;const a=stops[index-1],b=stops[index],q=(f-a[0])/(b[0]-a[0]);for(let j=0;j<3;j++)palette[k*4+j]=Math.round(a[1][j]+(b[1][j]-a[1][j])*q);palette[k*4+3]=255;}
   const heatmaps={density:document.createElement('canvas'),waterfall:document.createElement('canvas')};
   function decodedBytes(encoded) { const raw=atob(encoded || '');return Uint8Array.from(raw,c=>c.charCodeAt(0)); }
+  function densityPlotLimits(data) {
+    if(Number.isFinite(data?.min_db)&&Number.isFinite(data?.max_db)&&data.max_db>data.min_db)return {top:data.max_db,range:data.max_db-data.min_db};
+    const minimum=finite(state?.analysis?.density_min_db,-140),maximum=finite(state?.analysis?.density_max_db,0),offset=densityLevelContext().offset_db ?? 0;
+    return {top:maximum+offset,range:maximum-minimum};
+  }
   function renderDensityHistory(data = {}) {
     const windowMode=['window','time_window'].includes(state?.analysis?.persistence_mode);
     const el=$('densityHistory');el.hidden=!windowMode&&!data.window_truncated;
@@ -402,7 +454,7 @@
   }
   function drawHeatmap(kind) {
     const canvas=$(kind==='density'?'densityCanvas':'waterfallCanvas'),data=frame?.[kind];
-    const limits=kind==='density'&&data&&Number.isFinite(data.min_db)&&Number.isFinite(data.max_db)?{top:data.max_db,range:data.max_db-data.min_db}:null;
+    const limits=kind==='density'?densityPlotLimits(data):null;
     const s=plotAxes(canvas,kind==='density',limits);
     if(!data?.data_b64||!data.width||!data.height)return;
     const w=Math.trunc(data.width),h=Math.trunc(data.height);if(w*h>4194304||w<1||h<1)return;
@@ -579,6 +631,7 @@
   $('traceResetButton').addEventListener('click',resetTraces);
   $('detector').addEventListener('change',()=>action('set_analysis',{analysis:{detector:$('detector').value}}));
   $('densityMetric').addEventListener('change',()=>action('set_analysis',{analysis:{density_metric:$('densityMetric').value}}));
+  $('densityRangeForm').addEventListener('input',beginDensityRangeEdit);$('densityRangeForm').addEventListener('submit',submitDensityRange);
   $('waterfallRowSeconds').addEventListener('change',()=>action('set_analysis',{analysis:{waterfall_row_seconds:num('waterfallRowSeconds')}}));
   $('addVfoButton').addEventListener('click',()=>action('add_vfo',{vfo:{frequency_hz:finite(state?.input?.center_hz,32000000),mode:'WFM',bandwidth_hz:200000}}));
   $('vfoList').addEventListener('click',vfoAction);
@@ -625,7 +678,7 @@
   $('replaySeek').addEventListener('change',()=>{flushAudio();audioSequence=0;action('replay_seek',{seconds:num('replaySeek')});});
   $('replayCloseButton').addEventListener('click',()=>{flushAudio();action('replay_close');});
   $('noticeDismiss').addEventListener('click',()=>notice(''));
-  for(const form of ['tuningForm','receiverForm','persistenceForm','measurementForm','triggerForm']) $(form).addEventListener('input',()=>dirtyForms.add(form));
+  for(const form of ['tuningForm','receiverForm','persistenceForm','measurementForm','triggerForm','densityRangeForm']) $(form).addEventListener('input',()=>dirtyForms.add(form));
   $('spectrumCanvas').addEventListener('pointerdown',beginVfoDrag);$('spectrumCanvas').addEventListener('pointermove',moveVfo);$('spectrumCanvas').addEventListener('pointerup',finishVfo);$('spectrumCanvas').addEventListener('pointercancel',()=>{drag=null;drawSpectrum();});
   $('spectrumCanvas').addEventListener('pointerleave',()=>{if(!drag){hover=null;$('cursorReadout').hidden=true;drawSpectrum();}});
   $('spectrumCanvas').addEventListener('keydown',vfoKey);$('spectrumCanvas').addEventListener('wheel',vfoWheel,{passive:false});

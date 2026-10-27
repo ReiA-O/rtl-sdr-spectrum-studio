@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$BinaryPath,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBinarySha256,
-    [string]$PackageVersion = '0.2.1-dev',
+    [string]$PackageVersion = '0.2.2-dev',
     [string]$OutputParent,
     [string]$PresetPath,
     [string]$RuntimeDllPath,
@@ -154,7 +154,8 @@ Windows 10/11 x64 と通常のブラウザーを使用する。Rust/Python/Node/
 このZIPには元PCのIQ/WAV、履歴、校正情報、個人ファイルを含めない。元のユーザーデータは変更しない。
 再生・スピーカー・持出先PCの実機動作は、それぞれのPCでの確認が必要。
 Spectrumの「ピークリセット」でMax／Min／Averageの履歴を同時にリセットし、現在のLiveから再集計する。受信・録音は継続し、入力条件・密度・Waterfall・Marker位置は維持する。
-0.2.0の代表GUI操作は同じ開発PCで確認済み。今回追加したリセットの実画面確認、クリーンな別PC、屋外ノートPCでの実受信は別途必要。これはdev版の検証候補です。
+Densityの上限・下限は同パネルで手動設定できる。新しい範囲では密度だけを再集計し、Spectrumの保持値やWaterfall・受信は維持する。
+0.2.0の代表GUIと0.2.1のピークリセットは同じ開発PCで確認済み。今回のDensity操作、クリーンな別PC、屋外ノートPCでの実受信は別途確認する。これはdev版の検証候補です。
 
 `package-manifest.json` と `package-validation.json` に同梱物と検査結果を保存する。
 本体の画面はexeに内蔵し、外部サーバーからUI資産を取得しない。

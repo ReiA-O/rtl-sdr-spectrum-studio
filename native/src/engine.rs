@@ -609,8 +609,15 @@ impl Engine {
             },
             "set_analysis"=>{
                 let patch=&body["analysis"];let object=patch.as_object().ok_or("解析設定が不正です")?;
+                // Density bounds are stored as dBFS. The UI captures its edit
+                // unit/offset and converts before submitting, so a calibration
+                // change during editing cannot silently reinterpret a dBm value.
+                if let Some(unit)=object.get("density_level_unit"){
+                    if unit.as_str()!=Some("dBFS"){return Err("Densityの上下限は編集時の校正値でdBFSに換算して送信してください".into());}
+                }
                 if let Some(fs)=object.get("sample_rate"){if fs.as_f64()!=Some(self.fs()){return Err("サンプルレートは入力設定から変更してください".into());}}
                 let mut value=serde_json::to_value(&self.analyzer.config).map_err(|e|e.to_string())?;merge(&mut value,patch);value["sample_rate"]=json!(self.fs());
+                if let Some(fields)=value.as_object_mut(){fields.remove("density_level_unit");}
                 let mut config:Config=serde_json::from_value(value).map_err(|e|e.to_string())?;
                 let mut extra=self.analysis_extra.clone();for key in ["fft_mode","rbw_hz"]{if let Some(v)=object.get(key){extra[key]=v.clone();}}
                 if let Some(rbw)=object.get("target_rbw_hz"){extra["rbw_hz"]=rbw.clone();}
@@ -625,7 +632,11 @@ impl Engine {
                 self.performance["valid_frames"]=json!(self.analyzer.total_valid_frames);
                 self.performance["gap_samples"]=json!(self.analyzer.gap_samples);self.performance["dropped_samples"]=json!(self.analyzer.gap_samples);
                 self.display["ref_level"]=json!(self.analyzer.config.ref_level);self.display["range_db"]=json!(self.analyzer.config.range_db);
-                if boolean(&outcome,"history_cleared",false){self.frozen_markers.clear();self.notify("解析条件を変更したため密度履歴をクリアしました。","info");}
+                if boolean(&outcome,"history_cleared",false){
+                    if outcome["history_scope"]=="analysis"{self.frozen_markers.clear();}
+                    self.notify(if outcome["reason"]=="density_grid_changed"{"Densityの縦軸を変更したため密度履歴だけをクリアしました。"}
+                        else{"解析条件を変更したため密度履歴をクリアしました。"},"info");
+                }
             },
             "set_measurement"=>{
                 if !body["measurement"].is_object(){return Err("測定設定が不正です".into());}
@@ -831,6 +842,72 @@ mod tests{
         assert_eq!(e.state(),before);assert_eq!(e.trigger.snapshot(),trigger);assert_eq!(e.trigger_last_frame,trigger_frame);assert_eq!(e.prebuffer.get(1.0,None).unwrap(),pre);
         let after=e.frame();assert_trace_seeded_from_live(&after);assert_eq!(after["density"],previous["density"]);assert_eq!(after["waterfall"],previous["waterfall"]);assert_eq!(after["sample_index"],previous["sample_index"]);
         e.on_stop("test");
+    }
+    #[test]
+    fn density_axis_edit_preserves_recordings_frozen_markers_traces_and_stream(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.apply(&json!({"action":"iq_start"})).unwrap();
+        e.process_block(0,&trace_test_iq(16384,40.0)).unwrap();e.process_block(16384,&trace_test_iq(16384,8.0)).unwrap();
+        e.apply(&json!({"action":"user_marker_add","frequency_hz":32000000.0})).unwrap();
+        e.apply(&json!({"action":"set_measurement","measurement":{"marker_follow":false}})).unwrap();
+        let before_frame=e.frame();assert!(!e.frozen_markers.is_empty());let frozen=e.frozen_markers.clone();let before=e.state();
+        let pre=e.prebuffer.get(1.0,None).unwrap();let audio=e.audio(0);let last=e.last_sample;
+        let iq=e.iq.as_ref().unwrap().summary();let iq_samples=e.iq.as_ref().unwrap().samples_written;
+        let wav=e.vfos[0].wav.as_ref().unwrap();let wav_samples=wav.samples_written;
+        let files=[e.iq.as_ref().unwrap().data_path.clone().unwrap(),e.iq.as_ref().unwrap().meta_path.clone().unwrap(),wav.path.clone().unwrap(),wav.meta_path.clone().unwrap()];
+        let bytes:Vec<Vec<u8>>=files.iter().map(|p|fs::read(p).unwrap()).collect();
+        e.apply(&json!({"action":"set_analysis","analysis":{"density_min_db":-100.0,"density_max_db":-10.0,"density_levels":64,"density_level_unit":"dBFS"}})).unwrap();
+        let after=e.state();for key in ["running","source","input","display","measurement","trigger","selected_vfo_id","vfos","recording","locks","device","performance","replay","layout"]{assert_eq!(after[key],before[key],"{key}");}
+        assert_eq!(e.prebuffer.get(1.0,None).unwrap(),pre);assert_eq!(e.audio(0),audio);assert_eq!(e.last_sample,last);
+        assert_eq!(e.iq.as_ref().unwrap().summary(),iq);assert_eq!(e.frozen_markers,frozen);assert_eq!(files.iter().map(|p|fs::read(p).unwrap()).collect::<Vec<_>>(),bytes);
+        let after_frame=e.frame();for key in ["spectrum","waterfall","measurements","valid_frames","invalid_frames","gap_samples","sample_index"]{assert_eq!(after_frame[key],before_frame[key],"{key}");}
+        assert_eq!(after_frame["density"]["valid_frames"],0);assert_eq!(after_frame["density"]["height"],64);
+        assert_eq!(after_frame["density"]["min_db"],-100.0);assert_eq!(after_frame["density"]["max_db"],-10.0);
+        assert!(B64.decode(after_frame["density"]["data_b64"].as_str().unwrap()).unwrap().iter().all(|v|*v==0));
+        e.process_block(last,&trace_test_iq(16384,8.0)).unwrap();assert!(e.running&&e.iq_active()&&e.wav_active());
+        assert_eq!(e.iq.as_ref().unwrap().samples_written,iq_samples+16384);assert!(e.vfos[0].wav.as_ref().unwrap().samples_written>wav_samples);
+        let global=e.analyzer.total_valid_frames;assert!(global>before["performance"]["valid_frames"].as_u64().unwrap());
+        assert_eq!(e.performance["valid_frames"],global);assert!(e.analyzer.density_valid_frames>0&&e.analyzer.density_valid_frames<global);
+        let current=e.frame();let notices=e.notifications.clone();e.apply(&json!({"action":"set_analysis","analysis":{"density_min_db":-100.0,"density_max_db":-10.0,"density_level_unit":"dBFS"}})).unwrap();
+        assert_eq!(e.frame(),current);assert_eq!(e.notifications,notices);assert_eq!(e.frozen_markers,frozen);e.on_stop("test");
+    }
+    #[test]
+    fn density_axis_edit_during_replay_keeps_armed_trigger_and_prebuffer(){
+        let mut e=engine();e.on_start("replay",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"set_trigger","trigger":{"pre_seconds":0.001,"threshold_db":10.0}})).unwrap();
+        e.process_block(0,&trace_test_iq(16384,20.0)).unwrap();e.apply(&json!({"action":"arm"})).unwrap();
+        e.process_block(16384,&trace_test_iq(16384,8.0)).unwrap();let before=e.frame();let performance=e.performance.clone();
+        let trigger=e.trigger.snapshot();let trigger_frame=e.trigger_last_frame;let pre=e.prebuffer.get(1.0,None).unwrap();let last=e.last_sample;
+        e.apply(&json!({"action":"set_analysis","analysis":{"density_min_db":-90.0,"density_max_db":-20.0}})).unwrap();
+        assert_eq!(e.trigger.snapshot(),trigger);assert_eq!(e.trigger_last_frame,trigger_frame);assert_eq!(e.prebuffer.get(1.0,None).unwrap(),pre);
+        assert_eq!(e.performance,performance);assert_eq!(e.last_sample,last);assert!(e.running&&e.trigger.armed);assert_eq!(e.source,"replay");
+        let after=e.frame();for key in ["spectrum","waterfall","measurements","valid_frames","sample_index"]{assert_eq!(after[key],before[key],"{key}");}
+        assert_eq!(after["density"]["valid_frames"],0);e.on_stop("test");
+    }
+    #[test]
+    fn density_axis_invalid_inputs_leave_configuration_and_history_unchanged(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();e.process_block(0,&trace_test_iq(16384,20.0)).unwrap();
+        let frame=e.frame();let state=e.state();let config=e.configuration();
+        for patch in [json!({"density_min_db":""}),json!({"density_min_db":null}),json!({"density_max_db":false}),
+            json!({"density_min_db":0.0,"density_max_db":0.0}),json!({"density_min_db":10.0,"density_max_db":-10.0}),
+            json!({"density_min_db":-1e308,"density_max_db":1e308}),json!({"density_levels":0}),
+            json!({"density_level_unit":"dBm","density_min_db":-100.0}),json!({"density_level_unit":null}),json!({"density_level_unit":""})]{
+            assert!(e.apply(&json!({"action":"set_analysis","analysis":patch})).is_err());
+            assert_eq!(e.state(),state);assert_eq!(e.configuration(),config);assert_eq!(e.frame(),frame);
+        }e.on_stop("test");
+    }
+    #[test]
+    fn density_axis_canonical_units_persist_and_roundtrip_under_calibration(){
+        let mut e=engine();e.apply(&json!({"action":"calibration_load","calibration":calibration_profile()})).unwrap();e.on_start("live",live_metadata()).unwrap();
+        e.process_block(0,&trace_test_iq(16384,20.0)).unwrap();e.apply(&json!({"action":"set_level_unit","unit":"absolute"})).unwrap();
+        e.apply(&json!({"action":"set_analysis","analysis":{"density_min_db":-100.0,"density_max_db":-10.0,"density_level_unit":"dBFS"}})).unwrap();
+        let frame=e.frame();assert_eq!(frame["density"]["min_db"],-135.0);assert_eq!(frame["density"]["max_db"],-45.0);
+        let state=e.state();assert_eq!(state["analysis"]["density_min_db"],-100.0);assert_eq!(state["analysis"]["density_max_db"],-10.0);assert!(state["analysis"].get("density_level_unit").is_none());
+        e.on_stop("test");e.apply(&json!({"action":"preset_save","name":"density-test"})).unwrap();
+        e.apply(&json!({"action":"set_analysis","analysis":{"density_min_db":-80.0,"density_max_db":-5.0}})).unwrap();
+        e.apply(&json!({"action":"preset_load","name":"density-test"})).unwrap();assert_eq!(e.analyzer.config.density_min_db,-100.0);assert_eq!(e.analyzer.config.density_max_db,-10.0);
+        let config=e.configuration();assert!(config["analysis"].get("density_level_unit").is_none());let project=e.project.clone();drop(e);let restored=Engine::new(project).unwrap();
+        assert_eq!(restored.analyzer.config.density_min_db,-100.0);assert_eq!(restored.analyzer.config.density_max_db,-10.0);assert!(!restored.running);
     }
     #[test]
     fn input_confirmation_and_all_routes_share_filter_bounds(){

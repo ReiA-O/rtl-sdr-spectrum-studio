@@ -20,6 +20,7 @@ Windows 10/11 x64、RTL-SDR Blog V3を最初の実機対象とする開発版で
 - TraceはLive/Max Hold/Min Hold/平均、表示検波はSample/Positive Peak/Negative Peak/RMSです。表示用の縮約と測定用PSDを区別します。
 - 「ピークリセット」はMax Hold／Min Hold／平均を最新有効Live PSDへ揃えて再集計します。入力・FFT・表示条件、密度・Waterfall、Marker位置、VFO、トリガ／プリバッファ、IQ/WAVとサンプル時計は維持します。共有平均PSD由来の平均Channel Powerも新しい平均履歴へ追従します。
 - 密度は全有効FFTフレームを集計し、ヒット数／出現率、累積／Persistenceを切り替えます。Persistenceは指数減衰／時間窓／OFF／Infinite、指数減衰の指定は半減期／時定数／フレーム数に対応します。
+- Densityの縦軸上限／下限はSpectrumのRef／Rangeと独立して手動設定します。範囲変更は密度の履歴・母数だけを再集計し、全体FFT数・Spectrum保持・Waterfall・時計・記録を維持します。画面の校正単位は編集時に解釈し、内部へは正本dBFSで渡します。
 - FFT・窓・入力など解析条件の変更で密度履歴をクリアして通知します。時間窓の保持には容量上限があり、実効保持秒・保持FFT数・上限・短縮警告を表示します。
 - 自動マーカーはピーク上位へ配置します。独立したユーザーマーカーは追加・選択・移動、最大／左隣／右隣ピーク、Δ表示に対応し、自動マーカーと併用できます。
 - Channel PowerとOBWには独立測定帯域を指定でき、VFO連動も可能です。境界binは測定帯域との重なり幅で積分します。OBWは指定帯域内の信号と雑音を含む電力分布から計算します。

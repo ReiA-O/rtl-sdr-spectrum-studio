@@ -73,7 +73,8 @@ pub fn validate_config(c: &Config) -> Result<(), String> {
         if !x.is_finite() || x <= 0.0 { return Err("時間・範囲・メモリー上限は正の値が必要です".into()); }
     }
     if !c.ref_level.is_finite() || !c.density_min_db.is_finite() || !c.density_max_db.is_finite()
-        || c.density_max_db <= c.density_min_db || !(16..=256).contains(&c.density_levels)
+        || c.density_max_db <= c.density_min_db || !(c.density_max_db-c.density_min_db).is_finite()
+        || !(16..=256).contains(&c.density_levels)
         || c.persistence_frames == 0 || !(1..=1000).contains(&c.waterfall_rows) {
         return Err("密度または表示範囲が不正です".into());
     }
@@ -123,7 +124,11 @@ pub struct Analyzer {
     pub bin_hz: f64,
     pub enbw_hz: f64,
     pub frequency_offsets_hz: Vec<f64>,
+    /// All valid FFT frames since the last full analysis reset.
     pub total_valid_frames: u64,
+    /// Valid FFT frames in the current density-history epoch. A density
+    /// clear must restart this denominator without rewinding the stream.
+    pub density_valid_frames: u64,
     pub invalid_frames: u64,
     pub gap_samples: u64,
     pub last_psd: Vec<f64>,
@@ -172,7 +177,7 @@ impl Analyzer {
         Self { hop: ((n as f64*(1.0-config.overlap)).round() as usize).max(1),
             bin_hz: fs/n as f64, enbw_hz: fs*sum2/(sum*sum),
             frequency_offsets_hz: (0..n).map(|i|(i as f64-n as f64/2.0)*fs/n as f64).collect(),
-            total_valid_frames:0, invalid_frames:0, gap_samples:0, last_psd:vec![0.0;n],
+            total_valid_frames:0, density_valid_frames:0, invalid_frames:0, gap_samples:0, last_psd:vec![0.0;n],
             fft, fft_scratch:vec![Complex32::new(0.0,0.0);scratch_len],
             fft_buffer:vec![Complex32::new(0.0,0.0);n], window, psd_scale:fs*sum2,
             tail:Vec::new(), tail_start:None, expected_next:None,
@@ -217,8 +222,10 @@ impl Analyzer {
     }
 
     fn clear_density(&mut self) {
+        let cells=self.config.fft_size*self.config.density_levels;
+        self.cumulative.resize(cells,0); self.exponential.resize(cells,0.0); self.window_hist.resize(cells,0);
         self.cumulative.fill(0); self.exponential.fill(0.0); self.window_hist.fill(0);
-        self.total_valid_frames=0; self.exp_denominator=0.0; self.last_levels=None;
+        self.density_valid_frames=0; self.exp_denominator=0.0; self.last_levels=None;
         self.window_entries.clear(); self.window_bytes=0; self.window_truncated=false; self.window_last_forced_drop=None;
     }
 
@@ -226,11 +233,12 @@ impl Analyzer {
         validate_config(&config)?;
         let old = &self.config;
         if old.sample_rate!=config.sample_rate || old.fft_size!=config.fft_size || old.window!=config.window
-            || old.overlap!=config.overlap || old.density_levels!=config.density_levels
-            || old.density_min_db!=config.density_min_db || old.density_max_db!=config.density_max_db {
+            || old.overlap!=config.overlap {
             self.reset(Some(config));
-            return Ok(json!({"history_cleared":true,"reason":"analysis_conditions_changed"}));
+            return Ok(json!({"history_cleared":true,"history_scope":"analysis","reason":"analysis_conditions_changed"}));
         }
+        let grid_changed=old.density_levels!=config.density_levels
+            || old.density_min_db!=config.density_min_db || old.density_max_db!=config.density_max_db;
         let switched = old.persistence_unit!=config.persistence_unit;
         self.unit_values.insert(old.persistence_unit.clone(),(old.persistence_seconds,old.persistence_frames));
         if switched && config.switch_policy=="convert" {
@@ -245,10 +253,11 @@ impl Analyzer {
                 config.persistence_seconds=*seconds; config.persistence_frames=*frames;
             }
         }
-        let clear=(switched && config.switch_policy!="convert") || config.persistence_mode!=old.persistence_mode;
+        let clear=grid_changed || (switched && config.switch_policy!="convert") || config.persistence_mode!=old.persistence_mode;
         self.config=config;
         if clear { self.clear_density(); } else { self.prune_window_history(); }
-        Ok(json!({"history_cleared":clear,"reason":if clear {Some("persistence_setting_changed")} else {None}}))
+        Ok(json!({"history_cleared":clear,"history_scope":if clear {Some("density")} else {None},
+            "reason":if grid_changed {Some("density_grid_changed")} else if clear {Some("persistence_setting_changed")} else {None}}))
     }
 
     pub fn note_gap(&mut self, samples: u64) {
@@ -278,7 +287,7 @@ impl Analyzer {
             if self.window_entries.is_empty() || (!expired&&self.window_bytes<=cap){break;}
             if !expired&&self.window_bytes>cap{
                 self.window_last_forced_drop=Some((self.window_entries.front().unwrap().time,
-                    self.total_valid_frames.saturating_sub(self.window_entries.len() as u64)+1));
+                    self.density_valid_frames.saturating_sub(self.window_entries.len() as u64)+1));
             }
             let old=self.window_entries.pop_front().unwrap();self.window_bytes-=old.levels.len();
             for(k,level)in old.levels.into_iter().enumerate(){
@@ -288,7 +297,7 @@ impl Analyzer {
         }
         if let Some((time,sequence))=self.window_last_forced_drop {
             self.window_truncated=if self.config.persistence_unit=="frames"{
-                self.total_valid_frames.saturating_sub(sequence)<self.config.persistence_frames as u64
+                self.density_valid_frames.saturating_sub(sequence)<self.config.persistence_frames as u64
             }else{time>latest-self.config.persistence_seconds+1e-12};
         }
     }
@@ -335,8 +344,8 @@ impl Analyzer {
                     let p=frame[k];
                     self.max_psd[k]=self.max_psd[k].max(p);self.min_psd[k]=self.min_psd[k].min(p);
                     self.avg_acc[k]+=p*avg_weight;
-                    let level=(((db(p*self.enbw_hz)-self.config.density_min_db)*levels_count as f64
-                        /(self.config.density_max_db-self.config.density_min_db)).floor().max(0.0) as usize).min(max_level);
+                    let level=(((db(p*self.enbw_hz)-self.config.density_min_db)
+                        /(self.config.density_max_db-self.config.density_min_db)*levels_count as f64).floor().max(0.0) as usize).min(max_level);
                     row[k]=level as u8;
                     let cell=k*levels_count+level;
                     self.cumulative[cell]=self.cumulative[cell].saturating_add(1);
@@ -357,6 +366,7 @@ impl Analyzer {
                 self.waterfall_count+=1;
             }
             self.total_valid_frames=self.total_valid_frames.saturating_add(frames.len() as u64);
+            self.density_valid_frames=self.density_valid_frames.saturating_add(frames.len() as u64);
             self.last_frame_time=Some(latest);
             self.prune_window_history();
             self.last_levels=self.window_entries.back().map(|e|e.levels.clone());
@@ -364,7 +374,7 @@ impl Analyzer {
             if self.last_levels.is_none() {
                 let p=frames.last().unwrap();
                 self.last_levels=Some(p.iter().map(|v|(((db(v*self.enbw_hz)-self.config.density_min_db)
-                    *levels_count as f64/(self.config.density_max_db-self.config.density_min_db)).floor().max(0.0) as usize).min(max_level) as u8).collect());
+                    /(self.config.density_max_db-self.config.density_min_db)*levels_count as f64).floor().max(0.0) as usize).min(max_level) as u8).collect());
             }
             self.last_psd=frames.last().unwrap().clone();
         }
@@ -377,7 +387,7 @@ impl Analyzer {
 
     fn persistence_denominator(&self) -> f64 {
         match self.config.persistence_mode.as_str() {
-            "infinite" => self.total_valid_frames as f64,
+            "infinite" => self.density_valid_frames as f64,
             "window"|"time_window" => self.window_entries.len() as f64,
             "off" => if self.last_levels.is_some(){1.0}else{0.0},
             _ => self.exp_denominator,
@@ -394,7 +404,7 @@ impl Analyzer {
     }
 
     pub fn density_statistics(&self) -> (Vec<f64>,f64) {
-        if self.config.stats_mode=="cumulative" {return (self.cumulative.iter().map(|v|*v as f64).collect(),self.total_valid_frames as f64);}
+        if self.config.stats_mode=="cumulative" {return (self.cumulative.iter().map(|v|*v as f64).collect(),self.density_valid_frames as f64);}
         let mut values=vec![0.0;self.config.fft_size*self.config.density_levels];
         for k in 0..self.config.fft_size {for l in 0..self.config.density_levels {values[k*self.config.density_levels+l]=self.persistence_cell(k,l);}}
         (values,self.persistence_denominator())
@@ -428,7 +438,7 @@ impl Analyzer {
             image_values[(levels-1-l)*count+x]=value;image_top=image_top.max(value);
         }}
         let density_bytes:Vec<u8>=image_values.iter().map(|v|(255.0*(v/image_top.max(1e-30)).clamp(0.0,1.0).sqrt()).round() as u8).collect();
-        let stats_denom=if self.config.stats_mode=="cumulative"{self.total_valid_frames as f64}else{display_denom};
+        let stats_denom=if self.config.stats_mode=="cumulative"{self.density_valid_frames as f64}else{display_denom};
         let limit_bytes=(self.config.max_density_history_mb*1024.0*1024.0) as usize;
         let capacity_frames=limit_bytes/self.config.fft_size;
         let requested_seconds=if self.config.persistence_unit=="frames"{
@@ -466,7 +476,7 @@ impl Analyzer {
             "density":{"width":count,"height":levels,"data_b64":B64.encode(density_bytes),
                 "min_db":self.config.density_min_db,"max_db":self.config.density_max_db,"metric":self.config.density_metric,
                 "stats_mode":self.config.stats_mode,"normalization":"relative square-root color; all valid weighted analysis FFTs",
-                "valid_frames":self.total_valid_frames,"effective_frames":stats_denom,"display_effective_frames":display_denom,
+                "valid_frames":self.density_valid_frames,"effective_frames":stats_denom,"display_effective_frames":display_denom,
                 "maximum_value":stats_max,"weighted_hits":self.config.stats_mode=="persistence" && self.config.persistence_mode=="exponential",
                 "window_truncated":self.window_truncated,"window_frames_retained":self.window_entries.len(),
                 "window_history_bytes":self.window_bytes,"window_seconds_retained":retained_seconds,
@@ -677,8 +687,60 @@ mod tests {
         let cfg=Config{sample_rate:64000.0,fft_size:1024,persistence_mode:"window".into(),persistence_unit:"frames".into(),persistence_frames:3,..Config::default()};
         let mut a=Analyzer::new(cfg);a.process(&tone(20000,64000.0,4000.0,0.25),0);assert_eq!(a.density_statistics().1,3.0);
         let mut cfg=a.config.clone();cfg.persistence_mode="off".into();a.update_config(cfg).unwrap();a.process(&tone(2048,64000.0,4000.0,0.25),20000);assert_eq!(a.density_statistics().1,1.0);
-        let mut cfg=a.config.clone();cfg.persistence_unit="time_constant".into();cfg.switch_policy="retain".into();assert_eq!(a.update_config(cfg).unwrap()["history_cleared"],true);assert_eq!(a.total_valid_frames,0);
+        let frames=a.total_valid_frames;
+        let mut cfg=a.config.clone();cfg.persistence_unit="time_constant".into();cfg.switch_policy="retain".into();assert_eq!(a.update_config(cfg).unwrap()["history_cleared"],true);
+        assert_eq!(a.density_valid_frames,0);assert_eq!(a.total_valid_frames,frames);
         assert_eq!(fft_size_for_rbw(2048000.0,750.0,"hann"),4096);
+    }
+    #[test]
+    fn density_grid_clear_preserves_traces_waterfall_fft_tail_and_stream_counters(){
+        let cfg=Config{sample_rate:64000.0,fft_size:1024,stats_mode:"cumulative".into(),persistence_mode:"infinite".into(),..Config::default()};
+        let mut a=Analyzer::new(cfg);a.process(&tone(4096,64000.0,4000.0,0.8),0);a.process(&tone(4096,64000.0,4000.0,0.2),4096);
+        a.note_gap(37);let mut partial=tone(3000,64000.0,4000.0,0.2);partial[0]=Complex32::new(f32::NAN,0.0);a.process(&partial,8229);
+        let before=a.snapshot(64000.0,0.0,128);let measured=a.measurements(-16000.0,16000.0,0.0,99.0,6);
+        let tail=a.tail.clone();let timing=(a.tail_start,a.expected_next,a.last_frame_time);
+        let counters=(a.total_valid_frames,a.invalid_frames,a.gap_samples);let avg_weight=a.avg_weight;
+        let arrays=(a.last_psd.clone(),a.max_psd.clone(),a.min_psd.clone(),a.avg_acc.clone());
+        let mut changed=a.config.clone();changed.density_min_db=-85.0;changed.density_max_db=-5.0;changed.density_levels=17;
+        let outcome=a.update_config(changed).unwrap();assert_eq!(outcome["history_scope"],"density");assert_eq!(outcome["reason"],"density_grid_changed");
+        assert_eq!((a.total_valid_frames,a.invalid_frames,a.gap_samples),counters);assert_eq!(a.density_valid_frames,0);
+        assert_eq!(a.tail,tail);assert_eq!((a.tail_start,a.expected_next,a.last_frame_time),timing);assert_eq!(a.avg_weight,avg_weight);
+        assert_eq!((a.last_psd.clone(),a.max_psd.clone(),a.min_psd.clone(),a.avg_acc.clone()),arrays);
+        assert_eq!(a.measurements(-16000.0,16000.0,0.0,99.0,6),measured);
+        let after=a.snapshot(64000.0,0.0,128);for key in ["spectrum","waterfall","valid_frames","invalid_frames","gap_samples"]{assert_eq!(after[key],before[key],"{key}");}
+        for len in [a.cumulative.len(),a.exponential.len(),a.window_hist.len()]{assert_eq!(len,1024*17);}
+        assert!(a.cumulative.iter().all(|v|*v==0));assert!(a.exponential.iter().all(|v|*v==0.0));assert!(a.window_hist.iter().all(|v|*v==0));
+        assert!(a.window_entries.is_empty()&&a.last_levels.is_none());assert_eq!(after["density"]["valid_frames"],0);
+        // Complete exactly one FFT from the retained tail. The first density
+        // epoch frame has a 100% hit rate, not a denominator from before clear.
+        let rotation=Complex32::from_polar(1.0,(TAU*4000.0*3000.0/64000.0).rem_euclid(TAU)as f32);
+        let continued:Vec<_>=tone(72,64000.0,4000.0,0.2).into_iter().map(|v|v*rotation).collect();
+        assert_eq!(a.process(&continued,11229).frames_processed,1);assert_eq!(a.total_valid_frames,counters.0+1);assert_eq!(a.density_valid_frames,1);
+        let (hist,denom)=a.density_statistics();assert_eq!(denom,1.0);for col in hist.chunks(17){assert_eq!(col.iter().sum::<f64>(),1.0);}
+        assert_eq!(a.snapshot(64000.0,0.0,128)["density"]["maximum_value"],1.0);
+        let current=a.snapshot(64000.0,0.0,128);let outcome=a.update_config(a.config.clone()).unwrap();assert_eq!(outcome["history_cleared"],false);
+        assert_eq!(a.snapshot(64000.0,0.0,128),current);
+    }
+    #[test]
+    fn density_range_rejects_nonfinite_reversed_and_overflow_width_without_mutation(){
+        let mut a=Analyzer::new(Config{sample_rate:64000.0,fft_size:1024,..Config::default()});a.process(&tone(2048,64000.0,4000.0,0.25),0);
+        let before=a.snapshot(64000.0,0.0,64);let config=serde_json::to_value(&a.config).unwrap();
+        for(low,high)in [(0.0,0.0),(1.0,-1.0),(f64::NEG_INFINITY,0.0),(-140.0,f64::INFINITY),(f64::NAN,0.0),(-1e308,1e308)]{
+            let mut changed=a.config.clone();changed.density_min_db=low;changed.density_max_db=high;assert!(a.update_config(changed).is_err());
+            assert_eq!(a.snapshot(64000.0,0.0,64),before);assert_eq!(serde_json::to_value(&a.config).unwrap(),config);
+        }
+        // A very wide but finite interval remains valid. Divide before
+        // multiplying by the number of levels to avoid intermediate overflow.
+        let mut changed=a.config.clone();changed.density_min_db=-1e307;changed.density_max_db=1e307;a.update_config(changed).unwrap();
+        a.process(&tone(1024,64000.0,4000.0,0.25),2048);assert!(a.last_levels.as_ref().unwrap().iter().all(|level|*level==64));
+    }
+    #[test]
+    fn density_edit_before_first_fft_keeps_tail_but_simultaneous_fft_edit_resets_all(){
+        let mut a=Analyzer::new(Config{sample_rate:64000.0,fft_size:1024,..Config::default()});let input=tone(1024,64000.0,4000.0,0.25);
+        a.process(&input[..512],0);let mut changed=a.config.clone();changed.density_min_db=-100.0;a.update_config(changed).unwrap();
+        assert_eq!(a.process(&input[512..],512).frames_processed,1);assert_eq!(a.total_valid_frames,1);assert_eq!(a.density_valid_frames,1);
+        let mut changed=a.config.clone();changed.density_max_db=-10.0;changed.window="blackman".into();let outcome=a.update_config(changed).unwrap();
+        assert_eq!(outcome["history_scope"],"analysis");assert_eq!(a.total_valid_frames,0);assert_eq!(a.density_valid_frames,0);assert!(a.tail.is_empty());
     }
     #[test]
     fn trace_reset_restarts_from_live_without_erasing_other_analysis_history(){
