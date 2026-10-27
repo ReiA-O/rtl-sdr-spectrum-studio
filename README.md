@@ -2,7 +2,7 @@
 
 RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観測を行うWindows向け開発版です。Rust本体がローカルHTTPサーバーを動かし、exeに内蔵した画面を通常のブラウザーへ表示します。Pythonは数値比較・単体テスト用の参照実装で、アプリの実行には使いません。
 
-配布対象の最新デモ同梱ZIPは **`RTL-SDR-Spectrum-Studio-0.4.0-dev-demo-windows-x64-20261027-210450-328.zip`**（11,296,451 bytes、SHA256 `d04cde25fc4e250837dd80ff4a5d5c19838f40261dd5906428aba0ec967892de`）です。本体exeはv0.4.0と同一で、IQデモ・専用プリセット・案内を加えた配布構成です。[Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases) の`v0.4.0-demo`をprivateの下書きとして用意する運用で、公開化はしていません。GitHubへのこのZIPのアップロードは別途確認します。
+配布対象の最新デモ同梱ZIPは **`RTL-SDR-Spectrum-Studio-0.4.0-dev-demo-windows-x64-20261027-210450-328.zip`**（11,296,451 bytes、SHA256 `d04cde25fc4e250837dd80ff4a5d5c19838f40261dd5906428aba0ec967892de`）です。本体exeはv0.4.0と同一で、IQデモ・専用プリセット・案内を加えた配布構成です。[Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases) の`v0.4.0-demo`へprivateの下書きとして保存済みで、GitHub asset digestも上記SHA256と一致しています。公開化はしていません。
 
 v0.4.0は、帯域を決めてピークを選び、VFOで復調し、対象局を含む原IQを保存する導線を中心にしています。受信用の中心DC補正を既定ONで追加しました。最終配布物で設定境界・API・50Ω終端の受信・DEMOの画面操作を確認しました。条件と未検証部分は [VALIDATION.md](docs/VALIDATION.md) に記載しています。
 

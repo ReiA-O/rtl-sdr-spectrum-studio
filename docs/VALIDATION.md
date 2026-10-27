@@ -13,7 +13,7 @@ AFG3102の32 MHz FM（偏移±75 kHz、1 kHz試験音）をStudioで収録し、
 | 受信機相当が利用できない状態 | 起動→プリセット→保存データ→REPLAY、シーク／EOF／復調音の経路 | 最終ZIPの受信DLLを無効化した模擬状態で14項目成功。1 kHz WAVとspeaker用PCM transportを含むが、実際のスピーカー聴取・物理USB抜去・清浄な別PCの試験ではない |
 | 実GUI | プリセット、dialogを閉じる、IQ一覧、再生、4パネル、EOF／先頭、元設定復帰 | 先行デモ候補205550の実IABで9項目成功、console error/warn0。最終版の差は案内の×操作追記だけで、exe／IQ／metadata／presetの4点は同一hash |
 
-最終配布ZIPは`RTL-SDR-Spectrum-Studio-0.4.0-dev-demo-windows-x64-20261027-210450-328.zip`、11,296,451 bytes、SHA256 `d04cde25fc4e250837dd80ff4a5d5c19838f40261dd5906428aba0ec967892de`です。privateの下書き配布を準備する対象で、公開化やGitHubへのこのZIPのアップロード成功は別に確認します。
+最終配布ZIPは`RTL-SDR-Spectrum-Studio-0.4.0-dev-demo-windows-x64-20261027-210450-328.zip`、11,296,451 bytes、SHA256 `d04cde25fc4e250837dd80ff4a5d5c19838f40261dd5906428aba0ec967892de`です。privateの下書きReleaseへ保存済みで、GitHub asset digest・sizeもローカルZIPと一致しています。公開化はしていません。
 
 原IQ SHA256は`98eeac276c5b39c0954a6b58cf032a6e2e2e3dae75b4cdcc7e18139f1d97483a`です。収録音の簡易tone比は53.50 dBでした。この指標は校正SNR／SINADや普遍的な受信性能ではなく、特定の試験音・接続・受信条件の数値確認です。受信機不使用の再生試験を、清浄な別PC・実際の聴感・屋外受信の確認へ拡張しません。
 
