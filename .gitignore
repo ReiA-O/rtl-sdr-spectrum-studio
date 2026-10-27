@@ -14,6 +14,7 @@
 /tools/portable-support/cargo-metadata*.json
 /tools/portable-support/licenses/*.docx
 /tests/ui-static-boundaries.json
+/tests/ui-reception-boundaries.json
 
 # Python / editor / OS products
 __pycache__/

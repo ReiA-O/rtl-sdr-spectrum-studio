@@ -8,11 +8,15 @@ RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観
 
 - Spectrum・密度表示・Waterfall・複数VFOを同時表示。共通FFTから全有効フレームを集計します。
 - AM/NFM/WFMモノラル復調、選択VFOだけのスピーカー出力、VFO別WAV録音。
+- VFOごとの任意AFC（初期OFF）、RFスケルチ、音声ゲイン・sampleピーク保護・既知不連続のクリック抑制。AFCは手動でOFFへ戻せ、名目局周波数と受信中心を保持します。
+- WAVは復調音（後処理なし、既定）／聴取処理後を選択。AFC・同調フィルターは両方へ反映し、原IQや未補正PSDは変更しません。
 - 中心周波数・Span・RBW/FFT・Ref Level・Rangeの調整、TraceとPersistence、測定用プリセット。
 - Spectrumの「ピークリセット」でMax／Min／Averageを同時にリセットし、受信や録音を続けたまま現在のLiveから再集計。
 - Densityの上限・下限を手動設定。Spectrumの表示範囲から独立し、密度履歴だけを新範囲で再集計。
 - 自動ピークマーカーとユーザーマーカー、Channel Power、測定帯域内のOBW。
 - 生IQの手動保存、レベルトリガ、秒単位のプリ／ポストトリガ、保存IQの再生。
+
+VFOの「受信・音声補助」を開き、AFC等を変更して「補助に適用」を押します。AFCのチェックを外して再適用すると、補正量を0へ戻して名目周波数で受信します。測定用PSDと原IQはこの操作で変わりません。
 
 詳しい動作と制約は [SPEC.md](docs/SPEC.md) にあります。密度表示はソフトウェアのFFT集計であり、専用測定器の捕捉率・測定精度と同等という意味ではありません。
 
@@ -47,11 +51,12 @@ native\target\release\rtl-spectrum-studio.exe --self-check --project-dir .
 ```powershell
 cargo test --manifest-path native\Cargo.toml --all-targets
 node tests\ui-static-boundaries.cjs
+node tests\ui-reception-boundaries.cjs
 # Python参照テストを使う場合だけNumPyが必要
 python -m unittest discover -s tests -v
 ```
 
-JavaScriptテストはブラウザー・ネットワーク・実機を使わない29項目の状態遷移テストです。Rustはlibrary59＋main4＝63項目。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。
+JavaScriptテストはブラウザー・ネットワーク・実機を使わない既存29項目と受信・音声補助20項目の状態遷移テストです。Rustはlibrary78＋main4＝82項目の全対象実行と、その後追加した保存先失敗1項目の個別実行に成功しています。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。
 
 ## 構成
 

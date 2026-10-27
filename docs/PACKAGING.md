@@ -43,7 +43,7 @@ $prepared = .\tools\prepare-packaging.ps1 | ConvertFrom-Json
 ```powershell
 $binary = 'native\target-portable\release\rtl-spectrum-studio.exe'
 $hash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
-.\tools\package-studio.ps1 -BinaryPath $binary -ExpectedBinarySha256 $hash -PackageVersion 0.2.0-dev -CargoMetadataPath $prepared.cargo_metadata_path
+.\tools\package-studio.ps1 -BinaryPath $binary -ExpectedBinarySha256 $hash -PackageVersion 0.3.0-dev -CargoMetadataPath $prepared.cargo_metadata_path
 ```
 
 Microsoftランタイムはインストール済みの正規`VC/Redist/MSVC/.../x64/Microsoft.VC*.CRT/vcruntime140.dll`から取得します。自動検出先と異なる場合は`-RuntimeDllPath`で明示します。Rust標準ライブラリーの通知を別の場所へ導入した場合は`-RustCopyrightPath`を指定できます。System32からDLLを抜き出さないでください。

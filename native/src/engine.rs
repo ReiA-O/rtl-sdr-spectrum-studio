@@ -3,6 +3,7 @@
 use crate::calibration::{self,Calibration};
 use crate::dsp::{self, Analyzer, Config, VfoDemodulator};
 use crate::recording::{IQRecorder, PreTriggerBuffer, WavRecorder};
+use crate::reception::{AudioProcessor, ReceptionConfig};
 use crate::trigger::TriggerController;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
@@ -45,14 +46,18 @@ struct Vfo {
     id:u64,frequency_hz:f64,bandwidth_hz:f64,mode:String,enabled:bool,
     stopped_reason:Option<String>,wav_format:String,demod:Option<VfoDemodulator>,
     wav:Option<WavRecorder>,audio_level:f64,sample_count:u64,
+    reception:ReceptionConfig,audio_processor:AudioProcessor,reception_status:Value,
 }
 impl Vfo {
     fn config(&self)->Value{json!({"id":self.id,"frequency_hz":self.frequency_hz,"bandwidth_hz":self.bandwidth_hz,
-        "mode":self.mode,"enabled":self.enabled,"stopped_reason":self.stopped_reason,"wav_format":self.wav_format})}
-    fn state(&self,selected:u64)->Value{
+        "mode":self.mode,"enabled":self.enabled,"stopped_reason":self.stopped_reason,"wav_format":self.wav_format,"reception":self.reception})}
+    fn state(&self,selected:u64,running:bool)->Value{
         let mut value=self.config();value["selected"]=json!(self.id==selected);
         value["wav_recording"]=json!(self.wav.as_ref().is_some_and(|r|r.active));
-        value["audio_level"]=json!(self.audio_level);value["sample_count"]=json!(self.sample_count);value
+        value["audio_level"]=json!(self.audio_level);value["sample_count"]=json!(self.sample_count);
+        value["reception_status"]=self.reception_status.clone();
+        if !running||!self.enabled{value["reception_status"]["available"]=json!(false);value["reception_status"]["reason"]=json!(if !running{"stopped"}else{"vfo_disabled"});}
+        value["wav_summary"]=self.wav.as_ref().map(WavRecorder::summary).unwrap_or(Value::Null);value
     }
 }
 
@@ -84,6 +89,7 @@ pub struct Engine {
     notification_id:u64,
     audio_chunks:VecDeque<(u64,Vec<u8>)>,
     audio_sequence:u64,
+    audio_epoch:u64,
     frozen_markers:Vec<f64>,
     had_blocks:bool,
     trigger_last_frame:Option<u64>,
@@ -111,7 +117,7 @@ impl Engine {
             trigger:TriggerController::new(2_048_000.0,Self::trigger_controller_config(&trigger_config))?,trigger_config,
             prebuffer:PreTriggerBuffer::new(2_048_000.0,PRE_BYTES)?,iq:None,iq_triggered:false,iq_start_sample:None,iq_last:Value::Null,
             vfos:vec![],selected:1,next_vfo:2,layout:json!({"spectrum_ratio":0.6,"vfo_width":340,"bottom_ratio":0.5}),
-            notifications:VecDeque::new(),notification_id:0,audio_chunks:VecDeque::new(),audio_sequence:0,
+            notifications:VecDeque::new(),notification_id:0,audio_chunks:VecDeque::new(),audio_sequence:0,audio_epoch:0,
             frozen_markers:vec![],had_blocks:false,trigger_last_frame:None,pending_input_change:false,
             overload_streak:0,overload_notice:false,source_metadata:json!({}),calibration:None,requested_level_unit:"relative".into()};
         engine.vfos.push(engine.make_vfo(&json!({"id":1,"frequency_hz":32_000_000.0,"bandwidth_hz":200_000.0,"mode":"WFM","enabled":true,"wav_format":"PCM16"}),1)?);
@@ -159,18 +165,25 @@ impl Engine {
     fn in_band(input:&Value,frequency:f64,width:f64)->bool{
         frequency.is_finite()&&width.is_finite()&&width>0.0&&(frequency-num(input,"center_hz",0.0)).abs()+width/2.0<=Self::usable_for(input)/2.0
     }
+    fn afc_reference_in_band(offset:f64,bandwidth:f64,usable:f64)->bool{
+        offset.is_finite()&&bandwidth.is_finite()&&usable.is_finite()&&bandwidth>0.0&&offset.abs()+bandwidth<=usable/2.0
+    }
     fn make_vfo(&self,value:&Value,fallback:u64)->Result<Vfo,String>{
         let id=value.get("id").and_then(identifier).unwrap_or(fallback);
         let frequency=num(value,"frequency_hz",self.center());let bandwidth=num(value,"bandwidth_hz",200_000.0);
         let mode=text(value,"mode","WFM").to_uppercase();let enabled=boolean(value,"enabled",true);
         let format=text(value,"wav_format","PCM16").to_uppercase();
+        let reception=match value.get("reception"){None=>ReceptionConfig::default(),Some(value)=>serde_json::from_value::<ReceptionConfig>(value.clone()).map_err(|e|format!("受信補助設定が不正です：{e}"))?};
+        reception.validate()?;
         if !["AM","NFM","WFM"].contains(&mode.as_str()){return Err("復調方式はAM/NFM/WFMです".into());}
         if !["PCM16","PCM24"].contains(&format.as_str()){return Err("WAV形式はPCM16/PCM24です".into());}
         if !frequency.is_finite()||!bandwidth.is_finite()||bandwidth<=0.0||bandwidth>=self.fs(){return Err("VFOの周波数・帯域幅が不正です".into());}
         if enabled&&!Self::in_band(&self.input,frequency,bandwidth){return Err("復調フィルター全幅が有効受信帯域内に入る必要があります".into());}
-        let demod=if enabled{Some(VfoDemodulator::try_new(self.fs(),frequency-self.center(),bandwidth,&mode,AUDIO_RATE)?)}else{None};
+        let mut demod=if enabled{Some(VfoDemodulator::try_new(self.fs(),frequency-self.center(),bandwidth,&mode,AUDIO_RATE)?)}else{None};
+        if let Some(demod)=demod.as_mut(){demod.set_afc(reception.afc_enabled,reception.afc_max_hz)?;}
+        let audio_processor=AudioProcessor::try_new(reception.clone(),AUDIO_RATE)?;
         Ok(Vfo{id,frequency_hz:frequency,bandwidth_hz:bandwidth,mode,enabled,stopped_reason:value.get("stopped_reason").and_then(Value::as_str).map(str::to_owned),
-            wav_format:format,demod,wav:None,audio_level:-300.0,sample_count:0})
+            wav_format:format,demod,wav:None,audio_level:-300.0,sample_count:0,reception,audio_processor,reception_status:json!({"available":false,"reason":"not_started"})})
     }
     fn vfo_index(&self,id:&Value)->Result<usize,ActionError>{let id=identifier(id).ok_or("VFO IDが不正です")?;self.vfos.iter().position(|v|v.id==id).ok_or_else(||ActionError::bad("VFOが見つかりません"))}
     fn user_marker_index(&self,id:&Value)->Result<usize,ActionError>{
@@ -249,6 +262,8 @@ impl Engine {
     fn vfo_conditions(&self,index:usize)->Value{let v=&self.vfos[index];let gain=dsp::demod_audio_scale(&v.mode);
         let normalization=if v.mode=="AM"{"carrier-normalized envelope deviation"}else if v.mode=="WFM"{"phase discriminator divided by 75000 Hz; 50 us de-emphasis"}else{"phase discriminator divided by min(5000 Hz, bandwidth*0.2)"};
         json!({"frequency_hz":v.frequency_hz,"bandwidth_hz":v.bandwidth_hz,"mode":v.mode,"audio_gain":gain,"audio_gain_db":20.0*gain.log10(),"normalization":normalization,
+        "reception":v.reception,"wav_audio":v.reception.wav_audio,
+        "audio_routing":if v.reception.wav_audio=="processed"{"AFC/filter/demod then RF squelch, user audio gain, limiter and click suppression"}else{"AFC/filter/demod; excludes RF squelch, user audio gain, limiter and click suppression"},
         "input":self.input,"source":self.source,"input_metadata":self.source_metadata,"source_sample":self.last_sample})}
     fn reset_dsp(&mut self)->Result<(),String>{
         let mut config=self.analyzer.config.clone();config.sample_rate=self.fs();
@@ -259,9 +274,11 @@ impl Engine {
         for vfo in &mut self.vfos{
             if vfo.enabled&&(vfo.frequency_hz-center).abs()+vfo.bandwidth_hz/2.0>usable/2.0{vfo.enabled=false;vfo.stopped_reason=Some("現在の有効受信帯域外です。中心周波数を戻して手動で再開できます。".into());}
             vfo.demod=if vfo.enabled{Some(VfoDemodulator::try_new(fs,vfo.frequency_hz-center,vfo.bandwidth_hz,&vfo.mode,AUDIO_RATE)?)}else{None};
+            if let Some(demod)=vfo.demod.as_mut(){demod.set_afc(vfo.reception.afc_enabled,vfo.reception.afc_max_hz)?;}
+            vfo.audio_processor.note_gap();vfo.reception_status=json!({"available":false,"reason":"source_reset"});
             vfo.audio_level=-300.0;vfo.sample_count=0;
         }
-        self.audio_chunks.clear();self.frozen_markers.clear();self.trigger_last_frame=None;self.had_blocks=false;
+        self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();self.frozen_markers.clear();self.trigger_last_frame=None;self.had_blocks=false;
         self.last_sample=0;self.overload_streak=0;self.overload_notice=false;
         self.performance=json!({"processing_ms":0.0,"load_percent":0.0,"instant_load_percent":0.0,
             "gap_samples":0,"dropped_samples":0,"valid_frames":0,"input_samples":0});Ok(())
@@ -285,7 +302,8 @@ impl Engine {
         self.pending_input_change=false;self.running=true;self.overload_streak=0;self.overload_notice=false;Ok(())
     }
     pub fn on_stop(&mut self,reason:&str){
-        self.running=false;self.audio_chunks.clear();self.trigger.disarm();
+        self.running=false;self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();self.trigger.disarm();
+        for v in &mut self.vfos{v.audio_processor.note_gap();if let Some(d)=v.demod.as_mut(){d.reset();}v.reception_status=json!({"available":false,"reason":"stopped"});}
         if let Some(writer)=self.iq.as_mut().filter(|r|r.active){self.iq_last=writer.stop(reason);}
         self.iq_triggered=false;self.iq_start_sample=None;
         if reason=="input_change"{self.pending_input_change=true;}
@@ -312,8 +330,8 @@ impl Engine {
         let mut measurement=self.measurement.clone();if let Ok((low,high))=self.linked_band(&measurement){measurement["low_hz"]=json!(low);measurement["high_hz"]=json!(high);}
         if let Ok((low,high))=self.linked_band(&trigger){trigger["low_hz"]=json!(low);trigger["high_hz"]=json!(high);}
         let elapsed=self.iq.as_ref().filter(|r|r.active).map(|r|r.duration_seconds());
-        json!({"version":"0.1.0","running":self.running,"source":self.source,"input":input,"analysis":analysis,"display":display,
-            "measurement":measurement,"trigger":trigger,"selected_vfo_id":self.selected,"vfos":self.vfos.iter().map(|v|v.state(self.selected)).collect::<Vec<_>>(),
+        json!({"version":"0.1.0","running":self.running,"source":self.source,"input":input,"analysis":analysis,"display":display,"audio_epoch":self.audio_epoch,
+            "measurement":measurement,"trigger":trigger,"selected_vfo_id":self.selected,"vfos":self.vfos.iter().map(|v|v.state(self.selected,self.running)).collect::<Vec<_>>(),
             "recording":{"iq_active":self.iq_active(),"iq_triggered":self.iq_triggered,"elapsed_seconds":elapsed,"last_iq":self.iq_last},
             "locks":{"input":self.input_locked(),"center_sample_rate":self.input_locked()||self.wav_active(),"reason":if self.input_locked(){"IQ待機・保存中"}else if self.wav_active(){"WAV録音中は中心周波数・サンプルレートをロック"}else{""}},
             "device":self.device,"performance":self.performance,"replay":self.replay,"layout":self.layout,"notifications":self.notifications,
@@ -324,7 +342,7 @@ impl Engine {
         let mut data=vec![];let mut sequence=after.min(self.audio_sequence);
         let oldest=if after==0{self.audio_sequence.saturating_sub(5)}else{after};
         for(seq,chunk)in &self.audio_chunks{if *seq>oldest{data.extend_from_slice(chunk);sequence=*seq;if data.len()>=AUDIO_RATE as usize{break;}}}
-        json!({"sequence":sequence,"sample_rate":AUDIO_RATE,"vfo_id":self.selected,"format":"PCM16LE","data_b64":B64.encode(data)})
+        json!({"sequence":sequence,"epoch":self.audio_epoch,"sample_rate":AUDIO_RATE,"vfo_id":self.selected,"format":"PCM16LE","data_b64":B64.encode(data)})
     }
     pub fn frame(&mut self)->Value{
         let mut frame=self.analyzer.snapshot(num(&self.display,"span_hz",self.usable()),self.center(),768);
@@ -384,7 +402,9 @@ impl Engine {
         let gap=if self.had_blocks{start.saturating_sub(self.last_sample)}else{0};
         if self.had_blocks&&start<self.last_sample{return Err("入力サンプルの順序が逆転しました".into());}
         if gap>0{
-            self.audio_chunks.clear();for v in &mut self.vfos{if let Some(d)=v.demod.as_mut(){d.reset();}}
+            self.audio_epoch=self.audio_epoch.saturating_add(1);
+            self.audio_chunks.clear();for v in &mut self.vfos{if let Some(d)=v.demod.as_mut(){d.reset();}v.audio_processor.note_gap();v.reception_status=json!({"available":false,"reason":"gap"});
+                if let Some(writer)=v.wav.as_mut().filter(|w|w.active){writer.observe_processing(&json!({"gap_count":1,"source_complex_samples":0}));}}
             self.notify(&format!("入力欠落を検出：{gap} samples。時間軸とIQメタデータへ記録します。"),"warning");
         }
         self.prebuffer.append(start,raw)?;
@@ -427,12 +447,40 @@ impl Engine {
         }
         if self.iq_active(){let limit=if self.iq_triggered{self.trigger.end_sample.unwrap_or(end).min(end)}else{end};self.write_iq_until(raw,start,limit);}
         let mut audio_selected=None;let mut issues=vec![];
+        let center=self.center();let usable=self.usable();
+        let rail_components=raw.iter().filter(|v|**v==0||**v==255).count()as u64;
         for v in &mut self.vfos{
             if !v.enabled{continue;}
-            let Some(demod)=v.demod.as_mut()else{continue;};let audio=demod.process(&iq);
-            v.sample_count+=audio.len()as u64;v.audio_level=db(audio.iter().map(|a|(*a as f64).powi(2)).sum::<f64>()/audio.len().max(1)as f64);
-            if let Some(writer)=v.wav.as_mut().filter(|r|r.active){if let Err(error)=writer.write(&audio){issues.push(format!("VFO {}のWAV保存を停止：{error}",v.id));}else if writer.limit_reached{issues.push(format!("VFO {}のWAVがRIFF容量上限に達しました。",v.id));}}
-            if v.id==self.selected{audio_selected=Some(audio);}
+            // AFC compares noise sidebands out to +/- one full bandwidth.
+            // Both references must fit the provisional usable acquisition
+            // band, not merely Nyquist, or edge rolloff can inflate quality.
+            let reference_in_band=Self::afc_reference_in_band(v.frequency_hz-center,v.bandwidth_hz,usable);
+            let quality=if reference_in_band{self.analyzer.afc_quality(v.frequency_hz-center,v.bandwidth_hz)}else{None};
+            let margin=(usable/2.0-(v.frequency_hz-center).abs()-v.bandwidth_hz/2.0).max(0.0);
+            let Some(demod)=v.demod.as_mut()else{continue;};
+            let block=demod.process_with_metrics(&iq,quality,margin);
+            let before=v.audio_processor.status();let processed=v.audio_processor.process(&block.audio,block.rf_dbfs);
+            let mut status=v.audio_processor.status();merge(&mut status,&demod.afc_status());
+            status["afc_quality_reason"]=json!(if !v.reception.afc_enabled{"disabled"}else if !reference_in_band{"noise_reference_outside_usable_band"}else if quality.is_none(){"quality_unavailable"}else{"reference_in_usable_band"});
+            if v.reception.afc_enabled&&!reference_in_band{status["afc_status"]=json!("reference_outside_usable_band");}
+            status["available"]=json!(!block.audio.is_empty());status["reason"]=json!(if block.audio.is_empty(){"awaiting_audio"}else{"current"});
+            status["updated_sample"]=json!(end);status["wav_audio"]=json!(v.reception.wav_audio);
+            status["demod_level_dbfs"]=json!(db(block.audio.iter().map(|a|(*a as f64).powi(2)).sum::<f64>()/block.audio.len().max(1)as f64));
+            v.sample_count+=block.audio.len()as u64;v.audio_level=db(processed.iter().map(|a|(*a as f64).powi(2)).sum::<f64>()/processed.len().max(1)as f64);
+            status["processed_level_dbfs"]=json!(v.audio_level);
+            let mut observation=json!({"observed_blocks":1,"source_complex_samples":samples,"observed_audio_samples":block.audio.len(),
+                "raw_adc_rail_components":rail_components,"demod_overrange_samples":block.audio.iter().filter(|a|a.is_finite()&&a.abs()>1.0).count(),
+                "rf_dbfs":if block.rf_dbfs.is_finite(){Some(block.rf_dbfs)}else{None},"afc_offset_hz":block.afc_offset_hz});
+            for key in ["pre_overload_samples","limited_samples","muted_samples","invalid_samples","boundary_repairs"]{
+                observation[key]=json!(status[key].as_u64().unwrap_or(0).saturating_sub(before[key].as_u64().unwrap_or(0)));
+            }
+            v.reception_status=status;
+            if let Some(writer)=v.wav.as_mut().filter(|r|r.active){
+                writer.observe_processing(&observation);
+                let audio=if v.reception.wav_audio=="processed"{&processed}else{&block.audio};
+                if let Err(error)=writer.write(audio){issues.push(format!("VFO {}のWAV保存を停止：{error}",v.id));}else if writer.limit_reached{issues.push(format!("VFO {}のWAVがRIFF容量上限に達しました。",v.id));}
+            }
+            if v.id==self.selected{audio_selected=Some(processed);}
         }
         for issue in issues{self.notify(&issue,"warning");}
         if let Some(audio)=audio_selected{
@@ -449,7 +497,7 @@ impl Engine {
             let candidate=self.vfos.iter().enumerate().filter(|(_,v)|v.enabled&&v.id!=self.selected)
                 .min_by_key(|(_,v)|(v.wav.as_ref().is_some_and(|w|w.active),v.id)).map(|(i,_)|i);
             if let Some(index)=candidate{let id=self.vfos[index].id;let v=&mut self.vfos[index];if let Some(writer)=v.wav.as_mut().filter(|w|w.active){writer.stop("overload");}
-                v.enabled=false;v.demod=None;v.stopped_reason=Some("過負荷のため自動停止。再開は手動です。".into());self.notify(&format!("選択VFOを優先し、VFO {id}を過負荷停止しました。"),"warning");}
+                v.enabled=false;v.demod=None;v.audio_processor.note_gap();v.reception_status=json!({"available":false,"reason":"overload"});v.stopped_reason=Some("過負荷のため自動停止。再開は手動です。".into());self.notify(&format!("選択VFOを優先し、VFO {id}を過負荷停止しました。"),"warning");}
             else if !self.overload_notice{self.notify("選択VFO単独でも処理時間が入力時間を超えています。FFT条件や復調帯域を調整してください。","warning");self.overload_notice=true;}
             self.overload_streak=0;
         }
@@ -710,43 +758,55 @@ impl Engine {
                 let mut config=if body["vfo"].is_object(){body["vfo"].clone()}else{json!({})};config["id"]=json!(self.next_vfo);
                 let vfo=self.make_vfo(&config,self.next_vfo)?;self.next_vfo+=1;if self.vfos.is_empty(){self.selected=vfo.id;}self.vfos.push(vfo);
             },
-            "select_vfo"=>{let index=self.vfo_index(&body["id"])?;self.selected=self.vfos[index].id;self.audio_chunks.clear();},
+            "select_vfo"=>{let index=self.vfo_index(&body["id"])?;let id=self.vfos[index].id;if self.selected!=id{self.selected=id;self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();}},
             "update_vfo"=>{
                 let index=self.vfo_index(&body["id"])?;let patch=body["patch"].as_object().ok_or("VFO設定が不正です")?;
-                if patch.keys().any(|k|!["frequency_hz","bandwidth_hz","mode","wav_format","enabled"].contains(&k.as_str())){return Err("未対応のVFO設定項目です".into());}
+                if patch.keys().any(|k|!["frequency_hz","bandwidth_hz","mode","wav_format","enabled","reception"].contains(&k.as_str())){return Err("未対応のVFO設定項目です".into());}
                 let original=self.vfos[index].config();let mut config=original.clone();merge(&mut config,&body["patch"]);
+                let reception:ReceptionConfig=serde_json::from_value(config["reception"].clone()).map_err(|e|format!("受信補助設定が不正です：{e}"))?;
+                reception.validate()?;config["reception"]=serde_json::to_value(&reception).map_err(|e|e.to_string())?;
                 if patch.keys().all(|key|same(&original[key.as_str()],&config[key.as_str()])){return Ok(());}
                 let conditions_changed=["frequency_hz","bandwidth_hz","mode"].iter().any(|k|!same(&original[*k],&config[*k]));
+                let reception_changed=self.vfos[index].reception!=reception;
                 if conditions_changed&&self.trigger.armed&&self.trigger_config["link_vfo"].as_u64()==Some(self.vfos[index].id){return Err(ActionError::locked("トリガが連動中のVFO条件は待機解除後に変更してください"));}
                 let mut replacement=self.make_vfo(&config,self.vfos[index].id)?;
-                if !conditions_changed&&original["enabled"]==config["enabled"]{replacement.demod=self.vfos[index].demod.take();replacement.audio_level=self.vfos[index].audio_level;replacement.sample_count=self.vfos[index].sample_count;}
-                let split=conditions_changed||original["wav_format"]!=config["wav_format"];
+                if !conditions_changed&&original["enabled"]==config["enabled"]{
+                    replacement.demod=self.vfos[index].demod.take();replacement.audio_level=self.vfos[index].audio_level;replacement.sample_count=self.vfos[index].sample_count;
+                    if let Some(demod)=replacement.demod.as_mut(){demod.set_afc(reception.afc_enabled,reception.afc_max_hz)?;}
+                    self.vfos[index].audio_processor.set_config(reception.clone())?;
+                    std::mem::swap(&mut replacement.audio_processor,&mut self.vfos[index].audio_processor);
+                    replacement.reception_status=if reception_changed{json!({"available":false,"reason":"conditions_changed"})}else{self.vfos[index].reception_status.clone()};
+                }
+                let split=conditions_changed||reception_changed||original["wav_format"]!=config["wav_format"];
                 let old_wav=self.vfos[index].wav.take();replacement.wav=old_wav;
                 self.vfos[index]=replacement;
                 if split&&self.vfos[index].wav.as_ref().is_some_and(|w|w.active){
+                    let next_segment=self.vfos[index].wav.as_ref().unwrap().segment_index.saturating_add(1);
                     if let Some(writer)=self.vfos[index].wav.as_mut(){writer.stop("conditions_changed");}
                     let mut writer=WavRecorder::new(self.recordings_dir(),&self.vfos[index].id.to_string(),AUDIO_RATE,&self.vfos[index].wav_format)?;
+                    writer.segment_index=next_segment;
                     match writer.start(self.vfo_conditions(index)){Ok(_)=>self.vfos[index].wav=Some(writer),Err(error)=>self.notify(&format!("VFO条件は変更しましたがWAV再開に失敗：{error}"),"error")}
                 }
-                if self.vfos[index].id==self.selected&&(conditions_changed||original["enabled"]!=config["enabled"]){self.audio_chunks.clear();}
+                if self.vfos[index].id==self.selected&&(conditions_changed||original["enabled"]!=config["enabled"]){self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();}
                 if !self.vfos[index].enabled{if let Some(writer)=self.vfos[index].wav.as_mut().filter(|w|w.active){writer.stop("vfo_disabled");}}
             },
             "delete_vfo"=>{
                 let index=self.vfo_index(&body["id"])?;let id=self.vfos[index].id;
                 if self.trigger.armed&&self.trigger_config["link_vfo"].as_u64()==Some(id){return Err(ActionError::locked("トリガ連動中のVFOは待機解除してから削除してください"));}
                 if let Some(writer)=self.vfos[index].wav.as_mut().filter(|w|w.active){writer.stop("vfo_deleted");}self.vfos.remove(index);
-                if self.selected==id{self.selected=self.vfos.first().map(|v|v.id).unwrap_or(0);self.audio_chunks.clear();}
+                if self.selected==id{self.selected=self.vfos.first().map(|v|v.id).unwrap_or(0);self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();}
                 if self.measurement["link_vfo"].as_u64()==Some(id){self.measurement["link_vfo"]=Value::Null;}
                 if self.trigger_config["link_vfo"].as_u64()==Some(id){self.trigger_config["link_vfo"]=Value::Null;}
             },
             "resume_vfo"=>{
                 let index=self.vfo_index(&body["id"])?;if self.vfos[index].enabled{return Ok(());}let mut config=self.vfos[index].config();config["enabled"]=json!(true);config["stopped_reason"]=Value::Null;
                 let mut replacement=self.make_vfo(&config,self.vfos[index].id)?;replacement.wav=self.vfos[index].wav.take();self.vfos[index]=replacement;
+                if self.selected==self.vfos[index].id{self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();}
                 self.notify("VFOを手動で再開しました。停止したWAV録音は自動再開しません。","info");
             },
             "stop_vfo"=>{
                 let index=self.vfo_index(&body["id"])?;if let Some(writer)=self.vfos[index].wav.as_mut().filter(|w|w.active){writer.stop("vfo_stopped");}
-                self.vfos[index].enabled=false;self.vfos[index].demod=None;self.vfos[index].stopped_reason=Some("手動停止".into());if self.vfos[index].id==self.selected{self.audio_chunks.clear();}
+                self.vfos[index].enabled=false;self.vfos[index].demod=None;self.vfos[index].audio_processor.note_gap();self.vfos[index].reception_status=json!({"available":false,"reason":"vfo_stopped"});self.vfos[index].stopped_reason=Some("手動停止".into());if self.vfos[index].id==self.selected{self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();}
             },
             "wav_start"=>{
                 if !self.running{return Err("受信・再生を開始してからWAV録音してください".into());}let index=self.vfo_index(&body["id"])?;
@@ -990,6 +1050,152 @@ mod tests{
         "frequency_low_hz":30000000.0,"frequency_high_hz":35000000.0,"sample_rate":2048000.0,"gain_db":20.7,
         "mode":"tuner","agc":false,"device_name":"Test SDR","expires_utc":"2099-01-01T00:00:00Z","reference_note":"Synthetic fixture; no physical calibration was performed"})}
     fn live_metadata()->Value{json!({"name":"Test SDR","sample_rate":2048000.0,"center_hz":32256000.0,"gain_db_actual":20.7,"agc":false,"mode_actual":"tuner"})}
+    fn reception_fm_iq(count:usize)->Vec<u8>{
+        let fs=2048000.0;let offset=-256000.0;let tone=1000.0;let deviation=60000.0;
+        (0..count).flat_map(|n|{let phase=std::f64::consts::TAU*offset*n as f64/fs
+            +deviation/tone*(1.0-(std::f64::consts::TAU*tone*n as f64/fs).cos());
+            [(127.5+50.0*phase.cos()).round()as u8,(127.5+50.0*phase.sin()).round()as u8]}).collect()
+    }
+    fn reception_cw_iq(start:usize,count:usize)->Vec<u8>{
+        (start..start+count).flat_map(|n|{let phase=std::f64::consts::TAU*(-255800.0)*n as f64/2048000.0;
+            [(127.5+50.0*phase.cos()).round()as u8,(127.5+50.0*phase.sin()).round()as u8]}).collect()
+    }
+    #[test]
+    fn reception_legacy_defaults_validation_atomicity_and_preset_roundtrip(){
+        let mut e=engine();let mut legacy=e.configuration();legacy["vfos"][0].as_object_mut().unwrap().remove("reception");
+        e.restore_configuration(&legacy).unwrap();assert_eq!(e.vfos[0].reception,ReceptionConfig::default());
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"afc_enabled":true,"audio_gain_db":12.0,"wav_audio":"processed"}}})).unwrap();
+        let config=e.configuration();let status=e.vfos[0].audio_processor.status();
+        for patch in [json!({"audio_gain_db":37}),json!({"audio_gain_db":null}),json!({"squelch_hang_ms":-1}),json!({"afc_max_hz":0}),
+            json!({"afc_enabled":"false"}),json!({"limiter_ceiling_dbfs":1}),json!({"wav_audio":"raw"}),json!({"unknown":1})]{
+            assert!(e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":patch}})).is_err());
+            assert_eq!(e.configuration(),config);assert_eq!(e.vfos[0].audio_processor.status(),status);
+        }
+        e.apply(&json!({"action":"preset_save","name":"reception-roundtrip"})).unwrap();
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"audio_gain_db":0,"wav_audio":"demod"}}})).unwrap();
+        e.apply(&json!({"action":"preset_load","name":"reception-roundtrip"})).unwrap();assert_eq!(e.configuration(),config);
+        assert!(!e.running&&!e.vfos[0].wav.as_ref().is_some_and(|r|r.active));
+        assert_eq!(e.state()["vfos"][0]["reception_status"]["available"],false);
+        assert!(!e.configuration().to_string().contains("reception_status"));
+        let path=e.project.clone();drop(e);let restored=Engine::new(path).unwrap();assert_eq!(restored.vfos[0].reception.audio_gain_db,12.0);assert!(!restored.running);
+    }
+    #[test]
+    fn independent_wav_routes_keep_demod_audio_while_selected_speaker_is_squelched(){
+        let mut e=engine();let reception=json!({"squelch_enabled":true,"squelch_dbfs":0.0,"squelch_hysteresis_db":0.0,"squelch_hang_ms":0,"click_suppression_enabled":false});
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":reception}})).unwrap();
+        let mut second=reception.clone();second["wav_audio"]=json!("processed");
+        e.apply(&json!({"action":"add_vfo","vfo":{"frequency_hz":32000000.0,"bandwidth_hz":200000.0,"mode":"WFM","reception":second}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();let input=e.input.clone();
+        for id in [1,2]{e.apply(&json!({"action":"wav_start","id":id})).unwrap();}e.apply(&json!({"action":"iq_start"})).unwrap();
+        let raw=reception_fm_iq(131072);e.process_block(0,&raw).unwrap();
+        let audio=e.audio(0);assert_eq!(audio["vfo_id"],1);assert!(B64.decode(audio["data_b64"].as_str().unwrap()).unwrap().iter().all(|v|*v==0));
+        let mut reference=Analyzer::new(e.analyzer.config.clone());let iq:Vec<_>=raw.chunks_exact(2).map(|p|Complex32::new((p[0]as f32-127.5)/127.5,(p[1]as f32-127.5)/127.5)).collect();reference.process(&iq,0);
+        assert_eq!(e.analyzer.last_psd,reference.last_psd);assert_eq!(e.input,input);
+        e.apply(&json!({"action":"iq_stop"})).unwrap();assert_eq!(fs::read(e.iq.as_ref().unwrap().data_path.as_ref().unwrap()).unwrap(),raw);
+        let paths:Vec<_>=e.vfos.iter().map(|v|v.wav.as_ref().unwrap().path.clone().unwrap()).collect();
+        for id in [1,2]{e.apply(&json!({"action":"wav_stop","id":id})).unwrap();}
+        let a:Vec<i16>=hound::WavReader::open(&paths[0]).unwrap().samples::<i16>().map(Result::unwrap).collect();
+        let b:Vec<i16>=hound::WavReader::open(&paths[1]).unwrap().samples::<i16>().map(Result::unwrap).collect();
+        assert!(!a.is_empty()&&a.iter().any(|v|*v!=0));assert_eq!(a.len(),b.len());assert!(b.iter().all(|v|*v==0));
+        assert_eq!(e.vfos[0].wav.as_ref().unwrap().summary()["route"],"demod");assert_eq!(e.vfos[1].wav.as_ref().unwrap().summary()["route"],"processed");
+        assert!(e.vfos[1].wav.as_ref().unwrap().processing_summary["muted_samples"].as_u64().unwrap()>0);
+    }
+    #[test]
+    fn reception_changes_split_wav_noops_and_display_resets_preserve_processing_state(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"audio_gain_db":6.0}}})).unwrap();
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.process_block(0,&reception_fm_iq(65536)).unwrap();
+        let old=e.vfos[0].wav.as_ref().unwrap().path.clone().unwrap();let old_meta=e.vfos[0].wav.as_ref().unwrap().meta_path.clone().unwrap();
+        let before=e.state();let processor=e.vfos[0].audio_processor.status();let afc=e.vfos[0].demod.as_ref().unwrap().afc_status();let epoch=e.audio_epoch;
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"audio_gain_db":6}}})).unwrap();assert_eq!(e.state(),before);
+        e.apply(&json!({"action":"trace_reset"})).unwrap();e.apply(&json!({"action":"set_analysis","analysis":{"density_min_db":-100.0,"density_max_db":-10.0}})).unwrap();
+        assert_eq!(e.vfos[0].audio_processor.status(),processor);assert_eq!(e.vfos[0].demod.as_ref().unwrap().afc_status(),afc);assert_eq!(e.audio_epoch,epoch);
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"audio_gain_db":12.0,"wav_audio":"processed"}}})).unwrap();
+        let writer=e.vfos[0].wav.as_ref().unwrap();assert!(writer.active);assert_ne!(writer.path.as_ref().unwrap(),&old);assert_eq!(writer.segment_index,1);
+        assert_eq!(writer.summary()["route"],"processed");assert_eq!(e.audio_epoch,epoch);assert_eq!(e.vfos[0].reception_status["available"],false);
+        let previous:Value=serde_json::from_slice(&fs::read(old_meta).unwrap()).unwrap();assert_eq!(previous["stop_reason"],"conditions_changed");
+        assert_eq!(previous["conditions"]["reception"]["audio_gain_db"],6.0);assert_eq!(previous["route"],"demod");assert!(previous["processing_summary"]["observed_audio_samples"].as_u64().unwrap()>0);
+        e.process_block(65536,&reception_fm_iq(32768)).unwrap();assert_eq!(e.vfos[0].wav.as_ref().unwrap().processing_summary["observed_blocks"],1);e.on_stop("test");
+    }
+    #[test]
+    fn wav_split_destination_failure_returns_applied_configuration_with_explicit_recording_error(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.process_block(0,&reception_fm_iq(32768)).unwrap();
+        let old=e.vfos[0].wav.as_ref().unwrap();let old_path=old.path.clone().unwrap();let old_meta=old.meta_path.clone().unwrap();let old_samples=old.samples_written;
+        // Keep the original writer and its absolute paths intact. Only the
+        // next destination is an isolated test-owned path blocked by a file.
+        let blocked=std::env::temp_dir().join(format!("spectrum-recording-failure-{}-{}",std::process::id(),Utc::now().timestamp_nanos_opt().unwrap()));
+        fs::create_dir_all(blocked.join("data")).unwrap();let target=blocked.join("data/recordings");
+        let mut file=OpenOptions::new().write(true).create_new(true).open(&target).unwrap();file.write_all(b"test destination blocker").unwrap();drop(file);e.project=blocked;
+        let response=e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"audio_gain_db":6.0,"wav_audio":"processed"}}})).unwrap();
+        assert_eq!(response["vfos"][0]["reception"]["audio_gain_db"],6.0);assert_eq!(response["vfos"][0]["reception"]["wav_audio"],"processed");
+        assert_eq!(response["vfos"][0]["wav_recording"],false);assert!(e.running);assert!(!e.vfos[0].wav.as_ref().unwrap().active);
+        assert!(response["notifications"].as_array().unwrap().iter().any(|n|n["message"].as_str().is_some_and(|s|s.contains("VFO条件は変更しましたがWAV再開に失敗"))));
+        let metadata:Value=serde_json::from_slice(&fs::read(old_meta).unwrap()).unwrap();assert_eq!(metadata["stop_reason"],"conditions_changed");assert_eq!(metadata["samples"],old_samples);
+        assert_eq!(metadata["route"],"demod");assert_eq!(hound::WavReader::open(old_path).unwrap().duration()as u64,old_samples);
+        assert_eq!(fs::read(target).unwrap(),b"test destination blocker");e.process_block(32768,&reception_fm_iq(8192)).unwrap();assert_eq!(e.vfos[0].reception_status["available"],true);e.on_stop("test");
+    }
+    #[test]
+    fn afc_manual_off_preserves_nominal_input_psd_iq_and_splits_active_wav(){
+        let mut e=engine();e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":"AM","bandwidth_hz":20000.0,"reception":{"afc_enabled":true,"afc_max_hz":500.0}}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.apply(&json!({"action":"iq_start"})).unwrap();
+        let count=716800;e.process_block(0,&reception_cw_iq(0,count)).unwrap();
+        let correction=e.vfos[0].reception_status["afc_offset_hz"].as_f64().unwrap();assert!(correction>0.1&&correction<=500.0,"actual AFC correction {correction}");
+        let psd=e.analyzer.last_psd.clone();let input=e.input.clone();let frequency=e.vfos[0].frequency_hz;
+        let samples=e.iq.as_ref().unwrap().samples_written;let raw_path=e.iq.as_ref().unwrap().data_path.clone().unwrap();let raw_before=fs::read(&raw_path).unwrap();
+        let previous_meta=e.vfos[0].wav.as_ref().unwrap().meta_path.clone().unwrap();
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"afc_enabled":false}}})).unwrap();
+        assert_eq!(e.vfos[0].demod.as_ref().unwrap().afc_status()["afc_offset_hz"],0.0);
+        assert_eq!(e.input,input);assert_eq!(e.vfos[0].frequency_hz,frequency);assert_eq!(e.analyzer.last_psd,psd);
+        assert_eq!(e.iq.as_ref().unwrap().samples_written,samples);assert_eq!(fs::read(raw_path).unwrap(),raw_before);
+        assert_eq!(e.vfos[0].reception_status["available"],false);assert!(e.vfos[0].wav.as_ref().unwrap().active);
+        let previous:Value=serde_json::from_slice(&fs::read(previous_meta).unwrap()).unwrap();assert_eq!(previous["conditions"]["reception"]["afc_enabled"],true);
+        assert_eq!(e.vfos[0].wav.as_ref().unwrap().condition_metadata["reception"]["afc_enabled"],false);
+        e.process_block(count as u64,&reception_cw_iq(count,32768)).unwrap();assert_eq!(e.vfos[0].reception_status["afc_offset_hz"],0.0);e.on_stop("test");
+    }
+    #[test]
+    fn afc_freezes_when_noise_references_cross_usable_band_despite_fitting_nyquist(){
+        let mut e=engine();let usable=e.usable();assert!(Engine::afc_reference_in_band(usable/2.0-200000.0,200000.0,usable));
+        assert!(!Engine::afc_reference_in_band(usable/2.0-200000.0+1.0,200000.0,usable));
+        let frequency=e.center()+800000.0;
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"frequency_hz":frequency,"reception":{"afc_enabled":true}}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();let input=e.input.clone();
+        let raw:Vec<u8>=(0..65536).flat_map(|n|{let phase=std::f64::consts::TAU*800200.0*n as f64/2048000.0;
+            [(127.5+50.0*phase.cos()).round()as u8,(127.5+50.0*phase.sin()).round()as u8]}).collect();
+        e.process_block(0,&raw).unwrap();assert!(e.analyzer.afc_quality(800000.0,200000.0).is_some());
+        assert_eq!(e.vfos[0].reception_status["afc_quality_reason"],"noise_reference_outside_usable_band");
+        assert_eq!(e.vfos[0].reception_status["afc_status"],"reference_outside_usable_band");assert_eq!(e.vfos[0].reception_status["quality_db"],Value::Null);
+        assert_eq!(e.vfos[0].reception_status["afc_offset_hz"],0.0);assert_eq!(e.vfos[0].frequency_hz,frequency);assert_eq!(e.input,input);
+        let mut reference=Analyzer::new(e.analyzer.config.clone());let iq:Vec<_>=raw.chunks_exact(2).map(|p|Complex32::new((p[0]as f32-127.5)/127.5,(p[1]as f32-127.5)/127.5)).collect();reference.process(&iq,0);
+        assert_eq!(e.analyzer.last_psd,reference.last_psd);e.on_stop("test");
+    }
+    #[test]
+    fn speaker_selection_preserves_independent_processing_and_gap_advances_epoch(){
+        let mut e=engine();e.apply(&json!({"action":"add_vfo","vfo":{"frequency_hz":32000000.0,"mode":"WFM"}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();e.apply(&json!({"action":"wav_start","id":1})).unwrap();
+        e.process_block(0,&reception_fm_iq(65536)).unwrap();let status:Vec<_>=e.vfos.iter().map(|v|v.audio_processor.status()).collect();
+        let samples=e.vfos[0].wav.as_ref().unwrap().samples_written;let path=e.vfos[0].wav.as_ref().unwrap().path.clone();let epoch=e.audio_epoch;
+        e.apply(&json!({"action":"select_vfo","id":2})).unwrap();assert_eq!(e.audio_epoch,epoch+1);assert_eq!(e.audio(0)["epoch"],epoch+1);
+        for (v,old)in e.vfos.iter().zip(&status){assert_eq!(v.audio_processor.status(),*old);}
+        assert_eq!(e.vfos[0].wav.as_ref().unwrap().samples_written,samples);assert_eq!(e.vfos[0].wav.as_ref().unwrap().path,path);
+        let selected_epoch=e.audio_epoch;e.apply(&json!({"action":"select_vfo","id":2})).unwrap();assert_eq!(e.audio_epoch,selected_epoch);
+        e.process_block(65536+100,&reception_fm_iq(32768)).unwrap();assert_eq!(e.audio_epoch,selected_epoch+1);
+        assert!(e.vfos[0].audio_processor.status()["gap_count"].as_u64().unwrap()>status[0]["gap_count"].as_u64().unwrap());
+        assert_eq!(e.vfos[0].wav.as_ref().unwrap().processing_summary["gap_count"],1);assert!(e.vfos[0].wav.as_ref().unwrap().samples_written>samples);
+        e.on_stop("test");assert!(e.vfos.iter().all(|v|v.state(e.selected,e.running)["reception_status"]["available"]==false));
+    }
+    #[test]
+    fn processed_wav_limiter_reports_pre_overload_instead_of_hiding_it(){
+        let mut e=engine();e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"audio_gain_db":36.0,"limiter_enabled":true,"limiter_ceiling_dbfs":-2.0,"click_suppression_enabled":false,"wav_audio":"processed"}}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();e.apply(&json!({"action":"wav_start","id":1})).unwrap();
+        e.process_block(0,&reception_fm_iq(131072)).unwrap();e.apply(&json!({"action":"wav_stop","id":1})).unwrap();let writer=e.vfos[0].wav.as_ref().unwrap();
+        assert!(writer.processing_summary["pre_overload_samples"].as_u64().unwrap()>0);assert!(writer.processing_summary["limited_samples"].as_u64().unwrap()>0);
+        assert_eq!(writer.clipped_samples,0);let audio:Vec<i16>=hound::WavReader::open(writer.path.as_ref().unwrap()).unwrap().samples::<i16>().map(Result::unwrap).collect();
+        let ceiling=10_f64.powf(-2.0/20.0)*32768.0+1.0;assert!(audio.iter().all(|v|(*v as f64).abs()<=ceiling));
+        let metadata:Value=serde_json::from_slice(&fs::read(writer.meta_path.as_ref().unwrap()).unwrap()).unwrap();assert_eq!(metadata["processing_summary"],writer.processing_summary);
+        assert_eq!(metadata["route"],"processed");assert_eq!(metadata["conditions"]["reception"]["audio_gain_db"],36.0);e.on_stop("test");
+    }
     #[test]
     fn calibrated_display_conversion_preserves_canonical_psd_thresholds_and_settings(){
         let mut e=engine();e.apply(&json!({"action":"calibration_load","calibration":calibration_profile()})).unwrap();

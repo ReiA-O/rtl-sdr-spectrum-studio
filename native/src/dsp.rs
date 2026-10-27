@@ -410,6 +410,32 @@ impl Analyzer {
         (values,self.persistence_denominator())
     }
 
+    /// Signal-plus-noise / expected-noise ratio in the VFO band. Both
+    /// sidebands need at least eight PSD bins; their exponential-noise median
+    /// is converted to a mean with /ln(2). Receiver DC +/-2 bins never qualifies
+    /// AFC. This is a conservative gating estimate, not calibrated SNR/SINAD.
+    pub fn afc_quality(&self,offset_hz:f64,bandwidth_hz:f64)->Option<f64>{
+        if self.last_frame_time.is_none()||!offset_hz.is_finite()||!bandwidth_hz.is_finite()
+            ||bandwidth_hz<=0.0||offset_hz.abs()+bandwidth_hz>self.config.sample_rate/2.0{return None;}
+        let mut left=Vec::new();let mut right=Vec::new();let mut signal=0.0;let mut bins=0usize;let mut dc_power=0.0;
+        for(&frequency,&power)in self.frequency_offsets_hz.iter().zip(&self.last_psd){
+            if !power.is_finite()||power<0.0{continue;}
+            if frequency.abs()<=2.0*self.bin_hz{dc_power+=power*self.bin_hz;continue;}
+            let relative=frequency-offset_hz;
+            if relative.abs()<=bandwidth_hz/2.0{signal+=power;bins+=1;}
+            else if relative>=-bandwidth_hz&&relative<=-bandwidth_hz*0.6{left.push(power);}
+            else if relative>=bandwidth_hz*0.6&&relative<=bandwidth_hz{right.push(power);}
+        }
+        // A pure DC input leaves tiny f32 FFT round-off outside the excluded
+        // bins. Dividing that by an even smaller noise median must not qualify
+        // AFC. This gate never changes stored PSD or RF measurements.
+        if left.len()<8||right.len()<8||bins<4||signal*self.bin_hz<=1e-18_f64.max(dc_power*1e-10){return None;}
+        let median=|values:&mut Vec<f64>|{values.sort_by(f64::total_cmp);let n=values.len();if n%2==0{(values[n/2-1]+values[n/2])/2.0}else{values[n/2]}};
+        let noise=(median(&mut left)+median(&mut right))/(2.0*LN_2);
+        if !noise.is_finite()||noise<=0.0{return None;}
+        let quality=10.0*(signal/(noise*bins as f64)).max(1e-30).log10();quality.is_finite().then_some(quality)
+    }
+
     pub fn snapshot(&self,span_hz:f64,center_hz:f64,width:usize) -> Value {
         let span=if span_hz.is_finite() && span_hz>0.0 {span_hz.min(self.config.sample_rate)}else{self.config.sample_rate};
         let mut selected:Vec<usize>=self.frequency_offsets_hz.iter().enumerate().filter(|(_,f)|f.abs()<=span/2.0).map(|(i,_)|i).collect();
@@ -584,11 +610,84 @@ impl OnePole {
     fn value(&mut self,x:f64)->f64{self.state=self.a*self.state+(1.0-self.a)*x;self.state}
 }
 
+#[derive(Clone,Debug)]
+pub struct DemodulatedBlock {
+    /// Original un-limited demodulated audio, before listening-path processing.
+    pub audio:Vec<f32>,pub rf_dbfs:f64,pub afc_offset_hz:f64,pub afc_locked:bool,
+    pub quality_db:Option<f64>,pub afc_status:String,
+}
+
+struct AfcTracker {
+    enabled:bool,max_hz:f64,offset_hz:f64,locked:bool,quality:Option<f64>,status:&'static str,
+    residual:Option<f64>,smoothed_residual:Option<f64>,trusted_seconds:f64,
+    previous:Option<Complex32>,phase_sum:f64,lag_re:f64,lag_im:f64,lag_norm:f64,count:u64,
+    power:f64,power_count:u64,effective_limit:f64,
+}
+impl AfcTracker {
+    fn new()->Self{Self{enabled:false,max_hz:1000.0,offset_hz:0.0,locked:false,quality:None,status:"disabled",residual:None,
+        smoothed_residual:None,trusted_seconds:0.0,previous:None,phase_sum:0.0,lag_re:0.0,lag_im:0.0,
+        lag_norm:0.0,count:0,power:0.0,power_count:0,effective_limit:0.0}}
+    fn clear_window(&mut self){self.phase_sum=0.0;self.lag_re=0.0;self.lag_im=0.0;self.lag_norm=0.0;self.count=0;self.power=0.0;self.power_count=0;}
+    fn configure(&mut self,enabled:bool,max_hz:f64)->Result<(),String>{
+        if !max_hz.is_finite()||!(1.0..=5000.0).contains(&max_hz){return Err("AFC上限は1〜5000 Hzの有限値です".into());}
+        if self.enabled==enabled&&self.max_hz==max_hz{return Ok(());}
+        self.enabled=enabled;self.max_hz=max_hz;self.offset_hz=if enabled{self.offset_hz.clamp(-max_hz,max_hz)}else{0.0};
+        self.locked=false;self.trusted_seconds=0.0;self.smoothed_residual=None;self.residual=None;self.previous=None;self.clear_window();
+        self.status=if enabled{"qualifying"}else{"disabled"};Ok(())
+    }
+    fn observe(&mut self,channel:&[Complex32]){
+        if !self.enabled{return;}
+        for &value in channel {
+            let power=(value.re as f64).powi(2)+(value.im as f64).powi(2);
+            if !power.is_finite(){self.previous=None;continue;}
+            self.power+=power;self.power_count+=1;
+            if let Some(previous)=self.previous {
+                let re=value.re as f64*previous.re as f64+value.im as f64*previous.im as f64;
+                let im=value.im as f64*previous.re as f64-value.re as f64*previous.im as f64;
+                let norm=(re*re+im*im).sqrt();
+                if norm>1e-18{self.phase_sum+=im.atan2(re);self.lag_re+=re;self.lag_im+=im;self.lag_norm+=norm;self.count+=1;}
+            }
+            self.previous=Some(value);
+        }
+    }
+    fn update(&mut self,seconds:f64,rate:f64,bandwidth:f64,quality:Option<f64>,limit:f64){
+        self.quality=quality.filter(|v|v.is_finite());self.effective_limit=limit;
+        let residual=if self.count>0{Some(self.phase_sum/self.count as f64*rate/TAU)}else{None};
+        let coherence=(self.lag_re*self.lag_re+self.lag_im*self.lag_im).sqrt()/self.lag_norm.max(1e-30);
+        let power=self.power/self.power_count.max(1)as f64;
+        let valid=self.quality.is_some_and(|v|v>=6.0)&&self.count as f64>=rate*seconds*0.7&&power>1e-12&&coherence>=0.1
+            &&residual.is_some_and(|v|v.is_finite()&&v.abs()<=(self.max_hz*1.5+50.0).min(bandwidth*0.15));
+        self.residual=residual.filter(|v|v.is_finite());
+        if limit<=0.0{self.status="out_of_band";self.locked=false;self.trusted_seconds=0.0;self.smoothed_residual=None;}
+        else if !valid{self.status="quality_insufficient";self.locked=false;self.trusted_seconds=0.0;self.smoothed_residual=None;}
+        else {
+            self.trusted_seconds+=seconds;let residual=residual.unwrap();let alpha=(-seconds/0.35).exp();
+            let estimate=self.smoothed_residual.map(|old|alpha*old+(1.0-alpha)*residual).unwrap_or(residual);self.smoothed_residual=Some(estimate);
+            if self.trusted_seconds<0.25{self.status="qualifying";self.locked=false;}
+            else {
+                // Analogue carrier tracking is deliberately slow and bounded.
+                // CRC-free estimates never retune hardware or nominal VFO.
+                let step=(estimate*(1.0-(-seconds/1.0).exp())).clamp(-100.0*seconds,100.0*seconds);
+                self.offset_hz=(self.offset_hz+step).clamp(-limit,limit);self.status="tracking";self.locked=estimate.abs()<50.0;
+            }
+        }
+        self.clear_window();
+    }
+    fn status(&self)->Value{json!({"afc_enabled":self.enabled,"afc_offset_hz":self.offset_hz,"afc_locked":self.locked,
+        "quality_db":self.quality,"afc_status":self.status,"afc_max_hz":self.max_hz,"afc_residual_hz":self.residual,
+        "afc_effective_limit_hz":self.effective_limit,"afc_trusted_seconds":self.trusted_seconds,
+        "afc_quality_threshold_db":6.0,"afc_required_trust_seconds":0.25,"afc_update_seconds":0.02,
+        "afc_time_constant_seconds":1.0,"afc_max_slew_hz_per_second":100.0,
+        "afc_quality_definition":"band signal+noise / sideband median-noise expectation; receiver DC +/-2 bins excluded",
+        "afc_engineering_defaults":true})}
+}
+
 pub struct VfoDemodulator {
     pub sample_rate:f64,pub frequency_offset_hz:f64,pub bandwidth_hz:f64,pub mode:String,pub audio_rate:u32,
     pub channel_rate:f64,pub factor:usize,
     channel_filter:Fir,audio_filter:Fir,dc:OnePole,deemphasis:Option<OnePole>,
     phase:f64,input_count:u64,previous_iq:Option<Complex32>,channel_count:u64,output_count:u64,previous_audio:Option<f64>,
+    afc:AfcTracker,
 }
 impl VfoDemodulator {
     pub fn new(fs:f64,offset:f64,bw:f64,mode:&str,audio_rate:u32)->Self {
@@ -608,12 +707,41 @@ impl VfoDemodulator {
         Ok(Self {sample_rate:fs,frequency_offset_hz:offset,bandwidth_hz:bw,mode:mode.clone(),audio_rate,channel_rate,factor,
             channel_filter:Fir::new(lowpass(fs,bw/2.0,input_taps)),audio_filter:Fir::new(lowpass(channel_rate,cutoff,audio_taps)),
             dc:OnePole::new(channel_rate,0.05),deemphasis:if mode=="WFM"{Some(OnePole::new(audio_rate as f64,50e-6))}else{None},
-            phase:0.0,input_count:0,previous_iq:None,channel_count:0,output_count:0,previous_audio:None})
+            phase:0.0,input_count:0,previous_iq:None,channel_count:0,output_count:0,previous_audio:None,afc:AfcTracker::new()})
     }
-    pub fn reset(&mut self){*self=Self::new(self.sample_rate,self.frequency_offset_hz,self.bandwidth_hz,&self.mode,self.audio_rate);}
+    pub fn reset(&mut self){let(enabled,max_hz)=(self.afc.enabled,self.afc.max_hz);*self=Self::new(self.sample_rate,self.frequency_offset_hz,self.bandwidth_hz,&self.mode,self.audio_rate);self.afc.configure(enabled,max_hz).expect("existing AFC config");}
+    pub fn set_afc(&mut self,enabled:bool,max_hz:f64)->Result<(),String>{self.afc.configure(enabled,max_hz)}
+    pub fn afc_status(&self)->Value{self.afc.status()}
     pub fn process(&mut self,iq:&[Complex32])->Vec<f32> {
-        if iq.is_empty(){return Vec::new();}
-        let omega=-TAU*self.frequency_offset_hz/self.sample_rate;
+        self.process_with_metrics(iq,None,self.afc.max_hz).audio
+    }
+    /// Applies optional digital-only AFC. max_allowed_hz is the nonnegative
+    /// symmetric margin supplied by Engine inside its usable input bandwidth.
+    /// quality must be the independent wideband PSD gate; lack of quality
+    /// freezes tracking, never silently switches to a blind tracking loop.
+    pub fn process_with_metrics(&mut self,iq:&[Complex32],quality:Option<f64>,max_allowed_hz:f64)->DemodulatedBlock{
+        let limit=if max_allowed_hz.is_finite(){max_allowed_hz.max(0.0).min(self.afc.max_hz)}else{0.0};
+        self.afc.offset_hz=self.afc.offset_hz.clamp(-limit,limit);self.afc.quality=quality.filter(|v|v.is_finite());self.afc.effective_limit=limit;
+        if self.afc.enabled&&(limit<=0.0||!self.afc.quality.is_some_and(|v|v>=6.0)){
+            self.afc.locked=false;self.afc.trusted_seconds=0.0;self.afc.smoothed_residual=None;
+            self.afc.status=if limit<=0.0{"out_of_band"}else{"quality_insufficient"};
+        }
+        let mut audio=Vec::new();let mut power=0.0;let mut count=0usize;
+        if self.afc.enabled {
+            let quantum=(self.sample_rate*0.02).round().max(1.0)as u64;let mut cursor=0;
+            while cursor<iq.len(){
+                let end=(cursor+(quantum-self.input_count%quantum)as usize).min(iq.len());
+                let(samples,p,n)=self.process_segment(&iq[cursor..end]);audio.extend(samples);power+=p;count+=n;cursor=end;
+                if self.input_count%quantum==0{self.afc.update(quantum as f64/self.sample_rate,self.channel_rate,self.bandwidth_hz,quality,limit);}
+            }
+            if iq.is_empty(){self.afc.status="no_samples";self.afc.locked=false;}
+        }else{let(samples,p,n)=self.process_segment(iq);audio=samples;power=p;count=n;}
+        DemodulatedBlock{audio,rf_dbfs:db(power/count.max(1)as f64),afc_offset_hz:self.afc.offset_hz,
+            afc_locked:self.afc.locked,quality_db:self.afc.quality,afc_status:self.afc.status.into()}
+    }
+    fn process_segment(&mut self,iq:&[Complex32])->(Vec<f32>,f64,usize) {
+        if iq.is_empty(){return (Vec::new(),0.0,0);}
+        let omega=-TAU*(self.frequency_offset_hz+if self.afc.enabled{self.afc.offset_hz}else{0.0})/self.sample_rate;
         let (mut im,mut re)=self.phase.sin_cos();let (rotate_im,rotate_re)=omega.sin_cos();
         let mut mixed=Vec::with_capacity(iq.len());
         for (index,x) in iq.iter().enumerate(){
@@ -626,7 +754,9 @@ impl VfoDemodulator {
         let offset=((self.factor as u64-self.input_count%self.factor as u64)%self.factor as u64) as usize;
         let channel:Vec<Complex32>=filtered.iter().skip(offset).step_by(self.factor).copied().collect();
         self.input_count+=iq.len() as u64;
-        if channel.is_empty(){return Vec::new();}
+        if channel.is_empty(){return (Vec::new(),0.0,0);}
+        let rf_power=channel.iter().map(|z|(z.re as f64).powi(2)+(z.im as f64).powi(2)).sum();let rf_count=channel.len();
+        self.afc.observe(&channel);
         let mut audio=Vec::with_capacity(channel.len());
         if self.mode=="AM" {
             for z in &channel{let envelope=z.norm() as f64;let dc=self.dc.value(envelope);audio.push(Complex32::new(((envelope-dc)/dc.max(1e-4)) as f32,0.0));}
@@ -652,7 +782,7 @@ impl VfoDemodulator {
             result.push(if value.is_finite(){(value*output_gain) as f32}else{0.0});
         }
         self.previous_audio=filtered.last().map(|v|v.re as f64);self.channel_count+=filtered.len() as u64;self.output_count+=number as u64;
-        result
+        (result,rf_power,rf_count)
     }
 }
 
@@ -660,6 +790,60 @@ impl VfoDemodulator {
 mod tests {
     use super::*;
     fn tone(n:usize,fs:f64,f:f64,amplitude:f32)->Vec<Complex32>{(0..n).map(|i|Complex32::from_polar(amplitude,(TAU*f*i as f64/fs) as f32)).collect()}
+    fn analog_signal(start:usize,length:usize,fs:f64,offset:f64,cfo:f64,mode:&str)->Vec<Complex32>{
+        (start..start+length).map(|i|{let t=i as f64/fs;let modulation=(TAU*1000.0*t).sin();
+            let phase=TAU*(offset+cfo)*t+if mode=="WFM"{30.0*modulation}else if mode=="NFM"{2.5*modulation}else{0.0};
+            let amplitude=if mode=="AM"{0.2*(1.0+0.3*modulation)}else{0.2};Complex32::from_polar(amplitude as f32,phase.rem_euclid(TAU)as f32)}).collect()
+    }
+    #[test]
+    fn analog_afc_tracks_small_carrier_error_for_am_nfm_wfm_without_retuning(){
+        let fs=256000.0;let nominal=16000.0;
+        for(mode,bw)in [("AM",12000.0),("NFM",25000.0),("WFM",200000.0)]{
+            let mut d=VfoDemodulator::new(fs,nominal,bw,mode,32000);d.set_afc(true,1000.0).unwrap();
+            let mut cursor=0;let mut last=None;while cursor<(fs*4.0)as usize{let count=16384.min((fs*4.0)as usize-cursor);
+                let iq=analog_signal(cursor,count,fs,nominal,120.0,mode);last=Some(d.process_with_metrics(&iq,Some(20.0),400.0));cursor+=count;}
+            let result=last.unwrap();assert!((result.afc_offset_hz-120.0).abs()<12.0,"{mode}: {}",result.afc_offset_hz);
+            assert!(result.afc_locked,"{mode}: {}",result.afc_status);assert!(result.audio.iter().all(|v|v.is_finite()));
+            assert_eq!(d.frequency_offset_hz,nominal);assert_eq!(d.sample_rate,fs);assert!((result.rf_dbfs-10.0*0.04_f64.log10()).abs()<1.0);
+        }
+    }
+    #[test]
+    fn afc_limits_off_on_and_reset_preserve_nominal_tune_and_nco_phase(){
+        let fs=256000.0;let mut d=VfoDemodulator::new(fs,16000.0,25000.0,"NFM",32000);d.set_afc(true,1000.0).unwrap();
+        for block in 0..100{let iq=analog_signal(block*5120,5120,fs,16000.0,250.0,"NFM");d.process_with_metrics(&iq,Some(20.0),50.0);}
+        assert!((d.afc.offset_hz-50.0).abs()<1e-6);let phase=d.phase;let samples=d.input_count;let state=d.afc_status();d.set_afc(true,1000.0).unwrap();assert_eq!(d.afc_status(),state);
+        d.set_afc(false,1000.0).unwrap();assert_eq!(d.afc.offset_hz,0.0);assert_eq!(d.phase,phase);assert_eq!(d.input_count,samples);assert_eq!(d.afc_status()["afc_status"],"disabled");
+        d.set_afc(true,1000.0).unwrap();for block in 100..150{let iq=analog_signal(block*5120,5120,fs,16000.0,250.0,"NFM");d.process_with_metrics(&iq,Some(20.0),80.0);}
+        assert!(d.afc.offset_hz>0.0&&d.afc.offset_hz<=80.0);let tracked=d.afc.offset_hz;
+        let iq=analog_signal(150*5120,5120,fs,16000.0,250.0,"NFM");d.process_with_metrics(&iq,None,80.0);assert_eq!(d.afc.offset_hz,tracked);assert!(!d.afc.locked);
+        d.process_with_metrics(&iq,Some(20.0),0.0);assert_eq!(d.afc.offset_hz,0.0);assert_eq!(d.afc_status()["afc_status"],"out_of_band");
+        d.reset();assert_eq!(d.afc.offset_hz,0.0);assert_eq!(d.afc_status()["afc_enabled"],true);assert_eq!(d.afc_status()["afc_max_hz"],1000.0);assert_eq!(d.frequency_offset_hz,16000.0);
+        assert!(d.set_afc(true,f64::NAN).is_err());assert!(d.set_afc(true,0.0).is_err());
+    }
+    #[test]
+    fn afc_quality_rejects_dc_noise_and_missing_sideband_evidence(){
+        let fs=256000.0;let cfg=Config{sample_rate:fs,fft_size:4096,..Config::default()};let mut analyzer=Analyzer::new(cfg);
+        assert!(analyzer.afc_quality(16000.0,12000.0).is_none());let mut random=71931u64;
+        let mut noise=|n:usize|->Vec<Complex32>{(0..n).map(|_|{random=random.wrapping_mul(6364136223846793005).wrapping_add(1);let a=((random>>32)as u32 as f64/u32::MAX as f64-0.5)*0.02;random=random.wrapping_mul(6364136223846793005).wrapping_add(1);let b=((random>>32)as u32 as f64/u32::MAX as f64-0.5)*0.02;Complex32::new(a as f32,b as f32)}).collect()};
+        let mut demod=VfoDemodulator::new(fs,16000.0,12000.0,"AM",32000);demod.set_afc(true,1000.0).unwrap();
+        for block in 0..30{let iq=noise(5120);analyzer.process(&iq,block*5120);let quality=analyzer.afc_quality(16000.0,12000.0);
+            assert!(quality.is_none_or(|v|v<6.0));demod.process_with_metrics(&iq,quality,1000.0);}
+        assert_eq!(demod.afc.offset_hz,0.0);assert!(!demod.afc.locked);
+        let dc:Vec<_>=noise(8192).into_iter().map(|v|v+Complex32::new(0.25,-0.13)).collect();analyzer.reset(None);analyzer.process(&dc,0);
+        assert!(analyzer.afc_quality(0.0,12000.0).is_none_or(|v|v<6.0));
+        analyzer.reset(None);analyzer.process(&vec![Complex32::new(0.25,-0.13);8192],0);assert!(analyzer.afc_quality(0.0,12000.0).is_none_or(|v|v<6.0));
+        let iq:Vec<_>=analog_signal(0,8192,fs,16000.0,120.0,"AM").into_iter().zip(noise(8192)).map(|(a,b)|a+b).collect();analyzer.reset(None);analyzer.process(&iq,0);
+        assert!(analyzer.afc_quality(16000.0,12000.0).unwrap()>15.0);assert!(analyzer.afc_quality(120000.0,12000.0).is_none());
+    }
+    #[test]
+    fn afc_fixed_sample_windows_are_independent_of_api_chunk_boundaries(){
+        let fs=256000.0;let input=analog_signal(0,512000,fs,16000.0,120.0,"AM");let mut a=VfoDemodulator::new(fs,16000.0,12000.0,"AM",32000);let mut b=VfoDemodulator::new(fs,16000.0,12000.0,"AM",32000);
+        a.set_afc(true,1000.0).unwrap();b.set_afc(true,1000.0).unwrap();let whole=a.process_with_metrics(&input,Some(20.0),1000.0).audio;
+        let mut split=Vec::new();for chunk in input.chunks(17003){split.extend(b.process_with_metrics(chunk,Some(20.0),1000.0).audio);}
+        assert_eq!(whole.len(),split.len());let difference=whole[3200..].iter().zip(&split[3200..]).map(|(a,b)|(*a-*b).abs()).fold(0.0_f32,f32::max);
+        assert!(difference<0.002,"audio difference {difference}");assert!((a.afc.offset_hz-b.afc.offset_hz).abs()<0.02);
+        assert!((a.phase-b.phase).abs()<0.01);assert_eq!(a.input_count,b.input_count);
+    }
     #[test]
     fn fft_integral_and_all_frame_denominator(){
         let cfg=Config{sample_rate:64000.0,fft_size:1024,stats_mode:"cumulative".into(),..Config::default()};

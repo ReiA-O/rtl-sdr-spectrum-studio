@@ -10,7 +10,8 @@
   const colors = ['#64d7ec','#e6bf70','#bc9ce4','#75d6a9','#e99aa6','#8cafea','#d5d78b','#7cc6bf'];
   let state = null, frame = null, connectionError = false, actionInFlight = 0, preferredSource = null;
   let fileData = {files: [], presets: []}, vfoSignature = '', userMarkerSignature = '', drag = null, hover = null;
-  let audioEnabled = false, audioContext = null, audioGain = null, audioSequence = 0, audioNextTime = 0;
+  let audioEnabled = false, audioContext = null, audioGain = null, audioStreamGain = null, audioSequence = 0, audioNextTime = 0;
+  let audioEpoch = 0, audioRemoteEpoch = null, lastAudioConditions = '';
   let audioSources = [], lastAudioVfo = null, audioReceivedAt = 0;
   let layout = {spectrum_ratio: .6, vfo_width: 340, bottom_ratio: .5};
   let extraConditions = [], seenNotifications = new Set(), tuningTimer = null, frameFailures = 0, lastDeviceError = null;
@@ -20,6 +21,9 @@
   let vfoSelectionIntent, vfoSelectionGeneration = 0, vfoSelectionPromise = Promise.resolve(true), canvasGestureTarget = 'empty';
   let densityRangeDisplayContext = null, densityRangeEditContext = null, densityRangeEditGeneration = 0;
   const dirtyForms = new Set();
+  const vfoEdits = new Map();
+  const receptionDefaults = Object.freeze({afc_enabled:false,afc_max_hz:1000,squelch_enabled:false,squelch_dbfs:-60,squelch_hysteresis_db:3,squelch_hang_ms:300,audio_gain_db:0,limiter_enabled:true,limiter_ceiling_dbfs:-2,click_suppression_enabled:true,wav_audio:'demod'});
+  const receptionLimits = Object.freeze({afc_max_hz:{low:1,high:5000,label:'AFC補正上限'},squelch_dbfs:{low:-160,high:10,label:'RFしきい値'},squelch_hysteresis_db:{low:0,high:30,label:'ヒステリシス'},squelch_hang_ms:{low:0,high:5000,label:'保持時間'},audio_gain_db:{low:-24,high:36,label:'音声ゲイン'},limiter_ceiling_dbfs:{low:-24,high:0,label:'保護上限'}});
 
   function toast(message, type = 'info', duration = 4800) {
     if (!message) return;
@@ -44,6 +48,19 @@
   function formatBytes(bytes) { return bytes >= 1e9 ? `${(bytes/1e9).toFixed(2)} GB` : bytes >= 1e6 ? `${(bytes/1e6).toFixed(1)} MB` : bytes >= 1e3 ? `${(bytes/1e3).toFixed(1)} kB` : `${finite(bytes)} B`; }
   function inputLocked() { return Boolean(state && (state.locks?.input || state.trigger?.armed || state.recording?.iq_active || state.trigger?.recording)); }
   function selectedVfo() { return (vfoSelectionIntent===undefined?null:state?.vfos?.find(v=>String(v.id)===String(vfoSelectionIntent))) || state?.vfos?.find(v => v.selected) || state?.vfos?.find(v => String(v.id) === String(state.selected_vfo_id)) || null; }
+  function audioConditionsKey(vfo) { return JSON.stringify([state?.running,state?.source,vfo?.id,vfo?.frequency_hz,vfo?.bandwidth_hz,vfo?.mode,vfo?.enabled]); }
+  function validAudioEpoch(value) { return Number.isSafeInteger(value)&&value>=0; }
+  function syncStateAudioEpoch() {
+    const epoch=state?.audio_epoch;if(!validAudioEpoch(epoch))return;
+    if(validAudioEpoch(audioRemoteEpoch)&&epoch>audioRemoteEpoch){flushAudio();audioSequence=0;}
+    if(!validAudioEpoch(audioRemoteEpoch)||epoch>audioRemoteEpoch)audioRemoteEpoch=epoch;
+  }
+  function audioPacketMatchesState(data) {
+    if(data.vfo_id!==undefined&&data.vfo_id!==null&&String(data.vfo_id)!==String(selectedVfo()?.id))return false;
+    if(data.epoch===undefined||data.epoch===null)return true;
+    if(!validAudioEpoch(data.epoch))return false;
+    return (!validAudioEpoch(state?.audio_epoch)||data.epoch>=state.audio_epoch)&&(!validAudioEpoch(audioRemoteEpoch)||data.epoch>=audioRemoteEpoch);
+  }
   function wireId(id) { return state?.vfos?.find(v=>String(v.id)===String(id))?.id ?? id; }
   function linkedVfo(id) { return id === '' ? null : wireId(id); }
   function userMarkers() { return (state?.measurement?.manual_markers || []).filter(m=>m&&typeof m==='object'&&m.id!=null); }
@@ -251,7 +268,7 @@
       asText('replayPosition',`${finite(r.position_seconds).toFixed(2)} s`); asText('replayDuration',`${finite(r.duration_seconds ?? r.total_seconds).toFixed(2)} s`);
     }
     if (state.layout && !drag?.layout) applyLayout(state.layout, false);
-    renderCalibration(force);renderDensityRange(force);renderVfos(force || forceVfos);renderMeasurements(frame?.measurements || {});updateFftVisibility();updatePresetLoadState();
+    renderCalibration(force);renderDensityRange(force);renderVfos(force);renderMeasurements(frame?.measurements || {});updateFftVisibility();updatePresetLoadState();
     const pv = a.persistence_mode === 'off' ? 'OFF' : a.persistence_mode === 'infinite' ? 'Infinite' : a.persistence_mode === 'window' ? '時間窓' : '指数減衰';
     asText('persistenceReadout',`${pv}${['off','infinite'].includes(a.persistence_mode) ? '' : ` · ${a.persistence_unit === 'frames' ? finite(a.persistence_frames).toLocaleString()+' FFT' : finite(a.persistence_seconds,1).toFixed(2)+' s'}`}`);
     for (const item of state.notifications || []) {
@@ -263,51 +280,118 @@
     if (state.device?.error) notice(state.device.error, 'error');
     else if(lastDeviceError&&$('noticeText').textContent===lastDeviceError)notice('');
     lastDeviceError=state.device?.error || null;
-    const vfo = selectedVfo();
-    if (String(vfo?.id) !== String(lastAudioVfo)) { flushAudio(); audioSequence=0; lastAudioVfo=vfo?.id; }
+    const vfo = selectedVfo(),audioConditions=audioConditionsKey(vfo);
+    if (audioConditions!==lastAudioConditions) { flushAudio();audioSequence=0;lastAudioVfo=vfo?.id;lastAudioConditions=audioConditions; }
+    syncStateAudioEpoch();
     updateAudioCaption();
   }
 
-  function renderVfos(force = false) {
-    const vfos = state?.vfos || [];
-    for(const card of $('vfoList').querySelectorAll('[data-vfo]')) {
-      const v=vfos.find(item=>String(item.id)===card.dataset.vfo);if(!v)continue;
-      const rec=Boolean(v.wav_recording),stopped=v.enabled===false;
-      const selected=Boolean(v.selected||String(v.id)===String(state?.selected_vfo_id));
-      const status=card.querySelector('.vfo-state');if(status)status.textContent=stopped?'停止':state?.running?'復調中':'待機（有効）';
-      const record=card.querySelector('[data-vfo-action=record]');if(record){record.disabled=!rec&&(stopped||!state?.running);record.textContent=rec?'■ WAV停止':'● WAV';record.classList.toggle('active',rec);}
-      card.classList.toggle('selected',selected);card.classList.toggle('stopped',stopped);
-      const select=card.querySelector('[data-vfo-action=select]');if(select){select.classList.toggle('selected',selected);select.textContent=selected?'選択中':'選択';}
+  function vfoEditState(id) {
+    const key=String(id);if(!vfoEdits.has(key))vfoEdits.set(key,{basic:{dirty:false,generation:0},reception:{dirty:false,generation:0}});return vfoEdits.get(key);
+  }
+  function markVfoEdited(event) {
+    const field=event.target,card=field.closest('[data-vfo]');if(!card||(!field.dataset.vfoField&&!field.dataset.receptionField))return;
+    const section=field.dataset.receptionField?'reception':'basic',edit=vfoEditState(card.dataset.vfo)[section];edit.dirty=true;edit.generation++;
+    const status=card.querySelector(`[data-vfo-edit-status=${section}]`);if(status)status.textContent='未適用';
+  }
+  function receptionConfig(vfo) { return {...receptionDefaults,...(vfo?.reception || {})}; }
+  function wavRouteLabel(route) { return route==='processed'?'聴取処理後':route==='demod'?'復調音（後処理なし）':'—'; }
+  function readVfoReception(card) {
+    const config={};
+    for(const [key,initial] of Object.entries(receptionDefaults)){
+      const field=card.querySelector(`[data-reception-field=${key}]`);if(!field)return {error:'受信・音声補助の入力欄を確認してください。'};
+      if(typeof initial==='boolean'){config[key]=field.checked===true;continue;}
+      if(typeof initial==='string'){if(!['demod','processed'].includes(field.value))return {error:'WAV保存経路を選択してください。'};config[key]=field.value;continue;}
+      const text=field.value;if(typeof text!=='string'||!text.trim()||!Number.isFinite(Number(text)))return {error:'受信・音声補助の数値をすべて入力してください。'};
+      config[key]=Number(text);
     }
-    const signature = JSON.stringify({running:Boolean(state?.running),vfos:vfos.map(v => ({...v, audio_level:undefined, level_dbfs:undefined, sample_count:undefined}))});
-    if (!force && (signature === vfoSignature || document.activeElement?.closest('.vfo-card'))) return;
-    vfoSignature=signature;
-    if (!vfos.length) { $('vfoList').innerHTML='<div class="vfo-empty">「＋ VFO」で受信する局を追加</div>'; return; }
-    $('vfoList').innerHTML = vfos.map((v,index) => {
-      const active = Boolean(v.selected || String(v.id) === String(state.selected_vfo_id));
-      const stopped = v.enabled === false, rec=Boolean(v.wav_recording), vfoStatus=stopped?'停止':state?.running?'復調中':'待機（有効）';
-      return `<article class="vfo-card ${active?'selected':''} ${stopped?'stopped':''}" data-vfo="${escapeHtml(v.id)}"><header class="vfo-card-header"><div class="vfo-name"><span class="vfo-color" style="background:${colors[index%colors.length]}"></span><strong>VFO ${escapeHtml(v.id)}</strong>${rec?'<span class="badge recording">REC</span>':''}</div><div class="vfo-header-actions"><button class="vfo-select ${active?'selected':''}" data-vfo-action="select">${active?'選択中':'選択'}</button><button class="vfo-delete" data-vfo-action="delete" aria-label="VFO ${escapeHtml(v.id)}を削除">×</button></div></header><div class="vfo-fields"><label>局周波数<div class="input-unit"><input data-vfo-field="frequency" type="number" step="0.001" value="${mhz(v.frequency_hz).toFixed(6)}" aria-label="VFO ${escapeHtml(v.id)} 周波数"><span>MHz</span></div></label><label>復調<select data-vfo-field="mode" aria-label="VFO ${escapeHtml(v.id)} 復調方式">${['AM','NFM','WFM'].map(mode=>`<option ${v.mode===mode?'selected':''}>${mode}</option>`).join('')}</select></label><label>復調帯域幅<div class="input-unit"><input data-vfo-field="bandwidth" type="number" step="0.1" min="0.1" value="${(finite(v.bandwidth_hz)/1000).toFixed(2)}" aria-label="VFO ${escapeHtml(v.id)} 帯域幅"><span>kHz</span></div></label><label>状態<span class="vfo-state">${vfoStatus}</span></label></div><div class="vfo-actions"><button class="button" data-vfo-action="apply">適用</button><button class="button ${rec?'record active':'record'}" data-vfo-action="record" ${!rec&&(stopped||!state?.running)?'disabled':''}>${rec?'■ WAV停止':'● WAV'}</button>${stopped?'<button class="button" data-vfo-action="resume">再開</button>':''}<select data-vfo-field="wav-format" aria-label="WAV形式"><option value="PCM16" ${v.wav_format!=='PCM24'?'selected':''}>PCM16</option><option value="PCM24" ${v.wav_format==='PCM24'?'selected':''}>PCM24</option></select></div>${v.stopped_reason?`<div class="vfo-warning">${escapeHtml(v.stopped_reason)}</div>`:''}</article>`;
-    }).join('');
+    for(const [key,{low,high,label}] of Object.entries(receptionLimits))if(config[key]<low||config[key]>high)return {error:`${label}は ${low}〜${high} の範囲で指定してください。`};
+    if(!Number.isInteger(config.squelch_hang_ms))return {error:'保持時間は整数のmsで指定してください。'};
+    return {reception:config};
+  }
+  function readVfoBasic(card) {
+    const field=key=>card.querySelector(`[data-vfo-field=${key}]`)?.value;
+    const frequency=field('frequency'),bandwidth=field('bandwidth'),mode=field('mode'),format=field('wav-format');
+    if(typeof frequency!=='string'||!frequency.trim()||typeof bandwidth!=='string'||!bandwidth.trim())return {error:'局周波数と復調帯域幅を入力してください。'};
+    const hz=Number(frequency)*1e6,bw=Number(bandwidth)*1000;
+    if(!Number.isFinite(hz)||hz<=0||!Number.isFinite(bw)||bw<=0||!['AM','NFM','WFM'].includes(mode)||!['PCM16','PCM24'].includes(format))return {error:'局周波数・帯域幅・復調方式・WAV形式を確認してください。'};
+    return {patch:{frequency_hz:hz,bandwidth_hz:bw,mode,wav_format:format}};
+  }
+  async function applyVfoSection(card,vfo,section) {
+    const payload=section==='reception'?readVfoReception(card):readVfoBasic(card);if(payload.error){toast(payload.error,'error');return null;}
+    const edit=vfoEditState(vfo.id)[section],generation=edit.generation;
+    const result=await action('update_vfo',{id:vfo.id,patch:section==='reception'?{reception:payload.reception}:payload.patch},{forceVfos:false});
+    if(result){if(edit.generation===generation)edit.dirty=false;renderVfos();toast(edit.dirty?'設定を適用しました。追加の編集値は未適用です':section==='reception'?'受信・音声補助を適用しました':'VFO設定を適用しました');}
+    return result;
+  }
+  function receptionReadout(vfo,running) {
+    const config=receptionConfig(vfo),s=vfo.reception_status || {},available=running===true&&vfo.enabled!==false&&s.available===true&&!connectionError;
+    const route=vfo.wav_recording?vfo.wav_summary?.route:config.wav_audio;
+    const wav=`${vfo.wav_recording?'WAV記録中':'WAV保存'}：${wavRouteLabel(route)}`;
+    if(!available){const reason=connectionError?'アプリとの接続待ち':!running?'受信停止中':vfo.enabled===false?'VFO停止中':s.reason==='gap'?'欠落後の音声待ち':'補助状態の更新待ち';return {available:false,afc:`AFC ${config.afc_enabled?'待機':'手動・補正OFF'} · 補正 — Hz`,rf:'RF — dBFS · SQL —',audio:'ピーク保護 — dB · 過大入力 — samples',state:reason,wav};}
+    const afcNames={disabled:'OFF',qualifying:'判定中',tracking:'追従中',quality_insufficient:'信号不足',out_of_band:'範囲外',reference_outside_usable_band:'帯域端で保留',no_samples:'音声待ち'};
+    const offset=validLevel(s.afc_offset_hz)?`${Number(s.afc_offset_hz)>=0?'+':''}${Number(s.afc_offset_hz).toFixed(1)}`:'—';
+    const afc=`AFC ${config.afc_enabled?(afcNames[s.afc_status] || '判定中'):'手動・補正OFF'} · 補正 ${offset} Hz${config.afc_enabled&&s.afc_locked===true?' · LOCK':''}`;
+    const rf=`RF ${s.rf_available===true?dbText(s.rf_dbfs):'—'} dBFS · SQL ${config.squelch_enabled?(s.squelch_open===true?'開':'閉'):'OFF'}`;
+    const reduction=config.limiter_enabled?`${dbText(s.limiter_reduction_db)} dB`:'OFF';
+    const overload=typeof s.pre_overload_samples==='number'&&Number.isFinite(s.pre_overload_samples)?Math.max(0,s.pre_overload_samples).toLocaleString():'—';
+    return {available:true,afc,rf,audio:`ピーク保護 ${reduction} · 過大入力 ${overload} samples`,state:s.fade_active===true?'境界フェード中':'補助状態を更新中',wav};
+  }
+  function vfoReceptionHtml(vfo) {
+    const c=receptionConfig(vfo),id=escapeHtml(vfo.id);
+    const check=(key,label)=>`<label class="reception-check"><input type="checkbox" data-reception-field="${key}" ${c[key]===true?'checked':''} aria-label="VFO ${id} ${label}">${label}</label>`;
+    const number=(key,label,unit,step='1')=>`<label>${label}<div class="input-unit"><input type="number" step="${step}" min="${receptionLimits[key].low}" max="${receptionLimits[key].high}" required data-reception-field="${key}" value="${escapeHtml(c[key])}" aria-label="VFO ${id} ${label}"><span>${unit}</span></div></label>`;
+    return `<details class="vfo-reception"><summary>受信・音声補助 <span data-vfo-edit-status="reception"></span></summary><div class="reception-fields">${check('afc_enabled','AFC（自動周波数補正）')}${number('afc_max_hz','AFC補正上限','Hz')}${check('squelch_enabled','RFスケルチ')}${number('squelch_dbfs','RFしきい値','dBFS')}${number('squelch_hysteresis_db','ヒステリシス','dB', '0.1')}${number('squelch_hang_ms','保持時間','ms')}${number('audio_gain_db','音声ゲイン','dB','0.1')}${number('limiter_ceiling_dbfs','保護上限','dBFS','0.1')}${check('limiter_enabled','ピーク保護')}${check('click_suppression_enabled','クリック抑制')}<label class="reception-wav">WAV保存経路<select data-reception-field="wav_audio" aria-label="VFO ${id} WAV保存経路"><option value="demod" ${c.wav_audio!=='processed'?'selected':''}>復調音（後処理なし）</option><option value="processed" ${c.wav_audio==='processed'?'selected':''}>聴取処理後</option></select></label><div class="reception-note">AFCは両WAV経路に反映し、受信中心は動かしません。復調音は音声補助の前、聴取処理後は補助設定を反映（スピーカー音量は除外）。RF値・しきい値は常にdBFS。WAV経路・処理条件の変更は録音を分割します。</div><div class="reception-apply"><button class="button" data-vfo-action="reception-apply">補助に適用</button></div></div></details>`;
+  }
+  function vfoCardHtml(v,index) {
+    const id=escapeHtml(v.id);
+    return `<article class="vfo-card" data-vfo="${id}"><header class="vfo-card-header"><div class="vfo-name"><span class="vfo-color" style="background:${colors[index%colors.length]}"></span><strong>VFO ${id}</strong><span class="badge recording" data-vfo-rec hidden>REC</span></div><div class="vfo-header-actions"><button class="vfo-select" data-vfo-action="select">選択</button><button class="vfo-delete" data-vfo-action="delete" aria-label="VFO ${id}を削除">×</button></div></header><div class="vfo-fields"><label>局周波数（名目）<div class="input-unit"><input data-vfo-field="frequency" type="number" step="0.001" aria-label="VFO ${id} 周波数"><span>MHz</span></div></label><label>復調<select data-vfo-field="mode" aria-label="VFO ${id} 復調方式">${['AM','NFM','WFM'].map(mode=>`<option>${mode}</option>`).join('')}</select></label><label>復調帯域幅<div class="input-unit"><input data-vfo-field="bandwidth" type="number" step="0.1" min="0.1" aria-label="VFO ${id} 帯域幅"><span>kHz</span></div></label><label>状態<span class="vfo-state"></span></label></div><div class="vfo-actions"><button class="button" data-vfo-action="apply">適用</button><span class="vfo-edit-status" data-vfo-edit-status="basic"></span><button class="button record" data-vfo-action="record">● WAV</button><button class="button" data-vfo-action="resume" hidden>再開</button><select data-vfo-field="wav-format" aria-label="VFO ${id} WAV形式"><option>PCM16</option><option>PCM24</option></select></div><div class="vfo-reception-readout" aria-live="off"><div data-reception-readout="afc"></div><div data-reception-readout="rf"></div><div data-reception-readout="audio"></div><div data-reception-readout="wav"></div><span data-reception-readout="state"></span></div>${vfoReceptionHtml(v)}<div class="vfo-warning" hidden></div></article>`;
+  }
+  function syncVfoField(card,selector,value,protect,force=false) {
+    const field=card.querySelector(selector);if(!field||protect||(!force&&document.activeElement===field))return;
+    if(field.type==='checkbox')field.checked=value===true;else field.value=String(value);
+  }
+  function renderVfos(force = false) {
+    const vfos=state?.vfos || [],list=$('vfoList');
+    for(const card of list.querySelectorAll('[data-vfo]'))if(!vfos.some(v=>String(v.id)===card.dataset.vfo)){vfoEdits.delete(card.dataset.vfo);card.remove();}
+    if(!vfos.length){list.innerHTML='<div class="vfo-empty">「＋ VFO」で受信する局を追加</div>';return;}
+    list.querySelector('.vfo-empty')?.remove();
+    vfos.forEach((v,index)=>{
+      let card=Array.from(list.querySelectorAll('[data-vfo]')).find(el=>el.dataset.vfo===String(v.id));
+      if(!card){list.insertAdjacentHTML('beforeend',vfoCardHtml(v,index));card=list.lastElementChild;}
+      const edits=vfoEditState(v.id);if(force){edits.basic.dirty=false;edits.reception.dirty=false;}
+      const selected=Boolean(v.selected||String(v.id)===String(state?.selected_vfo_id)),stopped=v.enabled===false,rec=Boolean(v.wav_recording);
+      card.querySelector('.vfo-color').style.background=colors[index%colors.length];
+      card.classList.toggle('selected',selected);card.classList.toggle('stopped',stopped);
+      card.querySelector('.vfo-state').textContent=stopped?'停止':state?.running?'復調中':'待機（有効）';
+      const select=card.querySelector('[data-vfo-action=select]');select.classList.toggle('selected',selected);select.textContent=selected?'選択中':'選択';
+      const record=card.querySelector('[data-vfo-action=record]');record.disabled=!rec&&(stopped||!state?.running);record.textContent=rec?'■ WAV停止':'● WAV';record.classList.toggle('active',rec);
+      card.querySelector('[data-vfo-rec]').hidden=!rec;card.querySelector('[data-vfo-action=resume]').hidden=!stopped;
+      const values={frequency:mhz(v.frequency_hz).toFixed(6),bandwidth:(finite(v.bandwidth_hz)/1000).toFixed(2),mode:v.mode,'wav-format':v.wav_format || 'PCM16'};
+      for(const [key,value] of Object.entries(values))syncVfoField(card,`[data-vfo-field=${key}]`,value,edits.basic.dirty&&!force,force);
+      for(const [key,value] of Object.entries(receptionConfig(v)))if(key in receptionDefaults)syncVfoField(card,`[data-reception-field=${key}]`,value,edits.reception.dirty&&!force,force);
+      for(const section of ['basic','reception'])card.querySelector(`[data-vfo-edit-status=${section}]`).textContent=edits[section].dirty?'未適用':'';
+      const readout=receptionReadout(v,state?.running);for(const key of ['afc','rf','audio','state','wav'])card.querySelector(`[data-reception-readout=${key}]`).textContent=readout[key];
+      card.querySelector('.vfo-reception-readout').classList.toggle('unavailable',!readout.available);
+      const warning=card.querySelector('.vfo-warning');warning.hidden=!v.stopped_reason;warning.textContent=v.stopped_reason || '';
+    });
   }
   async function vfoAction(event) {
-    const button = event.target.closest('[data-vfo-action]'); if (!button) return;
-    const card=button.closest('[data-vfo]'), key=card.dataset.vfo;
-    const vfo=state?.vfos?.find(v=>String(v.id)===key); if (!vfo) return;
+    const button=event.target.closest('[data-vfo-action]');if(!button)return;
+    const card=button.closest('[data-vfo]'),vfo=state?.vfos?.find(v=>String(v.id)===card.dataset.vfo);if(!vfo)return;
     const id=vfo.id;
     if(button.dataset.vfoAction!=='select'&&selectedUserMarker()&&!await selectUserMarker(null,{focus:false}))return;
-    switch(button.dataset.vfoAction) {
-      case 'select': flushAudio(); await activateVfo(id); break;
-      case 'delete': if (!vfo.wav_recording || confirm(`VFO ${id} の録音を終了して削除しますか？`)) await action('delete_vfo',{id}); break;
-      case 'resume': await action('resume_vfo',{id}); break;
-      case 'apply': {
-        const patch={frequency_hz: Number(card.querySelector('[data-vfo-field=frequency]').value)*1e6,bandwidth_hz:Number(card.querySelector('[data-vfo-field=bandwidth]').value)*1000,mode:card.querySelector('[data-vfo-field=mode]').value,wav_format:card.querySelector('[data-vfo-field=wav-format]').value};
-        await action('update_vfo',{id,patch}); break;
-      }
-      case 'record': {
-        if(vfo.wav_recording) await action('wav_stop',{id});
-        else { const r=await action('update_vfo',{id,patch:{wav_format:card.querySelector('[data-vfo-field=wav-format]').value}}); if(r) await action('wav_start',{id}); }
+    switch(button.dataset.vfoAction){
+      case 'select':flushAudio();await activateVfo(id);break;
+      case 'delete':if(!vfo.wav_recording||confirm(`VFO ${id} の録音を終了して削除しますか？`))await action('delete_vfo',{id});break;
+      case 'resume':await action('resume_vfo',{id});break;
+      case 'apply':await applyVfoSection(card,vfo,'basic');break;
+      case 'reception-apply':await applyVfoSection(card,vfo,'reception');break;
+      case 'record':
+        if(vfo.wav_recording)await action('wav_stop',{id});
+        else if(vfoEditState(id).basic.dirty||vfoEditState(id).reception.dirty)toast('未適用のVFO設定があります。各「適用」を押してからWAV保存を開始してください。','warning');
+        else await action('wav_start',{id});
         break;
-      }
     }
   }
 
@@ -559,15 +643,34 @@
     $(id).addEventListener('keydown',event=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key))return;event.preventDefault();const plus=['ArrowRight','ArrowDown'].includes(event.key)?1:-1;if(kind==='spectrum')applyLayout({spectrum_ratio:layout.spectrum_ratio+plus*.025});if(kind==='sidebar')applyLayout({vfo_width:layout.vfo_width-plus*10});if(kind==='bottom')applyLayout({bottom_ratio:layout.bottom_ratio+plus*.025});action('set_layout',{layout:{...layout}});});
   }
 
-  function flushAudio(){for(const source of audioSources){try{source.stop();}catch{}}audioSources=[];audioNextTime=0;}
+  function flushAudio(){
+    const sources=audioSources,stream=audioStreamGain,now=audioContext?.currentTime ?? 0,end=now+.004;
+    audioEpoch++;audioSources=[];audioStreamGain=null;audioNextTime=0;audioRemoteEpoch=null;
+    if(stream&&audioContext){try{stream.gain.cancelScheduledValues(now);stream.gain.setValueAtTime(stream.gain.value,now);stream.gain.linearRampToValueAtTime(0,end);}catch{}}
+    for(const source of sources){try{source.stop(stream&&audioContext?end+.001:undefined);}catch{}}
+    if(stream)setTimeout(()=>{try{stream.disconnect();}catch{}},20);
+  }
   function updateAudioCaption(){const v=selectedVfo();asText('audioStatus',audioEnabled?(v?`VFO ${v.id} · ${v.mode} · ${mhz(v.frequency_hz).toFixed(4)} MHz${performance.now()-audioReceivedAt>2000?' · 音声待ち':''}`:'聴取するVFOを選択してください'):'選択中の1局だけをスピーカーへ出力');}
   async function toggleAudio(){
     if(!audioEnabled){try{audioContext ||= new (window.AudioContext||window.webkitAudioContext)();if(!audioGain){audioGain=audioContext.createGain();audioGain.gain.value=num('volume');audioGain.connect(audioContext.destination);}await audioContext.resume();audioEnabled=true;audioSequence=0;}catch(error){toast(`音声を開始できません：${error.message}`,'error');return;}}
     else{audioEnabled=false;flushAudio();}
     $('audioButton').textContent=audioEnabled?'🔊 音声ON':'🔈 音声OFF';$('audioButton').classList.toggle('active',audioEnabled);$('audioButton').setAttribute('aria-pressed',String(audioEnabled));updateAudioCaption();
   }
-  function playPcm(data){if(!audioEnabled||!audioContext||!data.data_b64)return;const bytes=decodedBytes(data.data_b64),n=Math.floor(bytes.length/2);if(!n)return;const sr=finite(data.sample_rate,32000),buffer=audioContext.createBuffer(1,n,sr),out=buffer.getChannelData(0),view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);for(let k=0;k<n;k++)out[k]=view.getInt16(k*2,true)/32768;
-    if(audioNextTime-audioContext.currentTime>.6)flushAudio();audioNextTime=Math.max(audioNextTime,audioContext.currentTime+.025);const source=audioContext.createBufferSource();source.buffer=buffer;source.connect(audioGain);source.start(audioNextTime);audioNextTime+=n/sr;audioSources.push(source);source.onended=()=>{audioSources=audioSources.filter(s=>s!==source);};audioReceivedAt=performance.now();updateAudioCaption();}
+  function playPcm(data){
+    if(!audioEnabled||!audioContext||!audioPacketMatchesState(data))return;
+    const remoteEpoch=data.epoch;if(remoteEpoch!==undefined&&remoteEpoch!==null){if(audioRemoteEpoch!==null&&remoteEpoch!==audioRemoteEpoch)flushAudio();audioRemoteEpoch=remoteEpoch;}
+    if(!data.data_b64)return;
+    const bytes=decodedBytes(data.data_b64),n=Math.floor(bytes.length/2);if(!n)return;
+    const sr=Number(data.sample_rate ?? 32000);if(!Number.isFinite(sr)||sr<=0)return;
+    const now=audioContext.currentTime;if(audioNextTime-now>.6)flushAudio();
+    const rebuffer=!audioStreamGain||audioNextTime<=now;
+    if(!audioStreamGain){audioStreamGain=audioContext.createGain();audioStreamGain.gain.value=0;audioStreamGain.connect(audioGain);}
+    if(rebuffer)audioNextTime=now+.025;
+    if(rebuffer){audioStreamGain.gain.setValueAtTime(0,audioNextTime);audioStreamGain.gain.linearRampToValueAtTime(1,audioNextTime+.004);}
+    const buffer=audioContext.createBuffer(1,n,sr),out=buffer.getChannelData(0),view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+    for(let k=0;k<n;k++)out[k]=view.getInt16(k*2,true)/32768;
+    const source=audioContext.createBufferSource();source.buffer=buffer;source.connect(audioStreamGain);source.start(audioNextTime);audioNextTime+=n/sr;audioSources.push(source);source.onended=()=>{audioSources=audioSources.filter(s=>s!==source);};audioReceivedAt=performance.now();updateAudioCaption();
+  }
 
   function showSettings(tab='receiver'){activateTab(tab);if(!$('settingsDialog').open)$('settingsDialog').showModal();if(tab==='presets')refreshFiles();}
   function activateTab(tab){document.querySelectorAll('[data-tab]').forEach(el=>{const active=el.dataset.tab===tab;el.classList.toggle('active',active);el.setAttribute('aria-selected',String(active));});document.querySelectorAll('[data-tab-panel]').forEach(el=>el.hidden=el.dataset.tabPanel!==tab);}
@@ -635,9 +738,10 @@
   $('waterfallRowSeconds').addEventListener('change',()=>action('set_analysis',{analysis:{waterfall_row_seconds:num('waterfallRowSeconds')}}));
   $('addVfoButton').addEventListener('click',()=>action('add_vfo',{vfo:{frequency_hz:finite(state?.input?.center_hz,32000000),mode:'WFM',bandwidth_hz:200000}}));
   $('vfoList').addEventListener('click',vfoAction);
+  $('vfoList').addEventListener('input',markVfoEdited);
   $('vfoList').addEventListener('focusin',event=>{if(event.target.matches('input,select')&&selectedUserMarker())selectUserMarker(null,{focus:false});});
-  $('vfoList').addEventListener('change',event=>{if(event.target.dataset.vfoField==='mode'){const card=event.target.closest('.vfo-card');card.querySelector('[data-vfo-field=bandwidth]').value={AM:10,NFM:12.5,WFM:200}[event.target.value];}});
-  $('vfoList').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target.matches('input')){event.preventDefault();event.target.closest('.vfo-card').querySelector('[data-vfo-action=apply]').click();}});
+  $('vfoList').addEventListener('change',event=>{markVfoEdited(event);if(event.target.dataset.vfoField==='mode'){const card=event.target.closest('.vfo-card');card.querySelector('[data-vfo-field=bandwidth]').value={AM:10,NFM:12.5,WFM:200}[event.target.value];}});
+  $('vfoList').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target.matches('input')){event.preventDefault();event.target.closest('.vfo-card').querySelector(event.target.dataset.receptionField?'[data-vfo-action=reception-apply]':'[data-vfo-action=apply]').click();}});
   $('audioButton').addEventListener('click',toggleAudio);$('volume').addEventListener('input',()=>{if(audioGain)audioGain.gain.setTargetAtTime(num('volume'),audioContext.currentTime,.02);});
   $('iqButton').addEventListener('click',()=>action(state?.recording?.iq_active?'iq_stop':'iq_start'));
   $('armButton').addEventListener('click',()=>action(state?.trigger?.armed?'disarm':'arm'));
@@ -688,7 +792,7 @@
   window.addEventListener('resize',()=>requestAnimationFrame(drawAll));
   try{const saved=JSON.parse(localStorage.getItem('spectrum-studio-layout'));if(saved)applyLayout(saved,false);}catch{}
 
-  async function refreshState(force=false,fromAction=false){const epoch=stateEpoch;try{const next=await getJson('/api/state');if(fromAction||(epoch===stateEpoch&&!actionInFlight))applyState(next,force);}catch(error){if(epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;}$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
+  async function refreshState(force=false,fromAction=false){const epoch=stateEpoch;try{const next=await getJson('/api/state');if(fromAction||(epoch===stateEpoch&&!actionInFlight))applyState(next,force);}catch(error){if(epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;flushAudio();renderVfos();}$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
   async function stateLoop(){await refreshState();setTimeout(stateLoop,1000);}
   function requestFrame(){clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}frameTimer=setTimeout(frameLoop,0);}
   async function frameLoop(){
@@ -697,6 +801,6 @@
     catch{if(epoch!==frameEpoch)return;frameFailures++;if(frameFailures===3&&state?.running&&!connectionError&&!state?.device?.error)notice('解析表示を更新できません。再接続を待っています。','error');}
     finally{framePending=false;const delay=frameRefreshRequested?0:!state?.running?1000:document.hidden?500:125;frameRefreshRequested=false;frameTimer=setTimeout(frameLoop,delay);}
   }
-  async function audioLoop(){if(audioEnabled&&state?.running){try{const data=await getJson(`/api/audio?after=${audioSequence}`);if(finite(data.sequence)<audioSequence)audioSequence=0;if(data.data_b64){playPcm(data);audioSequence=finite(data.sequence,audioSequence);}}catch{}}setTimeout(audioLoop,90);}
+  async function audioLoop(){if(audioEnabled&&state?.running&&!connectionError){const epoch=audioEpoch;try{const data=await getJson(`/api/audio?after=${audioSequence}`);if(epoch===audioEpoch&&audioEnabled&&state?.running&&!connectionError&&audioPacketMatchesState(data)){if(finite(data.sequence)<audioSequence)audioSequence=0;playPcm(data);if(data.data_b64)audioSequence=finite(data.sequence,audioSequence);}}catch{}}setTimeout(audioLoop,90);}
   updateFftVisibility();drawAll();stateLoop();frameLoop();audioLoop();
 })();

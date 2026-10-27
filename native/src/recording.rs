@@ -410,6 +410,7 @@ pub struct WavRecorder {
     pub segment_index: u64,
     pub segments: Vec<Value>,
     pub condition_metadata: Value,
+    pub processing_summary: Value,
     width: u16,
     writer: Option<hound::WavWriter<BufWriter<File>>>,
     started_at: DateTime<Utc>,
@@ -423,13 +424,14 @@ impl WavRecorder {
         Ok(Self {output_dir:output_dir.as_ref().to_path_buf(),vfo_id:vfo_id.into(),audio_rate,format,max_bytes:0xFFFF_FF00,
             active:false,limit_reached:false,last_error:None,stop_reason:None,path:None,meta_path:None,
             samples_written:0,bytes_written:0,clipped_samples:0,segment_index:0,segments:vec![],
-            condition_metadata:json!({}),width,writer:None,started_at:Utc::now(),meta_owned:false})
+            condition_metadata:json!({}),processing_summary:json!({}),width,writer:None,started_at:Utc::now(),meta_owned:false})
     }
     pub fn summary(&self) -> Value {
         json!({"path":self.path,"meta_path":self.meta_path,"vfo_id":self.vfo_id,"format":self.format,
             "audio_rate":self.audio_rate,"samples":self.samples_written,"bytes":self.bytes_written,
             "duration_seconds":self.samples_written as f64/self.audio_rate as f64,"clipped_samples":self.clipped_samples,
             "segment_index":self.segment_index,"conditions":self.condition_metadata,"active":self.active,
+            "route":self.condition_metadata["wav_audio"],"processing_summary":self.processing_summary,
             "stop_reason":self.stop_reason,"error":self.last_error,"limit_reached":self.limit_reached,
             "started_at_utc":self.started_at.to_rfc3339_opts(SecondsFormat::Micros,true)})
     }
@@ -444,6 +446,9 @@ impl WavRecorder {
         let spec = hound::WavSpec {channels:1,sample_rate:self.audio_rate,bits_per_sample:self.width*8,sample_format:hound::SampleFormat::Int};
         self.writer = Some(hound::WavWriter::new(BufWriter::new(file),spec).map_err(|e| e.to_string())?);
         self.condition_metadata = conditions; self.active = true; self.meta_owned = false;
+        self.processing_summary=json!({"observation_scope":"DSP blocks presented to this WAV segment; the final capacity/error block may contain more observed than accepted audio samples",
+            "afc_observation":"Correction at the end of each presented DSP block; min/max exclude within-block extrema",
+            "rf_observation":"Filtered channel mean power for each presented DSP block; uncalibrated dBFS"});
         self.samples_written = 0; self.bytes_written = 0; self.clipped_samples = 0;
         self.last_error = None; self.stop_reason = None; self.limit_reached = false; self.started_at = Utc::now();
         if let Err(error) = atomic_json(self.meta_path.as_ref().unwrap(),&self.summary(),true) {
@@ -451,6 +456,25 @@ impl WavRecorder {
         }
         self.meta_owned = true;
         Ok(self.summary())
+    }
+    /// Counters describe the DSP blocks presented to this segment, separately
+    /// from samples_written, which is the actual accepted PCM sample count.
+    pub fn observe_processing(&mut self, observation:&Value) {
+        if !self.active{return;}
+        for key in ["observed_blocks","source_complex_samples","observed_audio_samples","raw_adc_rail_components",
+            "demod_overrange_samples","pre_overload_samples","limited_samples","muted_samples","invalid_samples","boundary_repairs","gap_count"] {
+            if let Some(value)=observation[key].as_u64(){let old=self.processing_summary[key].as_u64().unwrap_or(0);
+                self.processing_summary[key]=json!(old.saturating_add(value));}
+        }
+        for key in ["afc_offset_hz","rf_dbfs"] {
+            if let Some(value)=observation[key].as_f64().filter(|v|v.is_finite()) {
+                let low=format!("{key}_min");let high=format!("{key}_max");
+                let minimum=self.processing_summary[&low].as_f64().unwrap_or(value).min(value);
+                let maximum=self.processing_summary[&high].as_f64().unwrap_or(value).max(value);
+                self.processing_summary[&low]=json!(minimum);self.processing_summary[&high]=json!(maximum);
+                self.processing_summary[key]=json!(value);
+            }
+        }
     }
     pub fn write(&mut self, audio: &[f32]) -> Result<usize,String> {
         if !self.active || audio.is_empty() { return Ok(0); }
@@ -584,6 +608,23 @@ mod tests {
         }
         let mut r=WavRecorder::new(&path,"limited",32000,"PCM16").unwrap();r.max_bytes=6;r.start(json!({})).unwrap();
         assert_eq!(r.write(&[0.0;10]).unwrap(),3);assert!(!r.active&&r.limit_reached);
+    }
+    #[test]
+    fn wav_processing_observations_are_segment_scoped_and_separate_from_accepted_samples(){
+        let path=dir();let mut r=WavRecorder::new(&path,"processing",32000,"PCM16").unwrap();
+        r.start(json!({"wav_audio":"demod","reception":{"audio_gain_db":0.0}})).unwrap();
+        r.observe_processing(&json!({"observed_blocks":1,"observed_audio_samples":2,"pre_overload_samples":1,"limited_samples":1,"afc_offset_hz":12.0,"rf_dbfs":-50.0}));
+        r.write(&[0.1,-0.1]).unwrap();let first_meta=r.meta_path.clone().unwrap();
+        r.split(json!({"wav_audio":"processed","reception":{"audio_gain_db":6.0}})).unwrap();
+        let first:Value=serde_json::from_slice(&fs::read(first_meta).unwrap()).unwrap();
+        assert_eq!(first["samples"],2);assert_eq!(first["processing_summary"]["pre_overload_samples"],1);assert_eq!(first["route"],"demod");
+        assert!(r.processing_summary.get("observed_audio_samples").is_none());assert_eq!(r.summary()["route"],"processed");
+        r.max_bytes=6;r.observe_processing(&json!({"observed_blocks":1,"observed_audio_samples":10,"pre_overload_samples":8,"limited_samples":8,"afc_offset_hz":-5.0,"rf_dbfs":-40.0}));
+        assert_eq!(r.write(&[0.25;10]).unwrap(),3);assert!(!r.active);assert_eq!(r.samples_written,3);
+        let last:Value=serde_json::from_slice(&fs::read(r.meta_path.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(last["processing_summary"]["observed_audio_samples"],10);assert_eq!(last["processing_summary"]["pre_overload_samples"],8);
+        assert_eq!(last["processing_summary"]["afc_offset_hz_min"],-5.0);assert_eq!(last["processing_summary"]["afc_offset_hz_max"],-5.0);
+        assert!(last["processing_summary"]["observation_scope"].as_str().unwrap().contains("more observed than accepted"));
     }
     #[test]
     fn invalid_capacity_and_destination_are_rejected(){

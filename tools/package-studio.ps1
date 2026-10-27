@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$BinaryPath,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBinarySha256,
-    [string]$PackageVersion = '0.2.2-dev',
+    [string]$PackageVersion = '0.3.0-dev',
     [string]$OutputParent,
     [string]$PresetPath,
     [string]$RuntimeDllPath,
@@ -155,6 +155,9 @@ Windows 10/11 x64 と通常のブラウザーを使用する。Rust/Python/Node/
 再生・スピーカー・持出先PCの実機動作は、それぞれのPCでの確認が必要。
 Spectrumの「ピークリセット」でMax／Min／Averageの履歴を同時にリセットし、現在のLiveから再集計する。受信・録音は継続し、入力条件・密度・Waterfall・Marker位置は維持する。
 Densityの上限・下限は同パネルで手動設定できる。新しい範囲では密度だけを再集計し、Spectrumの保持値やWaterfall・受信は維持する。
+VFOの「受信・音声補助」でAFC、RFスケルチ、音声ゲイン、ピーク保護、クリック抑制、WAV経路を設定する。AFC／スケルチは初期OFF。AFCをOFFに戻すと補正0になり、名目局周波数で受信する。
+WAVの既定は「復調音（後処理なし）」で、AFC／帯域フィルターは適用される。「聴取処理後」を選ぶとスケルチ／音声ゲイン／保護を含めて保存する。条件変更中のWAVは分割し、経路と処理統計を記録する。
+音声補助は原IQや未補正Spectrum／測定を変更しない。AFCは局の微小な周波数補正で、受信中心のDCを除去する処理ではない。音声ピーク保護はsample振幅の保護で、true-peak規格の保証ではない。
 0.2.0の代表GUIと0.2.1のピークリセットは同じ開発PCで確認済み。今回のDensity操作、クリーンな別PC、屋外ノートPCでの実受信は別途確認する。これはdev版の検証候補です。
 
 `package-manifest.json` と `package-validation.json` に同梱物と検査結果を保存する。
