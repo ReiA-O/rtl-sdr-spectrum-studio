@@ -1,3 +1,9 @@
 * text=auto eol=lf
 *.cmd text eol=crlf
 /demo/demo_afg_fm_32mhz.sigmf-data binary
+
+# These signed demo sidecars must retain their exact manifest bytes.
+/demo/demo_afg_fm_32mhz.sigmf-meta -text
+/demo/AFG_FM_32MHz_demo.json -text
+/demo/README.md -text
+/demo/manifest.json -text

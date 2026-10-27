@@ -71,3 +71,5 @@ PE依存・x64・承認バイナリーSHA256・driver原ZIPとの一致・ZIP全
 ## 4. 別工程の確認
 
 `--self-check`でルート検出、DLL読み込み、内蔵UIを確認できます。受信・サーバー・録音を開始しません。結果はパッケージ外へ保存し、完成ZIPのhashを保ちます。実画面・音声・別PC・屋外受信は、それぞれ別に確認してください。
+
+デモの固定4ファイルとmanifestはバイト列で検査します。Git取得時もmanifestと一致するよう、IQはbinary、同梱metadata・preset・README・manifestは固定pathの-text属性で改行変換を抑止します。通常sourceの改行方針は維持します。
