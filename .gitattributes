@@ -2,8 +2,8 @@
 *.cmd text eol=crlf
 /demo/demo_afg_fm_32mhz.sigmf-data binary
 
-# These signed demo sidecars must retain their exact manifest bytes.
-/demo/demo_afg_fm_32mhz.sigmf-meta -text
-/demo/AFG_FM_32MHz_demo.json -text
-/demo/README.md -text
-/demo/manifest.json -text
+# These hash-checked demo sidecars must retain their exact manifest bytes.
+/demo/demo_afg_fm_32mhz.sigmf-meta -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+/demo/AFG_FM_32MHz_demo.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+/demo/README.md -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+/demo/manifest.json -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
