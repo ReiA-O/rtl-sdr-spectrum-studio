@@ -2,21 +2,27 @@
 
 RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観測を行うWindows向け開発版です。Rust本体がローカルHTTPサーバーを動かし、exeに内蔵した画面を通常のブラウザーへ表示します。Pythonは数値比較・単体テスト用の参照実装で、アプリの実行には使いません。
 
+v0.4.0は、帯域を決めてピークを選び、VFOで復調し、対象局を含む原IQを保存する導線を中心にしています。受信用の中心DC補正を既定ONで追加しました。最終配布物で設定境界・API・50Ω終端の受信・DEMOの画面操作を確認しました。条件と未検証部分は [VALIDATION.md](docs/VALIDATION.md) に記載しています。
+
 現在はレビュー用のソース一式です。公開・販売向けのライセンス選定や製品全体の受入れ完了を意味しません。[LICENSE.md](LICENSE.md) と [検証範囲](docs/VALIDATION.md) を先に確認してください。
 
 ## 主な機能
 
 - Spectrum・密度表示・Waterfall・複数VFOを同時表示。共通FFTから全有効フレームを集計します。
 - AM/NFM/WFMモノラル復調、選択VFOだけのスピーカー出力、VFO別WAV録音。
+- 中心DC補正は手動ON/OFF。独立I/Qの公称20 Hz一極追従減算を、表示・ピーク検索・測定・トリガ・復調の共通経路へ適用します。原IQは未補正のまま保存します。
+- 自動／ユーザーマーカーのピークを選んで、選択VFOをその周波数へ同調できます。受信中心は自動変更せず、有効帯域外の同調を拒否します。
 - VFOごとの任意AFC（初期OFF）、RFスケルチ、音声ゲイン・sampleピーク保護・既知不連続のクリック抑制。AFCは手動でOFFへ戻せ、名目局周波数と受信中心を保持します。
-- WAVは復調音（後処理なし、既定）／聴取処理後を選択。AFC・同調フィルターは両方へ反映し、原IQや未補正PSDは変更しません。
+- WAVは復調音（音声補助前、既定）／聴取処理後を選択。中心DC補正・AFC・同調フィルターは両方へ反映し、スケルチ・音声ゲイン等は処理後経路へ反映します。
 - 中心周波数・Span・RBW/FFT・Ref Level・Rangeの調整、TraceとPersistence、測定用プリセット。
 - Spectrumの「ピークリセット」でMax／Min／Averageを同時にリセットし、受信や録音を続けたまま現在のLiveから再集計。
 - Densityの上限・下限を手動設定。Spectrumの表示範囲から独立し、密度履歴だけを新範囲で再集計。
 - 自動ピークマーカーとユーザーマーカー、Channel Power、測定帯域内のOBW。
 - 生IQの手動保存、レベルトリガ、秒単位のプリ／ポストトリガ、保存IQの再生。
 
-VFOの「受信・音声補助」を開き、AFC等を変更して「補助に適用」を押します。AFCのチェックを外して再適用すると、補正量を0へ戻して名目周波数で受信します。測定用PSDと原IQはこの操作で変わりません。
+「中心DC補正」は受信中心の実信号にも影響します。とくにAM局を中心に置くと実際の搬送波まで抑えて包絡復調が崩れる場合があります。OFFで比較するか、受信中心を局の周波数からずらし、VFOを局へ合わせてください。RF感度やS/Nを改善する機能ではありません。Arm・IQ保存・WAV録音中の切替は拒否します。補正適用中のレベルは相対表示で、絶対レベル校正表示を無効化します。[処理式・再利用API](docs/FRONTEND.md) に実装と制約をまとめています。
+
+VFOの「受信・音声補助」を開き、AFC等を変更して「補助に適用」を押します。AFCのチェックを外して再適用すると、補正量を0へ戻して名目周波数で受信します。AFC自体は測定用PSDと原IQを変更しません。中心DC補正とは独立した機能です。
 
 詳しい動作と制約は [SPEC.md](docs/SPEC.md) にあります。密度表示はソフトウェアのFFT集計であり、専用測定器の捕捉率・測定精度と同等という意味ではありません。
 
@@ -52,15 +58,25 @@ native\target\release\rtl-spectrum-studio.exe --self-check --project-dir .
 cargo test --manifest-path native\Cargo.toml --all-targets
 node tests\ui-static-boundaries.cjs
 node tests\ui-reception-boundaries.cjs
+node --test tests\frontend-ui.test.cjs
 # Python参照テストを使う場合だけNumPyが必要
 python -m unittest discover -s tests -v
 ```
 
-JavaScriptテストはブラウザー・ネットワーク・実機を使わない既存29項目と受信・音声補助20項目の状態遷移テストです。Rustはlibrary78＋main4＝82項目の全対象実行と、その後追加した保存先失敗1項目の個別実行に成功しています。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。
+v0.4.0はRust108件・JavaScript66件が合格しました。JavaScriptはブラウザー・ネットワーク・実機を使わない状態遷移テストで、中心補正の表示、録音中のロック、旧frame棄却、ピーク選局も含みます。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。数値境界と製品API・実機・GUIの結果は [VALIDATION.md](docs/VALIDATION.md) で区別します。
+
+再現用の数値probeは次のように実行します。`<新規出力フォルダー>`は毎回異なる名前へ置き換え、Git対象外の`verification/`または`data/`内を使ってください。JSONに加えてPCM検査用の小さなWAVも作成します。同名JSONは上書きせず失敗するため、既存の結果がある場所へ再実行しないでください。DLL・サーバー・実機を操作しない合成IQの検査です。
+
+```powershell
+cargo run --release --manifest-path native/Cargo.toml --example electrical_boundaries -- <新規出力フォルダー>/result.json
+```
+
+PowerShellでは、例えば出力先を`verification/electrical-probe-001/result.json`のような新規名に置き換えて実行します。
 
 ## 構成
 
 - `native/`: Rustの受信・解析・録音・設定・HTTP本体とテスト。
+- `native/examples/electrical_boundaries.rs`: 合成IQによるDSP数値境界の再現用probe。結果JSONとPCM検査用WAVはソースへ追加しません。
 - `web/`: exeへ内蔵する画面。
 - `studio/`, `tests/`: 数値参照用Pythonと単体テスト、JavaScriptの状態境界テスト。
 - `presets/`: 個人情報を含まない測定用プリセット。

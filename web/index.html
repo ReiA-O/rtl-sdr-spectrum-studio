@@ -40,6 +40,12 @@
       <span id="gainActual" class="muted small-text">実効値 —</span>
       <span id="lockIndicator" class="lock-label" hidden>入力ロック中</span>
     </div>
+    <div class="frontend-controls" aria-label="中心スプリアスの受信補正">
+      <label class="check-inline"><input id="dcRejectEnabled" type="checkbox" disabled aria-describedby="frontendDescription frontendLockReason" aria-busy="false">中心DC補正</label>
+      <span id="frontendStatus" class="frontend-status">中心DC補正：状態未取得</span>
+      <span id="frontendDescription" class="frontend-description">中心付近の実信号にも影響します（20 Hz）。中心AM局はOFF比較／中心をずらして受信。原IQは未補正保存。</span>
+      <span id="frontendLockReason" class="frontend-lock-reason" role="status" hidden></span>
+    </div>
   </section>
 
   <div id="noticeBar" class="notice-bar" role="status" hidden><span id="noticeText"></span><button id="noticeDismiss" aria-label="通知を閉じる">×</button></div>
@@ -52,7 +58,7 @@
         <div class="user-marker-toolbar" aria-label="独立ユーザMarker">
           <div class="user-marker-controls"><button id="addUserMarkerButton" class="button mini">＋ ユーザMarker</button><div id="userMarkerList" class="user-marker-list" aria-label="ユーザMarkerを選択"><span class="muted">自動ピーク A / ユーザ U</span></div><button id="userMarkerDeselect" class="text-button" disabled>選択解除</button></div>
           <div id="userMarkerReadout" class="user-marker-readout"><strong id="userMarkerName">U 未選択</strong><span id="userMarkerFrequency">周波数 — MHz</span><span id="userMarkerLevel">レベル — dBFS</span><span id="userMarkerOffset">中心から Δf — kHz</span><span id="userMarkerStatus" class="muted">追加して配置できます</span></div>
-          <div class="user-marker-peak-controls"><button id="userMarkerPeakLeft" class="button mini" disabled>← Peak</button><button id="userMarkerPeakRight" class="button mini" disabled>Peak →</button><button id="userMarkerPeakMax" class="button mini" disabled>最大Peak</button><button id="userMarkerDelete" class="text-button" disabled>削除</button></div>
+          <div class="user-marker-peak-controls"><button id="userMarkerPeakLeft" class="button mini" disabled>← Peak</button><button id="userMarkerPeakRight" class="button mini" disabled>Peak →</button><button id="userMarkerPeakMax" class="button mini" disabled>最大Peak</button><button id="userMarkerTuneButton" class="button mini" disabled title="この周波数へ選択中VFOを同調">選局</button><button id="userMarkerDelete" class="text-button" disabled>削除</button></div>
         </div>
         <div class="plot-wrap spectrum-wrap"><canvas id="spectrumCanvas" tabindex="0" role="img" aria-label="スペクトラム。ユーザMarker選択中はクリックで配置、左右キーで隣のピークへ。VFOの選択ボタンでVFO操作へ戻ります。ShiftクリックでユーザMarker追加"></canvas><div id="spectrumEmpty" class="empty-plot"><span class="empty-symbol">⌁</span><strong>信号を待っています</strong><span>受信開始、または保存したIQを開いてください</span></div><div id="cursorReadout" class="cursor-readout" hidden></div><div id="markerReadout" class="marker-readout"></div></div>
         <div class="plot-hint"><span id="plotModeHint">VFO：ドラッグ / ホイール / ← →　帯域幅：端をドラッグ</span><span id="spanReadout">—</span></div>

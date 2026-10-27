@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$BinaryPath,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBinarySha256,
-    [string]$PackageVersion = '0.3.0-dev',
+    [string]$PackageVersion = '0.4.0-dev',
     [string]$OutputParent,
     [string]$PresetPath,
     [string]$RuntimeDllPath,
@@ -142,7 +142,7 @@ $guide=@'
 Windows 10/11 x64 と通常のブラウザーを使用する。Rust/Python/Node/Build Toolsの追加は不要。
 設定・プリセットは `data/settings/`、新しいIQ/WAVは `data/recordings/` に保存する。
 起動時に受信・Arm・IQ/WAV録音を自動開始しない。実機、アンテナ、受信環境を選んで使用する。
-測定最適化プリセットを初期値に同梱。32.256 MHz / 2.048 MS/s / RF gain 20.7 dB、Span 900 kHz、Ref -55 dBFS、Range 30 dB、Hann ENBW 750 Hz は実験時の値で、屋外受信の万能設定ではない。
+測定用プリセットを初期値に同梱。32.256 MHz / 2.048 MS/s / RF gain 20.7 dB、Span 900 kHz、Ref -55 dBFS、Range 30 dB は一つの実験条件で、屋外受信の万能設定ではない。実効RBW／ENBWは画面で確認する。
 
 持出先PCでは RTL-SDR Interface 0 用 WinUSB ドライバーが別途必要。USBドライバーの導入・変更はこのアプリでは自動実行しない。
 公式手順: https://www.rtl-sdr.com/rtl-sdr-quick-start-guide/
@@ -157,8 +157,12 @@ Spectrumの「ピークリセット」でMax／Min／Averageの履歴を同時�
 Densityの上限・下限は同パネルで手動設定できる。新しい範囲では密度だけを再集計し、Spectrumの保持値やWaterfall・受信は維持する。
 VFOの「受信・音声補助」でAFC、RFスケルチ、音声ゲイン、ピーク保護、クリック抑制、WAV経路を設定する。AFC／スケルチは初期OFF。AFCをOFFに戻すと補正0になり、名目局周波数で受信する。
 WAVの既定は「復調音（後処理なし）」で、AFC／帯域フィルターは適用される。「聴取処理後」を選ぶとスケルチ／音声ゲイン／保護を含めて保存する。条件変更中のWAVは分割し、経路と処理統計を記録する。
-音声補助は原IQや未補正Spectrum／測定を変更しない。AFCは局の微小な周波数補正で、受信中心のDCを除去する処理ではない。音声ピーク保護はsample振幅の保護で、true-peak規格の保証ではない。
-0.2.0の代表GUIと0.2.1のピークリセットは同じ開発PCで確認済み。今回のDensity操作、クリーンな別PC、屋外ノートPCでの実受信は別途確認する。これはdev版の検証候補です。
+音声補助とAFC自体は原IQやSpectrum／測定を変更しない。音声ピーク保護はsample振幅の保護で、true-peak規格の保証ではない。
+v0.4.0の中心DC補正は既定ON、手動OFF。公称20 Hz一極追従減算を表示・ピーク・測定・トリガ・復調の共通経路へ適用する。中心の実信号にも影響し、適用中は絶対レベル校正表示を使えない。原IQは未補正で保存し、WAVには復調経路の補正が反映される。
+とくに中心AM局は実搬送波が抑えられ、包絡復調が崩れる場合がある。OFF比較か、受信中心を局からずらしてVFOで合わせる運用を使う。RF感度やS/Nを改善する機能ではない。
+Arm・IQ保存・WAV録音中は中心DC補正の切替を拒否する。切替時は保持Trace・密度・Waterfall・音声を初期化する。Direct Samplingは適用外。保存IQの再生開始・シークでは補正状態を再初期化する。
+自動／ユーザーマーカーのピークから選択VFOへ同調できる。受信中心は自動で動かさず、有効帯域外や未適用のVFO編集がある状態では同調を保留する。
+v0.4.0は同じ開発PCで設定境界・保存IQ API・50Ω終端の有限受信・DEMO実GUI・ZIP／自己診断を確認済み。各版の条件はリポジトリのdocs/VALIDATION.mdを参照する。実RF全域・感度／SFDR／alias／AGC実応答、クリーンな別PC、屋外ノートPC、長時間運転・聴取品質は未検証。このZIPはdev版です。
 
 `package-manifest.json` と `package-validation.json` に同梱物と検査結果を保存する。
 本体の画面はexeに内蔵し、外部サーバーからUI資産を取得しない。

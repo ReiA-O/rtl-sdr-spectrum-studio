@@ -17,6 +17,7 @@
   let extraConditions = [], seenNotifications = new Set(), tuningTimer = null, frameFailures = 0, lastDeviceError = null;
   let frameTimer = null, framePending = false, frameRefreshRequested = false, frameEpoch = 0, traceResetsPending = 0;
   let actionQueue = Promise.resolve(), stateEpoch = 0;
+  let frontendChanging = false, frontendPendingValue = null;
   let userSelectionIntent, userSelectionGeneration = 0, userSelectionPending = false, userSelectionPromise = Promise.resolve(true);
   let vfoSelectionIntent, vfoSelectionGeneration = 0, vfoSelectionPromise = Promise.resolve(true), canvasGestureTarget = 'empty';
   let densityRangeDisplayContext = null, densityRangeEditContext = null, densityRangeEditGeneration = 0;
@@ -47,6 +48,91 @@
   }
   function formatBytes(bytes) { return bytes >= 1e9 ? `${(bytes/1e9).toFixed(2)} GB` : bytes >= 1e6 ? `${(bytes/1e6).toFixed(1)} MB` : bytes >= 1e3 ? `${(bytes/1e3).toFixed(1)} kB` : `${finite(bytes)} B`; }
   function inputLocked() { return Boolean(state && (state.locks?.input || state.trigger?.armed || state.recording?.iq_active || state.trigger?.recording)); }
+  function frontendPresentation(current, disconnected = false) {
+    const enabled=current?.frontend?.dc_reject_enabled,s=current?.frontend_status;
+    if(typeof enabled!=='boolean')return {known:false,enabled:null,applied:false,label:'中心DC補正：状態未取得',kind:'',disabled:true,reason:'中心補正に対応したアプリとの接続を確認してください。'};
+    const recorded=Boolean(current.locks?.frontend||current.locks?.input||current.trigger?.armed||current.trigger?.recording||current.recording?.iq_active||current.vfos?.some(v=>v.wav_recording));
+    const reason=disconnected?'アプリとの接続を確認してください。':recorded?(current.locks?.frontend_reason||'IQ・WAVの保存とトリガ待機を終了してから中心補正を切り替えてください。'):'';
+    const base={known:true,enabled,applied:false,label:'中心DC補正：状態確認中',kind:'',disabled:Boolean(reason),reason};
+    if(disconnected)return {...base,label:'中心DC補正：接続待ち'};
+    if(!s||s.enabled!==enabled||typeof s.applied!=='boolean'||typeof s.available!=='boolean')return {...base,disabled:true,reason:'中心補正の適用状態を確認しています。'};
+    if(current.running!==true)return {...base,label:`中心DC補正：${enabled?'ON設定':'OFF'}（停止中）`};
+    if(!enabled)return {...base,label:'中心DC補正 OFF'};
+    if(s.available===false)return {...base,label:s.reason==='direct_sampling'?'中心DC補正：適用外（Direct入力）':s.reason==='sample_rate_unavailable'?'中心DC補正：適用外（サンプルレート）':'中心DC補正：適用外'};
+    if(s.applied===true)return {...base,applied:true,label:'中心DC補正 ON',kind:'active'};
+    return {...base,disabled:true,reason:'中心補正の適用状態を確認しています。'};
+  }
+  function frontendRouteKey(current) {
+    if(typeof current?.frontend?.dc_reject_enabled!=='boolean')return null;
+    return JSON.stringify([current.frontend.dc_reject_enabled,current.frontend_status?.available,current.frontend_status?.input_mode,current.source,current.input?.center_hz,current.input?.sample_rate]);
+  }
+  function frontendFrameMatchesState(current, incoming) {
+    if(typeof current?.frontend?.dc_reject_enabled!=='boolean')return true;
+    const status=incoming?.frontend_status,expected=current.frontend_status;
+    if(!status||!expected||typeof status.applied!=='boolean'||typeof status.available!=='boolean'||typeof expected.applied!=='boolean'||typeof expected.available!=='boolean')return false;
+    if(status.epoch!==undefined||expected.epoch!==undefined){if(!Number.isSafeInteger(status.epoch)||status.epoch<0||!Number.isSafeInteger(expected.epoch)||expected.epoch<0||status.epoch!==expected.epoch)return false;}
+    return status.enabled===current.frontend.dc_reject_enabled&&status.available===expected.available&&status.input_mode===expected.input_mode&&status.applied===expected.applied;
+  }
+  function frontendDisplayRoute(current, snapshot, disconnected=false) {
+    const view=frontendPresentation(current,disconnected);
+    if(disconnected)return '表示状態は接続待ち';
+    if(!view.known)return '補正状態は未取得';
+    if(current.running!==true)return snapshot?.spectrum?.f_hz?.length?'停止中：表示は停止前の解析結果':'受信停止中';
+    if(view.applied)return '中心補正後で探索・復調';
+    if(view.enabled===false)return '中心補正OFFで探索・復調';
+    if(current.frontend_status?.available===false)return view.label;
+    return '中心補正の適用状態を確認中';
+  }
+  function renderFrontend() {
+    const view=frontendPresentation(state,connectionError),toggle=$('dcRejectEnabled');
+    toggle.checked=frontendChanging?frontendPendingValue===true:view.enabled===true;
+    toggle.disabled=frontendChanging||view.disabled;toggle.setAttribute('aria-busy',String(frontendChanging));
+    asText('frontendStatus',frontendChanging?'中心DC補正：切替中（適用待ち）':view.label);
+    $('frontendStatus').className=`frontend-status ${!frontendChanging&&view.kind==='active'?'active':''}`;
+    const reason=frontendChanging?'処理と表示を切り替えています。':view.reason;
+    asText('frontendLockReason',reason);$('frontendLockReason').hidden=!reason;
+    const route=frontendChanging?'補正状態を切替中':frontendDisplayRoute(state,frame,connectionError);
+    asText('footerRight',`${route} · 原IQは未補正保存 · AM / NFM / WFM`);
+  }
+  async function changeFrontend() {
+    const desired=$('dcRejectEnabled').checked===true,view=frontendPresentation(state,connectionError);
+    if(frontendChanging||view.disabled){renderFrontend();if(view.reason)toast(view.reason,'warning');return null;}
+    if(desired===view.enabled){renderFrontend();return null;}
+    frontendChanging=true;frontendPendingValue=desired;renderFrontend();renderMeasurements(frame?.measurements || {});
+    try{return await action('set_frontend',{frontend:{dc_reject_enabled:desired}},{message:desired?'中心DC補正をON設定にしました。原IQは未補正で保存します':'中心DC補正をOFFにしました'});}
+    finally{frontendChanging=false;frontendPendingValue=null;renderFrontend();renderMeasurements(frame?.measurements || {});}
+  }
+  function peakTunePlan(current,vfo,frequency,disconnected=false) {
+    if(!current||disconnected)return {error:'アプリとの接続を確認してください。'};
+    if(!vfo)return {error:'選局するVFOを追加・選択してください。'};
+    if(vfo.enabled===false)return {error:'選択中のVFOを再開してから選局してください。'};
+    if(typeof frequency!=='number'||!Number.isFinite(frequency)||frequency<=0)return {error:'ピーク周波数を確認してください。'};
+    const center=current.input?.center_hz,fs=current.input?.sample_rate,bw=vfo.bandwidth_hz;
+    if(!Number.isFinite(center)||!Number.isFinite(fs)||fs<=0||!Number.isFinite(bw)||bw<=0)return {error:'受信帯域とVFO帯域幅を確認してください。'};
+    const declared=current.input?.usable_bandwidth_hz,usable=Number.isFinite(declared)&&declared>0?Math.min(declared,fs*.9):fs*.9;
+    if(Math.abs(frequency-center)+bw/2>usable/2)return {error:'このピークではVFO帯域が取得範囲を超えます。中心・スパンまたは復調帯域幅を確認してください。'};
+    return {id:vfo.id,patch:{frequency_hz:frequency}};
+  }
+  function peakTuneButton(marker,label,compact=false) {
+    const plan=peakTunePlan(state,selectedVfo(),marker?.frequency_hz,connectionError),dirty=selectedVfo()&&vfoEditState(selectedVfo().id).basic.dirty;
+    const reason=frontendChanging?'中心補正の切替完了を待ってください。':dirty?'選択中VFOの未適用設定を先に適用してください。':plan.error;
+    return `<button type="button" class="${compact?'peak-tune-chip':'button mini peak-tune-button'}" data-peak-key="${escapeHtml(label)}" data-peak-frequency="${escapeHtml(marker?.frequency_hz)}" data-peak-label="${escapeHtml(label)}" ${reason?'disabled':''} title="${escapeHtml(reason||`${label}の周波数へVFO ${selectedVfo()?.id}を同調`)}" aria-label="${escapeHtml(label)} ${mhz(marker?.frequency_hz).toFixed(6)} MHzへ選局">${compact?`<b>${escapeHtml(label)}</b>${mhz(marker.frequency_hz).toFixed(5)} · ${dbText(markerLevel(marker))}`:'選局'}</button>`;
+  }
+  async function tunePeakFrequency(frequency,label='ピーク') {
+    if(frontendChanging){toast('中心補正の切替完了を待ってください。','warning');return null;}
+    const vfo=selectedVfo(),planned=peakTunePlan(state,vfo,frequency,connectionError);
+    if(planned.error){toast(planned.error,'warning');return null;}
+    if(vfoEditState(vfo.id).basic.dirty){toast('選択中VFOの未適用設定を先に適用してください。','warning');return null;}
+    cancelPendingVfoTune();const selection=activateVfo(vfo.id,{focus:false});
+    const result=await action('update_vfo',{id:vfo.id,patch:planned.patch},{forceVfos:false,guard:async()=>{
+      if(!await selection)return false;
+      const current=state?.vfos?.find(item=>String(item.id)===String(vfo.id)),check=peakTunePlan(state,current,frequency,connectionError);
+      if(check.error||vfoEditState(vfo.id).basic.dirty){toast(check.error||'VFOに新しい未適用設定があります。先に適用してください。','warning');return false;}
+      return true;
+    }});
+    if(result){toast(`${label}へVFO ${vfo.id}を同調しました${state?.running?'':'。受信開始で復調します'}`);focusSpectrum();}
+    return result;
+  }
   function selectedVfo() { return (vfoSelectionIntent===undefined?null:state?.vfos?.find(v=>String(v.id)===String(vfoSelectionIntent))) || state?.vfos?.find(v => v.selected) || state?.vfos?.find(v => String(v.id) === String(state.selected_vfo_id)) || null; }
   function audioConditionsKey(vfo) { return JSON.stringify([state?.running,state?.source,vfo?.id,vfo?.frequency_hz,vfo?.bandwidth_hz,vfo?.mode,vfo?.enabled]); }
   function validAudioEpoch(value) { return Number.isSafeInteger(value)&&value>=0; }
@@ -199,9 +285,10 @@
   function applyState(next, force = false, forceVfos = false) {
     if (!next || typeof next !== 'object') return;
     const recovering=connectionError;
-    const previousUnit = levelUnit(); state = next; connectionError = false;
+    const previousUnit = levelUnit(),previousFrontend=frontendRouteKey(state); state = next; connectionError = false;
     const levelChanged = previousUnit !== levelUnit();
     if (levelChanged) { frame = null; requestFrame(); }
+    if(previousFrontend!==frontendRouteKey(state)){frameEpoch++;frame=null;cancelPendingVfoTune();requestFrame();}
     if(recovering&&$('noticeText').textContent.startsWith('アプリとの接続が切れています'))notice('');
     const running = Boolean(state.running), replay = state.source === 'replay';
     const i = state.input || {}, a = state.analysis || {}, d = state.display || {}, t = state.trigger || {}, m = state.measurement || {};
@@ -268,7 +355,7 @@
       asText('replayPosition',`${finite(r.position_seconds).toFixed(2)} s`); asText('replayDuration',`${finite(r.duration_seconds ?? r.total_seconds).toFixed(2)} s`);
     }
     if (state.layout && !drag?.layout) applyLayout(state.layout, false);
-    renderCalibration(force);renderDensityRange(force);renderVfos(force);renderMeasurements(frame?.measurements || {});updateFftVisibility();updatePresetLoadState();
+    renderCalibration(force);renderDensityRange(force);renderVfos(force);renderMeasurements(frame?.measurements || {});renderFrontend();updateFftVisibility();updatePresetLoadState();
     const pv = a.persistence_mode === 'off' ? 'OFF' : a.persistence_mode === 'infinite' ? 'Infinite' : a.persistence_mode === 'window' ? '時間窓' : '指数減衰';
     asText('persistenceReadout',`${pv}${['off','infinite'].includes(a.persistence_mode) ? '' : ` · ${a.persistence_unit === 'frames' ? finite(a.persistence_frames).toLocaleString()+' FFT' : finite(a.persistence_seconds,1).toFixed(2)+' s'}`}`);
     for (const item of state.notifications || []) {
@@ -411,6 +498,9 @@
       $('userMarkerList').innerHTML=users.length?users.map(m=>`<button class="user-marker-chip ${String(m.id)===String(selected?.id)?'selected':''}" data-user-marker-select="${escapeHtml(m.id)}" aria-pressed="${String(m.id)===String(selected?.id)}" aria-label="ユーザMarker U${escapeHtml(m.id)} を選択" title="${mhz(m.frequency_hz).toFixed(6)} MHz">U${escapeHtml(m.id)}</button>`).join(''):'<span class="muted">自動ピーク A / ユーザ U</span>';
     }
     for(const id of ['userMarkerDeselect','userMarkerPeakLeft','userMarkerPeakRight','userMarkerPeakMax','userMarkerDelete'])$(id).disabled=!selected;
+    const tunePlan=peakTunePlan(state,selectedVfo(),selected?.frequency_hz,connectionError),dirtyVfo=selectedVfo()&&vfoEditState(selectedVfo().id).basic.dirty;
+    $('userMarkerTuneButton').disabled=!selected||frontendChanging||Boolean(tunePlan.error)||Boolean(dirtyVfo);
+    $('userMarkerTuneButton').title=frontendChanging?'中心補正の切替完了を待ってください。':dirtyVfo?'選択中VFOの未適用設定を先に適用してください。':tunePlan.error||'この周波数へ選択中VFOを同調';
     $('userMarkerReadout').classList.toggle('selected',Boolean(selected));
     $('userMarkerReadout').setAttribute('aria-busy',String(userSelectionPending));
     if(selected){
@@ -425,10 +515,11 @@
       asText('plotModeHint',`U${selected.id} 操作：クリックで配置 / ← → で隣接Peak　VFOの「選択」ボタンでVFO操作へ`);
     }else{
       asText('userMarkerName','U 未選択');asText('userMarkerFrequency','周波数 — MHz');asText('userMarkerLevel',`レベル — ${unit}`);asText('userMarkerOffset','中心から Δf — kHz');asText('userMarkerStatus','追加または U をクリックして選択');
-      asText('plotModeHint','VFO：ドラッグ / ホイール / ← →　帯域幅：端をドラッグ　Shiftクリック：U追加');
+      asText('plotModeHint','ピーク A のボタンで選局　VFO：ドラッグ / ホイール / ← →　Shiftクリック：U追加');
     }
   }
   function renderMeasurements(m = {}) {
+    const activePeak=document.activeElement?.dataset?.peakKey,peakContainer=document.activeElement?.closest('#markerReadout')?'markerReadout':document.activeElement?.closest('#markerTable')?'markerTable':null;
     const unit=levelUnit(),absolute=unit==='dBm';
     $('channelPower').innerHTML=`${dbText(m[absolute?'cp_dbm':'cp_dbfs'])}<small>${unit}</small>`;
     $('channelPowerAverage').innerHTML=`${dbText(m[absolute?'cp_avg_dbm':'cp_avg_dbfs'])}<small>${unit}</small>`;
@@ -437,10 +528,11 @@
     const markers=measurementMarkers(m);
     const delta=$('deltaReference'),labels=markers.length?markers.map(markerLabel):['A1'],count=labels.length;
     if(Array.from(delta.options,o=>o.textContent).join('|')!==labels.join('|')&&document.activeElement!==delta){const chosen=delta.value;delta.replaceChildren(...labels.map((label,k)=>{const o=document.createElement('option');o.value=k;o.textContent=label;return o;}));delta.value=Number(chosen)<count?chosen:'0';}
-    $('markerReadout').innerHTML=markers.filter(p=>!isUserMarker(p)).slice(0,8).map((p,k)=>`<span class="auto-marker"><b>${escapeHtml(markerLabel(p,k))}</b>${mhz(p.frequency_hz).toFixed(5)} · ${dbText(markerLevel(p))}</span>`).join('');
+    $('markerReadout').innerHTML=markers.filter(p=>!isUserMarker(p)).slice(0,8).map((p,k)=>peakTuneButton(p,markerLabel(p,k),true)).join('');
     const base=markers[finite(state?.measurement?.delta_reference)] || markers[0];
-    $('markerTable').innerHTML=markers.length?`<table><thead><tr><th>Marker</th><th>MHz</th><th>${unit}</th><th>中心Δ kHz</th><th>基準Δ kHz</th><th>Δ dB</th></tr></thead><tbody>${markers.map((p,k)=>`<tr class="${isUserMarker(p)?'user-marker-row':''} ${userMarkerSelected(p)?'selected-marker-row':''}"><td>${isUserMarker(p)?`<button class="marker-table-select" data-user-marker-select="${escapeHtml(p.id)}" aria-pressed="${userMarkerSelected(p)}">${escapeHtml(markerLabel(p,k))}</button>`:escapeHtml(markerLabel(p,k))}</td><td>${mhz(p.frequency_hz).toFixed(6)}</td><td>${dbText(markerLevel(p))}</td><td>${((finite(p.frequency_hz)-finite(state?.input?.center_hz))/1000).toFixed(3)}</td><td>${base?((p.frequency_hz-base.frequency_hz)/1000).toFixed(3):'—'}</td><td>${base&&validLevel(markerLevel(p))&&validLevel(markerLevel(base))?(markerLevel(p)-markerLevel(base)).toFixed(2):'—'}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">受信後にMarker値を表示します。</p>';
+    $('markerTable').innerHTML=markers.length?`<table><thead><tr><th>Marker</th><th>MHz</th><th>${unit}</th><th>中心Δ kHz</th><th>基準Δ kHz</th><th>Δ dB</th><th>VFOへ</th></tr></thead><tbody>${markers.map((p,k)=>`<tr class="${isUserMarker(p)?'user-marker-row':''} ${userMarkerSelected(p)?'selected-marker-row':''}"><td>${isUserMarker(p)?`<button class="marker-table-select" data-user-marker-select="${escapeHtml(p.id)}" aria-pressed="${userMarkerSelected(p)}">${escapeHtml(markerLabel(p,k))}</button>`:escapeHtml(markerLabel(p,k))}</td><td>${mhz(p.frequency_hz).toFixed(6)}</td><td>${dbText(markerLevel(p))}</td><td>${((finite(p.frequency_hz)-finite(state?.input?.center_hz))/1000).toFixed(3)}</td><td>${base?((p.frequency_hz-base.frequency_hz)/1000).toFixed(3):'—'}</td><td>${base&&validLevel(markerLevel(p))&&validLevel(markerLevel(base))?(markerLevel(p)-markerLevel(base)).toFixed(2):'—'}</td><td>${peakTuneButton(p,markerLabel(p,k))}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">受信後にMarker値を表示します。</p>';
     renderUserMarkerControls(markers);
+    if(activePeak&&peakContainer){const replacement=Array.from($(peakContainer).querySelectorAll('[data-peak-key]')).find(button=>button.dataset.peakKey===activePeak);if(replacement&&!replacement.disabled)replacement.focus({preventScroll:true});}
   }
 
   function clearTraceDisplayFrame(current) {
@@ -564,9 +656,10 @@
   }
   function drawAll() { drawSpectrum();drawHeatmap('density');drawHeatmap('waterfall'); }
   function acceptFrame(next) {
+    if(!frontendFrameMatchesState(state,next))return;
     const unit=next.spectrum?.unit || next.unit;
     if(unit && (String(unit).startsWith('dBm') !== (levelUnit()==='dBm')))return;
-    frame=next;renderMeasurements(next.measurements || {});renderDensityHistory(next.density || {});drawAll();
+    frame=next;renderMeasurements(next.measurements || {});renderDensityHistory(next.density || {});renderFrontend();drawAll();
     const a=state?.analysis || {},s=next.spectrum || {};
     const fft=a.fft_size || next.fft_size,rbw=next.enbw_hz ?? s.enbw_hz ?? a.enbw_hz,bin=next.bin_hz ?? s.bin_hz ?? a.bin_hz;
     asText('fftReadout',`FFT ${fft ? finite(fft).toLocaleString():'—'} · RBW ${rbw ? formatHz(rbw,1):'—'}${bin?' · bin '+formatHz(bin,1):''}`);
@@ -729,6 +822,7 @@
     await action('set_display',{display},{form:'tuningForm',message:'周波数・表示条件を適用しました'});
   });
   $('inputApply').addEventListener('click',()=>action('set_input',{input:{gain_db:num('gainDb'),agc:$('agc').checked,ppm:num('ppm')}},{message:'入力条件を適用しました'}));
+  $('dcRejectEnabled').addEventListener('change',changeFrontend);
   $('fftMode').addEventListener('change',updateFftVisibility);
   for(const [key,id] of Object.entries({live:'traceLive',max:'traceMax',min:'traceMin',avg:'traceAvg'})) $(id).addEventListener('change',()=>action('set_display',{display:{traces:{[key]:$(id).checked}}}));
   $('traceResetButton').addEventListener('click',resetTraces);
@@ -749,6 +843,9 @@
   $('addUserMarkerButton').addEventListener('click',()=>addManualMarker());
   const chooseUserMarker=event=>{const button=event.target.closest('[data-user-marker-select]');if(button)selectUserMarker(button.dataset.userMarkerSelect);};
   $('userMarkerList').addEventListener('click',chooseUserMarker);$('markerTable').addEventListener('click',chooseUserMarker);
+  const choosePeak=event=>{const button=event.target.closest('[data-peak-frequency]');if(button&&!button.disabled){event.preventDefault();event.stopPropagation();tunePeakFrequency(Number(button.dataset.peakFrequency),button.dataset.peakLabel || 'ピーク');}};
+  $('markerReadout').addEventListener('click',choosePeak);$('markerTable').addEventListener('click',choosePeak);
+  $('userMarkerTuneButton').addEventListener('click',()=>{const marker=selectedUserMarker();if(marker)tunePeakFrequency(marker.frequency_hz,`U${marker.id}`);});
   $('userMarkerDeselect').addEventListener('click',()=>selectUserMarker(null));
   $('userMarkerPeakLeft').addEventListener('click',()=>seekUserPeak('left'));$('userMarkerPeakRight').addEventListener('click',()=>seekUserPeak('right'));$('userMarkerPeakMax').addEventListener('click',()=>seekUserPeak('max'));
   $('userMarkerDelete').addEventListener('click',async()=>{const result=await userMarkerAction('user_marker_delete');if(result)focusSpectrum();});
@@ -792,7 +889,7 @@
   window.addEventListener('resize',()=>requestAnimationFrame(drawAll));
   try{const saved=JSON.parse(localStorage.getItem('spectrum-studio-layout'));if(saved)applyLayout(saved,false);}catch{}
 
-  async function refreshState(force=false,fromAction=false){const epoch=stateEpoch;try{const next=await getJson('/api/state');if(fromAction||(epoch===stateEpoch&&!actionInFlight))applyState(next,force);}catch(error){if(epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;flushAudio();renderVfos();}$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
+  async function refreshState(force=false,fromAction=false){const epoch=stateEpoch;try{const next=await getJson('/api/state');if(fromAction||(epoch===stateEpoch&&!actionInFlight))applyState(next,force);}catch(error){if(epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;flushAudio();renderVfos();}renderFrontend();$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
   async function stateLoop(){await refreshState();setTimeout(stateLoop,1000);}
   function requestFrame(){clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}frameTimer=setTimeout(frameLoop,0);}
   async function frameLoop(){
@@ -802,5 +899,5 @@
     finally{framePending=false;const delay=frameRefreshRequested?0:!state?.running?1000:document.hidden?500:125;frameRefreshRequested=false;frameTimer=setTimeout(frameLoop,delay);}
   }
   async function audioLoop(){if(audioEnabled&&state?.running&&!connectionError){const epoch=audioEpoch;try{const data=await getJson(`/api/audio?after=${audioSequence}`);if(epoch===audioEpoch&&audioEnabled&&state?.running&&!connectionError&&audioPacketMatchesState(data)){if(finite(data.sequence)<audioSequence)audioSequence=0;playPcm(data);if(data.data_b64)audioSequence=finite(data.sequence,audioSequence);}}catch{}}setTimeout(audioLoop,90);}
-  updateFftVisibility();drawAll();stateLoop();frameLoop();audioLoop();
+  renderFrontend();updateFftVisibility();drawAll();stateLoop();frameLoop();audioLoop();
 })();

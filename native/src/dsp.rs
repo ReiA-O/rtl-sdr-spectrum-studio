@@ -528,17 +528,27 @@ impl Analyzer {
             || !obw.is_finite() || obw<=0.0 || obw>=100.0 {return unavailable("Invalid measurement band or OBW percentage");}
         let n=self.config.fft_size;
         let frequency:Vec<f64>=self.frequency_offsets_hz.iter().map(|f|f+center).collect();
-        let edges_low:Vec<f64>=frequency.iter().map(|f|(f-self.bin_hz/2.0).max(low)).collect();
-        let widths:Vec<f64>=frequency.iter().zip(edges_low.iter()).map(|(f,l)|((f+self.bin_hz/2.0).min(high)-l).max(0.0)).collect();
+        // FFT bin centers are half-open [-Fs/2, Fs/2). Their integration cells
+        // are periodic: bin zero's lower half wraps to the upper Nyquist edge.
+        // Keep separate, ascending-frequency segments for linear-axis OBW;
+        // widths per bin remain aggregated for CP, average and peak selection.
+        let mut widths=vec![0.0;n];let mut segments=Vec::<(usize,f64,f64)>::with_capacity(n+1);
+        for (k,f) in frequency.iter().enumerate(){
+            let left=(f-self.bin_hz/2.0).max(low);let right=(f+self.bin_hz/2.0).min(high);
+            if right>left{let width=right-left;widths[k]+=width;segments.push((k,left,width));}
+        }
+        let wrapped=frequency[0]+self.config.sample_rate;
+        let left=(wrapped-self.bin_hz/2.0).max(low);let right=(wrapped+self.bin_hz/2.0).min(high);
+        if right>left{let width=right-left;widths[0]+=width;segments.push((0,left,width));}
         let selected:Vec<usize>=(0..n).filter(|k|widths[*k]>0.0).collect();
-        let powers:Vec<f64>=selected.iter().map(|k|self.last_psd[*k]*widths[*k]).collect();
+        let powers:Vec<f64>=segments.iter().map(|(k,_,width)|self.last_psd[*k]*width).collect();
         let total:f64=powers.iter().sum();
         if total<=0.0{return unavailable("No finite power in measurement band");}
         let average:f64=self.avg_acc.iter().zip(widths.iter()).map(|(p,w)|p/self.avg_weight.max(1e-30)*w).sum();
         let quantile=|fraction:f64|{
             let target=total*fraction;let mut previous=0.0;
             for (j,p) in powers.iter().enumerate(){if previous+p>=target || j==powers.len()-1 {
-                let k=selected[j];return edges_low[k]+((target-previous)/p.max(1e-300)).clamp(0.0,1.0)*widths[k];
+                let(_,left,width)=segments[j];return left+((target-previous)/p.max(1e-300)).clamp(0.0,1.0)*width;
             }previous+=p;}high
         };
         let tail=(1.0-obw/100.0)/2.0;let left=quantile(tail);let right=quantile(1.0-tail);
@@ -554,7 +564,10 @@ impl Analyzer {
             let mut correction=0.0;
             if k>0 && k+1<n {let a=self.last_psd[k-1].max(1e-300).ln();let b=self.last_psd[k].max(1e-300).ln();let c=self.last_psd[k+1].max(1e-300).ln();let div=a-2.0*b+c;
                 if div.abs()>1e-15{correction=(0.5*(a-c)/div).clamp(-0.5,0.5);}}
-            let f=frequency[k]+correction*self.bin_hz;let level=db(self.last_psd[k]*self.enbw_hz);
+            // If only the wrapped upper half of bin zero overlaps this ROI,
+            // report that alias. A full-span ROI keeps the canonical lower one.
+            let alias=if k==0&&low>=frequency[0]+self.bin_hz/2.0{self.config.sample_rate}else{0.0};
+            let f=frequency[k]+correction*self.bin_hz+alias;let level=db(self.last_psd[k]*self.enbw_hz);
             if rank==0{primary=(f,level);}
             markers.push(json!({"rank":rank+1,"frequency_hz":f,"level_dbfs":level,
                 "delta_hz":f-primary.0,"delta_db":level-primary.1}));
@@ -856,6 +869,84 @@ mod tests {
         assert!((m["markers"][0]["frequency_hz"].as_f64().unwrap()-4000.0).abs()<0.1);
         let snap=a.snapshot(50000.0,0.0,80);
         assert_eq!(B64.decode(snap["density"]["data_b64"].as_str().unwrap()).unwrap().len(),80*128);
+    }
+    fn nyquist_measurement_fixture()->Analyzer{
+        let mut a=Analyzer::new(Config{sample_rate:64000.0,fft_size:128,window:"rect".into(),overlap:0.0,..Config::default()});
+        a.process(&vec![Complex32::new(0.5,0.0);128],0);
+        a.last_psd.fill(0.0);a.avg_acc.fill(0.0);a.avg_weight=2.0;
+        a.last_psd[0]=2.0;a.avg_acc[0]=6.0;a
+    }
+    #[test]
+    fn full_nyquist_cp_and_average_retain_the_whole_periodic_edge_bin(){
+        let a=nyquist_measurement_fixture();let m=a.measurements(-32000.0,32000.0,0.0,99.0,1);
+        assert_eq!(m["status"],"ok");assert!((m["cp_dbfs"].as_f64().unwrap()-db(2.0*500.0)).abs()<1e-12);
+        assert!((m["cp_avg_dbfs"].as_f64().unwrap()-db(3.0*500.0)).abs()<1e-12);
+        // Linear-axis equal-tail OBW crosses the gap between the two edge halves.
+        assert!((m["obw_low_hz"].as_f64().unwrap()+31997.5).abs()<1e-9);
+        assert!((m["obw_high_hz"].as_f64().unwrap()-31997.5).abs()<1e-9);
+        assert!((m["obw_hz"].as_f64().unwrap()-63995.0).abs()<1e-9);
+        let shifted=a.measurements(968000.0,1032000.0,1000000.0,99.0,1);
+        assert_eq!(shifted["cp_dbfs"],m["cp_dbfs"]);assert_eq!(shifted["obw_hz"],m["obw_hz"]);
+    }
+    #[test]
+    fn nyquist_half_and_partial_bins_are_symmetric_and_do_not_double_count(){
+        let a=nyquist_measurement_fixture();
+        for(low,high,width)in [(-32000.0,-31750.0,250.0),(31750.0,32000.0,250.0),
+                              (-31990.0,-31980.0,10.0),(31980.0,31990.0,10.0)]{
+            let m=a.measurements(low,high,0.0,99.0,1);assert_eq!(m["status"],"ok");
+            assert!((m["cp_dbfs"].as_f64().unwrap()-db(2.0*width)).abs()<1e-12);
+            assert!((m["cp_avg_dbfs"].as_f64().unwrap()-db(3.0*width)).abs()<1e-12);
+            assert!((m["obw_hz"].as_f64().unwrap()-width*0.99).abs()<1e-9);
+        }
+        // A boundary touching the adjacent cell has zero overlap with bin zero.
+        assert_eq!(a.measurements(-31750.0,-31250.0,0.0,99.0,1)["status"],"unavailable");
+        assert_eq!(a.measurements(31250.0,31750.0,0.0,99.0,1)["status"],"unavailable");
+    }
+    #[test]
+    fn upper_only_nyquist_marker_uses_upper_alias_and_retains_rank_and_delta(){
+        let mut a=nyquist_measurement_fixture();a.last_psd[126]=0.5;
+        let upper=a.measurements(30000.0,32000.0,0.0,99.0,2);let markers=upper["markers"].as_array().unwrap();
+        assert_eq!(markers.len(),2);assert_eq!(markers[0]["rank"],1);assert_eq!(markers[0]["frequency_hz"],32000.0);
+        assert_eq!(markers[1]["rank"],2);assert_eq!(markers[1]["frequency_hz"],31000.0);
+        assert_eq!(markers[0]["delta_hz"],0.0);assert_eq!(markers[1]["delta_hz"],-1000.0);
+        assert!((markers[1]["delta_db"].as_f64().unwrap()-db(0.25)).abs()<1e-12);
+        let full=a.measurements(-32000.0,32000.0,0.0,99.0,2);
+        assert_eq!(full["markers"][0]["frequency_hz"],-32000.0);
+        assert_eq!(full["markers"][1]["delta_hz"],63000.0);
+        // A sub-bin ROI retains power even when the normal peak threshold
+        // rejects its single-bin median as insufficient prominence.
+        let narrow=a.measurements(31875.0,32000.0,0.0,99.0,2);
+        assert_eq!(narrow["status"],"ok");assert!((narrow["cp_dbfs"].as_f64().unwrap()-db(250.0)).abs()<1e-12);
+    }
+    #[test]
+    fn nyquist_fix_preserves_center_cells_flat_psd_and_unavailable_results(){
+        let mut a=nyquist_measurement_fixture();a.last_psd.fill(0.0);a.avg_acc.fill(0.0);
+        a.last_psd[64]=2.0;a.avg_acc[64]=6.0;
+        let center=a.measurements(-250.0,250.0,0.0,99.0,1);
+        assert!((center["cp_dbfs"].as_f64().unwrap()-db(1000.0)).abs()<1e-12);
+        assert!((center["obw_hz"].as_f64().unwrap()-495.0).abs()<1e-9);
+        a.last_psd.fill(1.0);a.avg_acc.fill(2.0);
+        for(low,high)in [(-32000.0,32000.0),(-28800.0,28800.0),(-100.0,100.0)]{
+            let m=a.measurements(low,high,0.0,99.0,1);
+            assert!((m["cp_dbfs"].as_f64().unwrap()-db(high-low)).abs()<1e-12);
+            assert!((m["cp_avg_dbfs"].as_f64().unwrap()-db(high-low)).abs()<1e-12);
+            assert!((m["obw_hz"].as_f64().unwrap()-(high-low)*0.99).abs()<1e-8);
+        }
+        for(low,high)in [(0.0,0.0),(1.0,-1.0),(-32000.1,32000.0),(-32000.0,32000.1),(f64::NAN,100.0)]{
+            let m=a.measurements(low,high,0.0,99.0,1);assert_eq!(m["status"],"unavailable");assert!(m["cp_dbfs"].is_null());
+        }
+        a.last_psd.fill(0.0);assert_eq!(a.measurements(-32000.0,32000.0,0.0,99.0,1)["status"],"unavailable");
+        let empty=Analyzer::new(Config::default());assert_eq!(empty.measurements(-100.0,100.0,0.0,99.0,1)["status"],"unavailable");
+    }
+    #[test]
+    fn actual_nyquist_tones_match_full_band_cp_for_supported_windows(){
+        for window in ["rect","hann","hamming","blackman"]{
+            let mut a=Analyzer::new(Config{sample_rate:64000.0,fft_size:128,window:window.into(),overlap:0.0,..Config::default()});
+            let values:Vec<Complex32>=(0..128).map(|k|Complex32::new(if k%2==0{0.2}else{-0.2},0.0)).collect();
+            let p=a.process(&values,0);let m=a.measurements(-32000.0,32000.0,0.0,99.0,1);
+            assert!((p.integrated_dbfs-db(0.04)).abs()<1e-5,"{window}");
+            assert!((m["cp_dbfs"].as_f64().unwrap()-p.integrated_dbfs).abs()<1e-12,"{window}");
+        }
     }
     #[test]
     fn chunking_and_gap(){

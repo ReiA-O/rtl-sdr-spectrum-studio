@@ -7,6 +7,8 @@
 ```powershell
 cargo test --manifest-path native\Cargo.toml --all-targets
 node tests\ui-static-boundaries.cjs
+node tests\ui-reception-boundaries.cjs
+node --test tests\frontend-ui.test.cjs
 ```
 
 配布バイナリーへ開発PCのソースパスを埋めないため、パスをremapしてビルドします。空白を含むパスを扱えるよう、区切り付きのRust flagsを使用します。これらの環境変数は現在のPowerShell内だけに設定します。
@@ -43,12 +45,14 @@ $prepared = .\tools\prepare-packaging.ps1 | ConvertFrom-Json
 ```powershell
 $binary = 'native\target-portable\release\rtl-spectrum-studio.exe'
 $hash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
-.\tools\package-studio.ps1 -BinaryPath $binary -ExpectedBinarySha256 $hash -PackageVersion 0.3.0-dev -CargoMetadataPath $prepared.cargo_metadata_path
+.\tools\package-studio.ps1 -BinaryPath $binary -ExpectedBinarySha256 $hash -PackageVersion 0.4.0-dev -CargoMetadataPath $prepared.cargo_metadata_path
 ```
 
 Microsoftランタイムはインストール済みの正規`VC/Redist/MSVC/.../x64/Microsoft.VC*.CRT/vcruntime140.dll`から取得します。自動検出先と異なる場合は`-RuntimeDllPath`で明示します。Rust標準ライブラリーの通知を別の場所へ導入した場合は`-RustCopyrightPath`を指定できます。System32からDLLを抜き出さないでください。
 
 同名成果物を置換せず、`dist/`へ時刻付きで新規作成します。元の`data/`は読まず、`presets/fm-measurement.json`だけを新しいsettingsの初期値へコピーします。録音フォルダーは空です。
+
+v0.4.0の初期プリセットは中心DC補正ONです。中心付近の実信号にも影響し、処理中のレベルは相対表示になります。中心AM局は搬送波が抑えられて包絡復調が崩れる場合があるため、OFF比較か、受信中心を局からずらしてVFOで合わせる運用を使います。RF感度／S/N改善ではありません。原IQ保存は補正前です。補正OFFを初期値にする場合は、個人情報のない別のプリセットを用意して`-PresetPath`で明示します。パッケージ生成の成功と、[VALIDATION.md](VALIDATION.md) の製品受入れは別の確認です。
 
 PE依存・x64・承認バイナリーSHA256・driver原ZIPとの一致・ZIP全ファイルhashを検査します。`-ForbiddenText`へ公開してはいけない文字列の配列を渡すと、全同梱ファイルをUTF8/UTF16LE/BEで検査してhit時に停止します。秘密文字列そのものをソースやmanifestへ保存しないでください。
 

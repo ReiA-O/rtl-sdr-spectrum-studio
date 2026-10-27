@@ -2,6 +2,7 @@
 //! owned by Runtime; input changes are planned before that source is stopped.
 use crate::calibration::{self,Calibration};
 use crate::dsp::{self, Analyzer, Config, VfoDemodulator};
+use crate::frontend::{CenterDcRejector,CENTER_DC_CUTOFF_HZ};
 use crate::recording::{IQRecorder, PreTriggerBuffer, WavRecorder};
 use crate::reception::{AudioProcessor, ReceptionConfig};
 use crate::trigger::TriggerController;
@@ -72,6 +73,8 @@ pub struct Engine {
     pub last_sample:u64,
     analyzer:Analyzer,
     analysis_extra:Value,
+    frontend:Value,
+    center_dc_rejector:CenterDcRejector,
     display:Value,
     measurement:Value,
     trigger_config:Value,
@@ -111,6 +114,7 @@ impl Engine {
         let mut engine=Self {project,input,running:false,source:"live".into(),replay:Value::Null,
             device:json!({"name":"RTL-SDR","connected":false}),performance:json!({"load_percent":0.0,"gap_samples":0,"valid_frames":0}),last_sample:0,
             analyzer:Analyzer::new(config),analysis_extra:json!({"fft_mode":"rbw","rbw_hz":750.0}),
+            frontend:json!({"dc_reject_enabled":true}),center_dc_rejector:CenterDcRejector::new(2_048_000.0),
             display:json!({"span_hz":1_800_000.0,"ref_level":-20.0,"range_db":100.0,"traces":{"live":true,"max":false,"min":false,"avg":false}}),
             measurement:json!({"low_hz":31_900_000.0,"high_hz":32_100_000.0,"link_vfo":null,"obw_percent":99.0,"marker_count":6,
                 "marker_mode":"auto","marker_follow":true,"delta_reference":0,"manual_markers":[],"selected_user_marker_id":null}),
@@ -137,7 +141,55 @@ impl Engine {
     fn center(&self)->f64{num(&self.input,"center_hz",32_256_000.0)}
     fn usable_for(input:&Value)->f64{num(input,"sample_rate",2_048_000.0)*0.9}
     fn usable(&self)->f64{Self::usable_for(&self.input)}
+    fn frontend_metadata_mode(&self)->Option<&str>{
+        if !self.running{return None;}
+        let mut metadata=&self.source_metadata;
+        // Re-recorded raw replay keeps the previous source metadata nested.
+        for _ in 0..16{
+            if let Some(mode)=metadata["mode_actual"].as_str(){if ["tuner","direct_i","direct_q"].contains(&mode){return Some(mode);}}
+            let Some(previous)=metadata.get("input_metadata").filter(|value|value.is_object())else{break;};metadata=previous;
+        }
+        None
+    }
+    fn frontend_mode_basis(&self)->&str{
+        if self.frontend_metadata_mode().is_none(){"requested_configuration_inference"}
+        else{match self.source.as_str(){"live"=>"source_api_readback","replay"=>"recorded_input_metadata",_=>"synthetic_metadata"}}
+    }
+    fn frontend_input_mode(&self)->&str{
+        if let Some(mode)=self.frontend_metadata_mode(){return mode;}
+        match text(&self.input,"mode","auto"){
+            "direct_i"=>"direct_i","direct_q"=>"direct_q","auto" if self.center()<24_000_000.0=>"direct_q",_=>"tuner",
+        }
+    }
+    fn frontend_available(&self)->bool{self.frontend_input_mode()=="tuner"&&self.fs().is_finite()&&self.fs()>2.0*CENTER_DC_CUTOFF_HZ}
+    fn frontend_effective(&self)->bool{boolean(&self.frontend,"dc_reject_enabled",true)&&self.frontend_available()}
+    fn reset_frontend_state(&mut self){
+        let fs=self.fs();let safe_fs=if fs.is_finite()&&fs>2.0*CENTER_DC_CUTOFF_HZ{fs}else{2_048_000.0};
+        self.center_dc_rejector.reset(safe_fs);
+    }
+    fn frontend_processing(&self)->Value{
+        json!({"schema":"center-dc-rejection-1","dc_reject_enabled":boolean(&self.frontend,"dc_reject_enabled",true),
+            "dc_reject_applied_to_processing":self.frontend_effective(),"cutoff_hz":CENTER_DC_CUTOFF_HZ,
+            "method":"independent_iq_one_pole_dc_rejection","input_mode":self.frontend_input_mode(),"input_mode_basis":self.frontend_mode_basis(),
+            "analysis_demod_trigger_route":if self.frontend_effective(){"dc_rejected"}else{"raw_decoded"},
+            "recorded_iq_route":"raw_cu8_unmodified","center_signal_affected":self.frontend_effective(),"startup_seed":"first_finite_input_block_mean","replay_processing_state":"reseeded_at_playback_start_or_seek"})
+    }
+    fn frontend_status(&self)->Value{
+        let enabled=boolean(&self.frontend,"dc_reject_enabled",true);let available=self.frontend_available();
+        json!({"enabled":enabled,"available":available,"applied":self.running&&enabled&&available,"epoch":self.audio_epoch,
+            "reason":if !self.running{"stopped"}else if !enabled{"off"}else if self.frontend_input_mode()!="tuner"{"direct_sampling"}else if !available{"sample_rate_unavailable"}else{"enabled"},
+            "cutoff_hz":CENTER_DC_CUTOFF_HZ,"method":"independent_iq_one_pole_dc_rejection",
+            "iq_recording":"raw_unmodified","input_mode":self.frontend_input_mode(),"input_mode_basis":self.frontend_mode_basis(),
+            "warning":"中心付近の実信号にも影響します。中心AM局は補正OFFで比較するか受信中心をずらしてください。原IQは未補正で保存します。"})
+    }
+    fn validate_frontend_patch(value:&Value)->Result<(),ActionError>{
+        let fields=value.as_object().ok_or("中心補正設定はオブジェクトで指定してください")?;
+        if fields.keys().any(|key|key!="dc_reject_enabled"){return Err("未対応の中心補正設定項目です".into());}
+        if fields.get("dc_reject_enabled").is_some_and(|v|v.as_bool().is_none()){return Err("中心補正のON/OFFは真偽値で指定してください".into());}
+        Ok(())
+    }
     fn calibration_check_at(&self,now:chrono::DateTime<Utc>)->Result<(),String>{
+        if self.running&&self.frontend_effective(){return Err("中心DC補正中は受信用の相対表示です。絶対レベル表示には補正をOFFにしてください。".into());}
         let calibration=self.calibration.as_ref().ok_or("校正情報は未読込です")?;
         let band=self.linked_band(&self.measurement)?;
         calibration.check_at(&self.source,self.running,&self.input,&self.source_metadata,self.usable(),band,now)
@@ -163,12 +215,19 @@ impl Engine {
         while self.notifications.len()>50{self.notifications.pop_front();}
     }
     fn in_band(input:&Value,frequency:f64,width:f64)->bool{
-        frequency.is_finite()&&width.is_finite()&&width>0.0&&(frequency-num(input,"center_hz",0.0)).abs()+width/2.0<=Self::usable_for(input)/2.0
+        frequency.is_finite()&&width.is_finite()&&width>0.0&&frequency-width/2.0>=0.0&&(frequency-num(input,"center_hz",0.0)).abs()+width/2.0<=Self::usable_for(input)/2.0
     }
     fn afc_reference_in_band(offset:f64,bandwidth:f64,usable:f64)->bool{
         offset.is_finite()&&bandwidth.is_finite()&&usable.is_finite()&&bandwidth>0.0&&offset.abs()+bandwidth<=usable/2.0
     }
     fn make_vfo(&self,value:&Value,fallback:u64)->Result<Vfo,String>{
+        let fields=value.as_object().ok_or("VFO設定はオブジェクトで指定してください")?;
+        // Defaults apply to omitted legacy fields, never to an explicitly invalid
+        // value: a malformed tune must not silently move a station to the center.
+        for key in ["frequency_hz","bandwidth_hz"]{if fields.get(key).is_some_and(|v|v.as_f64().is_none()){return Err(format!("VFOの{key}は数値で指定してください"));}}
+        for key in ["mode","wav_format"]{if fields.get(key).is_some_and(|v|v.as_str().is_none()){return Err(format!("VFOの{key}は文字列で指定してください"));}}
+        if fields.get("enabled").is_some_and(|v|v.as_bool().is_none()){return Err("VFOの有効状態は真偽値で指定してください".into());}
+        if fields.get("id").is_some_and(|v|identifier(v).is_none()){return Err("VFO IDが不正です".into());}
         let id=value.get("id").and_then(identifier).unwrap_or(fallback);
         let frequency=num(value,"frequency_hz",self.center());let bandwidth=num(value,"bandwidth_hz",200_000.0);
         let mode=text(value,"mode","WFM").to_uppercase();let enabled=boolean(value,"enabled",true);
@@ -177,7 +236,7 @@ impl Engine {
         reception.validate()?;
         if !["AM","NFM","WFM"].contains(&mode.as_str()){return Err("復調方式はAM/NFM/WFMです".into());}
         if !["PCM16","PCM24"].contains(&format.as_str()){return Err("WAV形式はPCM16/PCM24です".into());}
-        if !frequency.is_finite()||!bandwidth.is_finite()||bandwidth<=0.0||bandwidth>=self.fs(){return Err("VFOの周波数・帯域幅が不正です".into());}
+        if !frequency.is_finite()||!bandwidth.is_finite()||bandwidth<=0.0||bandwidth>=self.fs()||frequency-bandwidth/2.0<0.0{return Err("VFOの周波数・帯域幅が不正です。フィルター下端は0 Hz以上にしてください".into());}
         if enabled&&!Self::in_band(&self.input,frequency,bandwidth){return Err("復調フィルター全幅が有効受信帯域内に入る必要があります".into());}
         let mut demod=if enabled{Some(VfoDemodulator::try_new(self.fs(),frequency-self.center(),bandwidth,&mode,AUDIO_RATE)?)}else{None};
         if let Some(demod)=demod.as_mut(){demod.set_afc(reception.afc_enabled,reception.afc_max_hz)?;}
@@ -193,14 +252,14 @@ impl Engine {
     }
     fn user_marker_frequency(&self,value:&Value)->Result<f64,ActionError>{
         let frequency=value.as_f64().filter(|f|f.is_finite()).ok_or("Marker周波数は有限数で指定してください")?;
-        if (frequency-self.center()).abs()>self.usable()/2.0{
+        if frequency<0.0||(frequency-self.center()).abs()>self.usable()/2.0{
             return Err(ActionError::new("OUT_OF_BAND","ユーザーMarkerは有効取得帯域内へ配置してください。中心周波数は自動変更しません。"));
         }Ok(frequency)
     }
     fn user_marker_peaks(&self)->Result<Vec<Value>,ActionError>{
         if self.analyzer.total_valid_frames==0{return Err(ActionError::new("NO_DATA","FFTデータを受信してからピーク検索してください"));}
         let half_span=num(&self.display,"span_hz",self.usable()).min(self.usable())/2.0;
-        let low=self.center()-half_span;let high=self.center()+half_span;
+        let low=(self.center()-half_span).max(0.0);let high=self.center()+half_span;
         // Ask for every candidate, independently of the automatic marker count
         // and CP/OBW measurement ROI. Candidate selection remains the common
         // original-PSD local-peak definition used by Analyzer.
@@ -227,7 +286,7 @@ impl Engine {
         chosen.map(|peak|num(peak,"frequency_hz",self.center())).ok_or_else(||ActionError::new("PEAK_BOUNDARY",if direction=="left"{"表示Span内に、これより左のピークはありません"}else{"表示Span内に、これより右のピークはありません"}))
     }
     fn marker_level(&self,frequency:f64)->(Option<f64>,&'static str,&'static str){
-        if !frequency.is_finite()||(frequency-self.center()).abs()>self.usable()/2.0{return(None,"out_of_band","現在の有効取得帯域外です。周波数は保持しています。");}
+        if !frequency.is_finite()||frequency<0.0||(frequency-self.center()).abs()>self.usable()/2.0{return(None,"out_of_band","現在の有効取得帯域外です。周波数は保持しています。");}
         if self.analyzer.total_valid_frames==0{return(None,"no_data","FFTデータをまだ受信していません。");}
         let index=((frequency-self.center())/self.analyzer.bin_hz+self.analyzer.config.fft_size as f64/2.0).round() as isize;
         if index<0||index>=self.analyzer.last_psd.len()as isize{return(None,"out_of_band","この周波数に対応する解析binがありません。");}
@@ -246,7 +305,7 @@ impl Engine {
         if let Some(extra)=config["conditions"].as_array(){conditions.extend(extra.iter().cloned());}
         expanded["conditions"]=json!(conditions);expanded
     }
-    fn band_valid(&self,low:f64,high:f64)->bool{low.is_finite()&&high.is_finite()&&low<high&&low>=self.center()-self.usable()/2.0&&high<=self.center()+self.usable()/2.0}
+    fn band_valid(&self,low:f64,high:f64)->bool{low.is_finite()&&high.is_finite()&&low>=0.0&&low<high&&low>=self.center()-self.usable()/2.0&&high<=self.center()+self.usable()/2.0}
     fn trigger_band_weights(&self,low:f64,high:f64)->Vec<(usize,f64)>{
         let center=self.center();let half_bin=self.analyzer.bin_hz/2.0;
         self.analyzer.frequency_offsets_hz.iter().enumerate().filter_map(|(index,offset)|{
@@ -264,8 +323,10 @@ impl Engine {
         json!({"frequency_hz":v.frequency_hz,"bandwidth_hz":v.bandwidth_hz,"mode":v.mode,"audio_gain":gain,"audio_gain_db":20.0*gain.log10(),"normalization":normalization,
         "reception":v.reception,"wav_audio":v.reception.wav_audio,
         "audio_routing":if v.reception.wav_audio=="processed"{"AFC/filter/demod then RF squelch, user audio gain, limiter and click suppression"}else{"AFC/filter/demod; excludes RF squelch, user audio gain, limiter and click suppression"},
-        "input":self.input,"source":self.source,"input_metadata":self.source_metadata,"source_sample":self.last_sample})}
+        "input":self.input,"source":self.source,"input_metadata":self.source_metadata,"source_sample":self.last_sample,
+        "frontend_processing":self.frontend_processing()})}
     fn reset_dsp(&mut self)->Result<(),String>{
+        self.reset_frontend_state();
         let mut config=self.analyzer.config.clone();config.sample_rate=self.fs();
         if text(&self.analysis_extra,"fft_mode","rbw")=="rbw"{config.fft_size=dsp::fft_size_for_rbw(self.fs(),num(&self.analysis_extra,"rbw_hz",750.0),&config.window);}
         dsp::validate_config(&config)?;self.analyzer.reset(Some(config));self.prebuffer=PreTriggerBuffer::new(self.fs(),PRE_BYTES)?;
@@ -293,15 +354,16 @@ impl Engine {
         self.device["connected"]=json!(true);self.device["usable_bandwidth_hz"]=json!(self.usable());
         self.device["usable_bandwidth_status"]=json!("provisional_90_percent_of_sample_rate");
         if source=="demo"{self.device["name"]=json!("合成AM/FM信号");self.device["synthetic"]=json!(true);}
-        self.reset_dsp()?;self.last_sample=0;
+        self.reset_dsp()?;self.last_sample=0;self.running=true;
         if self.pending_input_change{
             for index in 0..self.vfos.len(){let conditions=self.vfo_conditions(index);if let Some(writer)=self.vfos[index].wav.as_mut().filter(|r|r.active){
                 if let Err(error)=writer.split(conditions){self.notify(&format!("VFOのWAV分割に失敗しました：{error}"),"error");}
             }}
         }
-        self.pending_input_change=false;self.running=true;self.overload_streak=0;self.overload_notice=false;Ok(())
+        self.pending_input_change=false;self.overload_streak=0;self.overload_notice=false;Ok(())
     }
     pub fn on_stop(&mut self,reason:&str){
+        self.reset_frontend_state();
         self.running=false;self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();self.trigger.disarm();
         for v in &mut self.vfos{v.audio_processor.note_gap();if let Some(d)=v.demod.as_mut(){d.reset();}v.reception_status=json!({"available":false,"reason":"stopped"});}
         if let Some(writer)=self.iq.as_mut().filter(|r|r.active){self.iq_last=writer.stop(reason);}
@@ -333,9 +395,10 @@ impl Engine {
         json!({"version":"0.1.0","running":self.running,"source":self.source,"input":input,"analysis":analysis,"display":display,"audio_epoch":self.audio_epoch,
             "measurement":measurement,"trigger":trigger,"selected_vfo_id":self.selected,"vfos":self.vfos.iter().map(|v|v.state(self.selected,self.running)).collect::<Vec<_>>(),
             "recording":{"iq_active":self.iq_active(),"iq_triggered":self.iq_triggered,"elapsed_seconds":elapsed,"last_iq":self.iq_last},
-            "locks":{"input":self.input_locked(),"center_sample_rate":self.input_locked()||self.wav_active(),"reason":if self.input_locked(){"IQ待機・保存中"}else if self.wav_active(){"WAV録音中は中心周波数・サンプルレートをロック"}else{""}},
+            "locks":{"input":self.input_locked(),"center_sample_rate":self.input_locked()||self.wav_active(),"frontend":self.input_locked()||self.wav_active(),
+                "frontend_reason":if self.input_locked(){"IQのArm・保存中は中心補正を変更できません"}else if self.wav_active(){"WAV録音中は中心補正を変更できません"}else{""},"reason":if self.input_locked(){"IQ待機・保存中"}else if self.wav_active(){"WAV録音中は中心周波数・サンプルレートをロック"}else{""}},
             "device":self.device,"performance":self.performance,"replay":self.replay,"layout":self.layout,"notifications":self.notifications,
-            "calibration":calibration,
+            "calibration":calibration,"frontend":self.frontend,"frontend_status":self.frontend_status(),
             "implementation":{"engineering_defaults":true,"vfo_limit":"performance-dependent","weak_signal_processing":"optional_not_implemented","d03":"original_subject_pending"}})
     }
     pub fn audio(&self,after:u64)->Value{
@@ -352,11 +415,11 @@ impl Engine {
             else{json!({"status":"unavailable","reason":"測定帯域が有効受信帯域外です","cp_dbfs":null,"cp_avg_dbfs":null,"obw_hz":null,"markers":[]})};
         let mode=text(&self.measurement,"marker_mode","auto");
         if mode=="auto"&&(boolean(&self.measurement,"marker_follow",true)||self.frozen_markers.is_empty()){
-            self.frozen_markers=measurement["markers"].as_array().map(|m|m.iter().filter_map(|v|v["frequency_hz"].as_f64()).collect()).unwrap_or_default();
+            self.frozen_markers=measurement["markers"].as_array().map(|m|m.iter().filter_map(|v|v["frequency_hz"].as_f64()).filter(|f|f.is_finite()&&*f>=0.0).collect()).unwrap_or_default();
         }
         let manual=self.measurement["manual_markers"].as_array().cloned().unwrap_or_default();
         let mut markers=vec![];
-        if mode!="manual"&&self.analyzer.total_valid_frames>0{for(index,frequency)in self.frozen_markers.iter().copied().enumerate(){
+        if mode!="manual"&&self.analyzer.total_valid_frames>0{for(index,frequency)in self.frozen_markers.iter().copied().filter(|f|f.is_finite()&&*f>=0.0).enumerate(){
             let(level,status,reason)=self.marker_level(frequency);
             markers.push(json!({"rank":markers.len()+1,"kind":"auto","label":format!("A{}",index+1),"selected":false,
                 "frequency_hz":frequency,"offset_hz":frequency-self.center(),"level_dbfs":level,"status":status,"reason":reason}));
@@ -376,7 +439,7 @@ impl Engine {
         measurement["selected_user_marker_id"]=self.measurement["selected_user_marker_id"].clone();
         measurement["markers"]=json!(markers);frame["measurements"]=measurement;frame["sample_index"]=json!(self.last_sample);
         let now=Utc::now();calibration::apply_frame(&mut frame,self.absolute_offset_at(now),self.calibration.as_ref());
-        frame["calibration"]=self.calibration_status_at(now);frame
+        frame["calibration"]=self.calibration_status_at(now);frame["frontend_status"]=self.frontend_status();frame
     }
     fn stop_iq(&mut self,reason:&str){if let Some(writer)=self.iq.as_mut(){self.iq_last=writer.stop(reason);}self.iq_triggered=false;self.iq_start_sample=None;}
     fn write_iq_until(&mut self,raw:&[u8],start:u64,end:u64){
@@ -391,6 +454,10 @@ impl Engine {
     }
     fn start_iq(&mut self,pre:&[(u64,Vec<u8>)],triggered:bool)->Result<(),String>{
         let mut metadata=self.source_metadata.clone();if !metadata.is_object(){metadata=json!({});}metadata["input_conditions"]=self.input.clone();metadata["source"]=json!(self.source);
+        // Flatten only known source/recorded mode metadata. A requested-mode
+        // inference must never be promoted into an actual-hardware claim.
+        if let Some(mode)=self.frontend_metadata_mode(){metadata["mode_actual"]=json!(mode);}
+        metadata["frontend_processing"]=self.frontend_processing();
         let mut writer=IQRecorder::new(self.recordings_dir(),self.fs(),self.center(),metadata,IQ_BYTES,IQ_SECONDS)?;
         writer.start(pre)?;if writer.limit_reached{return Err("プリトリガが保存上限に達しました".into());}
         self.iq=Some(writer);self.iq_triggered=triggered;self.iq_start_sample=pre.first().map(|chunk|chunk.0);Ok(())
@@ -402,13 +469,17 @@ impl Engine {
         let gap=if self.had_blocks{start.saturating_sub(self.last_sample)}else{0};
         if self.had_blocks&&start<self.last_sample{return Err("入力サンプルの順序が逆転しました".into());}
         if gap>0{
+            self.reset_frontend_state();
             self.audio_epoch=self.audio_epoch.saturating_add(1);
             self.audio_chunks.clear();for v in &mut self.vfos{if let Some(d)=v.demod.as_mut(){d.reset();}v.audio_processor.note_gap();v.reception_status=json!({"available":false,"reason":"gap"});
                 if let Some(writer)=v.wav.as_mut().filter(|w|w.active){writer.observe_processing(&json!({"gap_count":1,"source_complex_samples":0}));}}
             self.notify(&format!("入力欠落を検出：{gap} samples。時間軸とIQメタデータへ記録します。"),"warning");
         }
         self.prebuffer.append(start,raw)?;
-        let iq:Vec<Complex32>=raw.chunks_exact(2).map(|v|Complex32::new((v[0]as f32-127.5)/127.5,(v[1]as f32-127.5)/127.5)).collect();
+        let mut iq:Vec<Complex32>=raw.chunks_exact(2).map(|v|Complex32::new((v[0]as f32-127.5)/127.5,(v[1]as f32-127.5)/127.5)).collect();
+        // Recording/pre-trigger retain the original bytes. Only this shared
+        // analysis/demodulation/trigger branch receives center rejection.
+        if self.frontend_effective(){self.center_dc_rejector.process_in_place(&mut iq);}
         let result=self.analyzer.process(&iq,start);
         if self.trigger.armed{
             let (low,high)=self.linked_band(&self.trigger_config)?;
@@ -525,15 +596,20 @@ impl Engine {
         if ![1_024_000.0,1_536_000.0,2_048_000.0,2_400_000.0].contains(&fs){return Err("この版のサンプルレートは1.024/1.536/2.048/2.4 MS/sです".into());}
         let center=finite(num(input,"center_hz",f64::NAN),"中心周波数")?;
         if !(10_000.0..=1_766_000_000.0).contains(&center){return Err("中心周波数が設定範囲外です".into());}
-        if !["auto","tuner","direct_q","direct_i"].contains(&text(input,"mode","auto")){return Err("入力モードが不正です".into());}
+        let mode=input["mode"].as_str().ok_or("入力モードは文字列で指定してください")?;
+        if !["auto","tuner","direct_q","direct_i"].contains(&mode){return Err("入力モードが不正です".into());}
+        // The pinned Blog DLL treats mode 0 as automatic on this receiver. Reject
+        // impossible explicit modes before Runtime stops the current stream.
+        if mode=="tuner"&&center<24_000_000.0{return Err("このドライバーのチューナーモードは24 MHz以上で指定してください".into());}
+        if ["direct_i","direct_q"].contains(&mode)&&center>28_800_000.0{return Err("RTL-SDR V3のDirect Samplingは28.8 MHz以下で指定してください。鏡像の影響にも注意してください".into());}
         let gain=finite(num(input,"gain_db",f64::NAN),"ゲイン")?;if !(-10.0..=60.0).contains(&gain){return Err("ゲインの指定範囲は-10〜60 dBです。実効値は受信機に合わせて表示します。".into());}
         if input.get("agc").and_then(Value::as_bool).is_none(){return Err("AGCは真偽値で指定してください".into());}
         let ppm=num(input,"ppm",f64::NAN);if !ppm.is_finite()||ppm.fract()!=0.0||ppm.abs()>500.0{return Err("PPMは-500〜500の整数です".into());}
-        if input["device_index"].as_u64().is_none(){return Err("受信機番号が不正です".into());}Ok(())
+        if input["device_index"].as_u64().is_none_or(|index|u32::try_from(index).is_err()){return Err("受信機番号は0〜4294967295の整数です".into());}Ok(())
     }
     fn configuration(&self)->Value{let mut input=self.input.clone();if let Some(fields)=input.as_object_mut(){fields.remove("gain_actual_db");}
         json!({"version":1,"input":input,"analysis":{ "config":self.analyzer.config,"extra":self.analysis_extra},
-        "display":self.display,"measurement":self.measurement,"trigger":self.trigger_config,"layout":self.layout,
+        "display":self.display,"measurement":self.measurement,"trigger":self.trigger_config,"layout":self.layout,"frontend":self.frontend,
         "calibration":self.calibration.as_ref().map(Calibration::to_json),"requested_level_unit":self.requested_level_unit,
         "vfos":self.vfos.iter().map(Vfo::config).collect::<Vec<_>>(),"selected_vfo_id":self.selected,"preferred_source":if self.source=="demo"{"demo"}else{"live"}})}
     fn save_last(&self)->Result<(),String>{
@@ -545,11 +621,15 @@ impl Engine {
     fn restore_configuration(&mut self,value:&Value)->Result<(),String>{
         let mut input=self.input.clone();merge(&mut input,&value["input"]);Self::validate_input(&input).map_err(|e|e.message)?;
         input["gain_actual_db"]=Value::Null;
+        let mut frontend=json!({"dc_reject_enabled":true});
+        if let Some(patch)=value.get("frontend"){Self::validate_frontend_patch(patch).map_err(|e|e.message)?;merge(&mut frontend,patch);}
         let calibration=if value["calibration"].is_null(){None}else{Some(Calibration::from_json(&value["calibration"])?)};
         let unit=text(value,"requested_level_unit","relative");if !["relative","absolute"].contains(&unit){return Err("レベル単位設定が不正です".into());}
         let mut config:Config=serde_json::from_value(value["analysis"]["config"].clone()).map_err(|e|e.to_string())?;config.sample_rate=num(&input,"sample_rate",2_048_000.0);dsp::validate_config(&config)?;
         let mut display=self.display.clone();merge(&mut display,&value["display"]);Self::validate_display(&display,Self::usable_for(&input)).map_err(|e|e.message)?;
         let mut trigger_config=self.trigger_config.clone();merge(&mut trigger_config,&value["trigger"]);
+        let trigger_low=finite(num(&trigger_config,"low_hz",f64::NAN),"監視下端").map_err(|e|e.message)?;let trigger_high=finite(num(&trigger_config,"high_hz",f64::NAN),"監視上端").map_err(|e|e.message)?;
+        if trigger_low<0.0||trigger_low>=trigger_high{return Err("監視帯域は0 Hz以上で下端を上端より低くしてください".into());}
         let trigger=TriggerController::new(config.sample_rate,Self::trigger_controller_config(&trigger_config))?;
         if trigger.pre_seconds>PRE_BYTES as f64/2.0/config.sample_rate{return Err("プリトリガがメモリー容量を超えます".into());}
         let mut measurement=self.measurement.clone();merge(&mut measurement,&value["measurement"]);Self::validate_measurement(&mut measurement).map_err(|e|e.message)?;
@@ -562,6 +642,7 @@ impl Engine {
         self.display=display;self.measurement=measurement;self.trigger_config=trigger_config;self.trigger=trigger;
         self.prebuffer=PreTriggerBuffer::new(self.fs(),PRE_BYTES)?;if value["layout"].is_object(){self.layout=value["layout"].clone();}
         self.source=if value["preferred_source"]=="demo"{"demo"}else{"live"}.into();self.calibration=calibration;self.requested_level_unit=unit.into();
+        self.frontend=frontend;self.reset_frontend_state();
         self.source_metadata=json!({});self.audio_chunks.clear();self.frozen_markers.clear();self.had_blocks=false;self.trigger_last_frame=None;self.last_sample=0;
         self.performance=json!({"processing_ms":0.0,"load_percent":0.0,"instant_load_percent":0.0,"gap_samples":0,"dropped_samples":0,"valid_frames":0,"input_samples":0});Ok(())
     }
@@ -572,7 +653,7 @@ impl Engine {
     }
     fn validate_measurement(value:&mut Value)->Result<(),ActionError>{
         let low=finite(num(value,"low_hz",f64::NAN),"測定下端")?;let high=finite(num(value,"high_hz",f64::NAN),"測定上端")?;
-        if low>=high{return Err("測定下端は上端より低くしてください".into());}
+        if low<0.0||low>=high{return Err("測定帯域は0 Hz以上で下端を上端より低くしてください".into());}
         let obw=finite(num(value,"obw_percent",99.0),"OBW割合")?;if obw<=0.0||obw>=100.0{return Err("OBW割合は0%より大きく100%より小さい値です".into());}
         if value["marker_count"].as_u64().unwrap_or(0)==0{return Err("Marker本数は1以上の整数です".into());}
         if !["auto","manual"].contains(&text(value,"marker_mode","auto")){return Err("Markerモードが不正です".into());}
@@ -587,6 +668,7 @@ impl Engine {
             // Legacy files contained frequency-only objects. Numeric entries
             // are accepted as frequencies as well; all saved output is canonical.
             let frequency=finite(if marker.is_number(){marker.as_f64().unwrap_or(f64::NAN)}else{num(&marker,"frequency_hz",f64::NAN)},"Marker周波数")?;
+            if frequency<0.0{return Err("Marker周波数は0 Hz以上で指定してください".into());}
             let id=if let Some(id)=marker.get("id").and_then(identifier){id}else{
                 while used.contains(&next){next=next.checked_add(1).ok_or("ユーザーMarker IDを確保できません")?;}
                 let id=next;used.insert(id);id
@@ -612,8 +694,9 @@ impl Engine {
         json!({"files":files,"presets":presets})
     }
     pub fn apply(&mut self,body:&Value)->Result<Value,ActionError>{
-        self.apply_action(body)?;
-        if text(body,"action","")!="trace_reset"{
+        let frontend_before=self.frontend.clone();self.apply_action(body)?;
+        let frontend_noop=text(body,"action","")=="set_frontend"&&frontend_before==self.frontend;
+        if text(body,"action","")!="trace_reset"&&!frontend_noop{
             if let Err(error)=self.save_last(){self.notify(&format!("設定の保存に失敗しました：{error}"),"warning");}
         }
         Ok(self.state())
@@ -621,6 +704,14 @@ impl Engine {
     fn apply_action(&mut self,body:&Value)->Result<(),ActionError>{
         match text(body,"action",""){
             "trace_reset"=>self.analyzer.reset_traces(),
+            "set_frontend"=>{
+                Self::validate_frontend_patch(&body["frontend"])?;
+                let mut candidate=self.frontend.clone();merge(&mut candidate,&body["frontend"]);
+                if candidate==self.frontend{return Ok(());}
+                if self.input_locked()||self.wav_active(){return Err(ActionError::locked("Arm・IQ保存・WAV録音を終了してから中心補正を変更してください"));}
+                self.frontend=candidate;self.reset_dsp()?;
+                self.notify("中心DC補正を変更し、解析・密度・Trace・音声の履歴をクリアしました。原IQ保存は未補正です。","info");
+            },
             "set_input"=>{
                 let patch=&body["input"];let candidate=self.plan_input(patch,boolean(body,"confirm_impacted",false))?;
                 let changed=patch.as_object().unwrap().keys().any(|key|!same(&self.input[key.as_str()],&candidate[key.as_str()]));
@@ -733,7 +824,7 @@ impl Engine {
                 if !body["trigger"].is_object(){return Err("トリガ設定が不正です".into());}
                 let mut config=self.trigger_config.clone();merge(&mut config,&body["trigger"]);
                 let low=finite(num(&config,"low_hz",f64::NAN),"監視下端")?;let high=finite(num(&config,"high_hz",f64::NAN),"監視上端")?;
-                if low>=high{return Err("監視下端は上端より低くしてください".into());}
+                if low<0.0||low>=high{return Err("監視帯域は0 Hz以上で下端を上端より低くしてください".into());}
                 if let Some(id)=config.get("link_vfo").and_then(identifier){if !self.vfos.iter().any(|v|v.id==id){return Err("連動先VFOがありません".into());}}
                 let controller=TriggerController::new(self.fs(),Self::trigger_controller_config(&config))?;
                 if controller.pre_seconds>self.prebuffer.capacity_seconds(){return Err(format!("プリトリガは確保可能時間 {:.3} s 以内にしてください",self.prebuffer.capacity_seconds()).into());}
@@ -842,7 +933,9 @@ impl Engine {
 #[cfg(test)]
 mod tests{
     use super::*;
-    fn engine()->Engine{Engine::new(std::env::temp_dir().join(format!("spectrum-engine-test-{}-{}",std::process::id(),Utc::now().timestamp_nanos_opt().unwrap()))).unwrap()}
+    // Existing tests exercise the unprocessed measurement path explicitly.
+    // New frontend tests below cover the product's default-ON receiver path.
+    fn engine()->Engine{let mut e=Engine::new(std::env::temp_dir().join(format!("spectrum-engine-test-{}-{}",std::process::id(),Utc::now().timestamp_nanos_opt().unwrap()))).unwrap();e.frontend=json!({"dc_reject_enabled":false});e}
     fn trace_test_iq(samples:usize,amplitude:f64)->Vec<u8>{
         (0..samples).flat_map(|k|{let phase=-std::f64::consts::TAU*256000.0*k as f64/2048000.0;
             [(127.5+amplitude*phase.cos()).round()as u8,(127.5+amplitude*phase.sin()).round()as u8]}).collect()
@@ -1354,5 +1447,231 @@ mod tests{
         let edge=4096.0f64*0.45;
         assert_roi_trigger_matches_cp(edge-0.6,edge,edge.floor(),2400000.0);
         assert_roi_trigger_matches_cp(-edge,-edge+0.6,-edge.floor(),2400000.0);
+    }
+
+    fn frontend_tone_raw(samples:usize)->Vec<u8>{
+        (0..samples).flat_map(|sample|{
+            let t=sample as f64/2_048_000.0;let phase=std::f64::consts::TAU*50_000.0*t;
+            let envelope=0.03*(1.0+0.5*(std::f64::consts::TAU*1_000.0*t).cos());
+            [((0.16+envelope*phase.cos())*127.5+127.5).round()as u8,
+             ((-0.12+envelope*phase.sin())*127.5+127.5).round()as u8]
+        }).collect()
+    }
+    #[test]
+    fn frontend_default_legacy_configuration_and_strict_validation(){
+        let project=std::env::temp_dir().join(format!("frontend-default-{}-{}",std::process::id(),Utc::now().timestamp_nanos_opt().unwrap()));
+        let mut e=Engine::new(project.clone()).unwrap();assert_eq!(e.state()["frontend"]["dc_reject_enabled"],true);
+        assert_eq!(e.state()["frontend_status"]["reason"],"stopped");assert_eq!(e.state()["frontend_status"]["applied"],false);
+        let before=e.state();e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        assert_eq!(e.state(),before);assert!(!project.exists(),"A no-op must not create a settings file");
+        for patch in [json!(null),json!(true),json!({"dc_reject_enabled":1}),json!({"dc_reject_enabled":null}),json!({"cutoff_hz":20})]{
+            assert!(e.apply(&json!({"action":"set_frontend","frontend":patch})).is_err());assert_eq!(e.state(),before);
+        }
+        let mut legacy=e.configuration();legacy.as_object_mut().unwrap().remove("frontend");
+        e.frontend=json!({"dc_reject_enabled":false});e.restore_configuration(&legacy).unwrap();assert_eq!(e.frontend["dc_reject_enabled"],true);
+        e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":false}})).unwrap();
+        let stored=e.configuration();let project=e.project.clone();drop(e);let restored=Engine::new(project).unwrap();
+        assert_eq!(restored.frontend["dc_reject_enabled"],false);assert_eq!(restored.configuration(),stored);
+    }
+    #[test]
+    fn frontend_corrects_search_demod_branch_while_iq_recording_and_prebuffer_stay_raw(){
+        let mut e=engine();e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        let center=e.center();e.apply(&json!({"action":"set_measurement","measurement":{"low_hz":center-100_000.0,"high_hz":center+100_000.0,"marker_count":1}})).unwrap();
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"frequency_hz":center+50_000.0,"bandwidth_hz":12_000.0,"mode":"AM"}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":center,"mode_actual":"tuner"})).unwrap();
+        assert_eq!(e.state()["frontend_status"]["applied"],true);
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.apply(&json!({"action":"iq_start"})).unwrap();
+        let raw=frontend_tone_raw(65536);let original=raw.clone();e.process_block(0,&raw).unwrap();assert_eq!(raw,original);
+        let pre:Vec<u8>=e.prebuffer.get(1.0,None).unwrap().0.into_iter().flat_map(|(_,bytes)|bytes).collect();assert_eq!(pre,raw);
+        let center_level=db(e.analyzer.last_psd[e.analyzer.config.fft_size/2]*e.analyzer.enbw_hz);
+        let frame=e.frame();let peak=frame["measurements"]["markers"][0]["frequency_hz"].as_f64().unwrap();
+        assert!((peak-(center+50_000.0)).abs()<=e.analyzer.bin_hz,"Corrected peak search should select the off-center station");
+        let peak_level=frame["measurements"]["markers"][0]["level_dbfs"].as_f64().unwrap();
+        assert!(center_level<peak_level-20.0,"DC line must not dominate automatic markers");
+        e.apply(&json!({"action":"user_marker_add"})).unwrap();let selected=e.measurement["manual_markers"][0]["frequency_hz"].as_f64().unwrap();assert!((selected-peak).abs()<1.0);
+        assert!(e.vfos[0].sample_count>0);assert!(e.vfos[0].audio_level>-100.0,"Off-center AM must still demodulate");
+        let wav_conditions=e.vfos[0].wav.as_ref().unwrap().condition_metadata.clone();
+        assert_eq!(wav_conditions["frontend_processing"]["dc_reject_applied_to_processing"],true);
+        e.on_stop("frontend_test");let iq=e.iq.as_ref().unwrap();assert_eq!(fs::read(iq.data_path.as_ref().unwrap()).unwrap(),raw);
+        let meta:Value=serde_json::from_slice(&fs::read(iq.meta_path.as_ref().unwrap()).unwrap()).unwrap();
+        let processing=&meta["global"]["spectrum_studio:input"]["frontend_processing"];
+        assert_eq!(processing["recorded_iq_route"],"raw_cu8_unmodified");assert_eq!(processing["dc_reject_applied_to_processing"],true);
+    }
+    #[test]
+    fn frontend_change_locks_noop_and_history_audio_reset(){
+        let mut e=engine();e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.process_block(0,&frontend_tone_raw(16384)).unwrap();let epoch=e.audio_epoch;
+        e.apply(&json!({"action":"arm"})).unwrap();let before=e.state();
+        e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();assert_eq!(e.state(),before);
+        assert_eq!(e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":false}})).unwrap_err().code,"locked");
+        e.apply(&json!({"action":"disarm"})).unwrap();e.apply(&json!({"action":"wav_start","id":1})).unwrap();
+        assert_eq!(e.state()["locks"]["frontend"],true);assert_eq!(e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":false}})).unwrap_err().code,"locked");
+        e.apply(&json!({"action":"wav_stop","id":1})).unwrap();e.apply(&json!({"action":"iq_start"})).unwrap();
+        assert_eq!(e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":false}})).unwrap_err().code,"locked");e.apply(&json!({"action":"iq_stop"})).unwrap();
+        e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":false}})).unwrap();
+        assert!(e.running);assert!(e.audio_epoch>epoch);assert!(e.audio_chunks.is_empty());assert_eq!(e.analyzer.total_valid_frames,0);
+        assert_eq!(e.state()["frontend_status"]["reason"],"off");assert_eq!(e.state()["frontend_status"]["applied"],false);
+        e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();e.process_block(16384,&frontend_tone_raw(16384)).unwrap();
+        assert!(e.analyzer.total_valid_frames>0);e.on_stop("test");assert_eq!(e.state()["frontend_status"]["applied"],false);
+    }
+    #[test]
+    fn frontend_bypasses_actual_direct_sampling_and_resets_across_gaps_and_seek(){
+        let raw=frontend_tone_raw(16384);let mut e=engine();e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        e.on_start("live",json!({"sample_rate":2048000,"center_hz":32256000,"mode_actual":"direct_q"})).unwrap();e.process_block(0,&raw).unwrap();
+        assert_eq!(e.state()["frontend_status"]["reason"],"direct_sampling");assert_eq!(e.state()["frontend_status"]["applied"],false);
+        let mut reference=Analyzer::new(e.analyzer.config.clone());reference.process(&crate::device::decode(&raw),0);assert_eq!(e.analyzer.last_psd,reference.last_psd);
+        e.on_stop("test");e.on_start("replay",json!({"sample_rate":2048000,"center_hz":32256000,"input_metadata":{"mode_actual":"direct_i"}})).unwrap();
+        assert_eq!(e.state()["frontend_status"]["reason"],"direct_sampling");e.on_stop("test");
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        let first=vec![148u8,133u8].repeat(8192);let second=vec![136u8,124u8].repeat(8192);
+        e.process_block(0,&first).unwrap();e.process_block(8229,&second).unwrap();assert!(e.analyzer.last_psd.iter().all(|v|*v<1e-20),"Gap must discard the previous DC estimate");
+        e.reset_for_seek(20000).unwrap();e.process_block(20000,&first).unwrap();assert!(e.analyzer.last_psd.iter().all(|v|*v<1e-20),"Seek must reset the DC estimate");
+        e.on_stop("test");e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();e.process_block(0,&second).unwrap();assert!(e.analyzer.last_psd.iter().all(|v|*v<1e-20));
+    }
+    #[test]
+    fn frontend_active_path_blocks_absolute_calibration_and_off_restores_eligibility(){
+        let mut e=engine();e.apply(&json!({"action":"calibration_load","calibration":calibration_profile()})).unwrap();e.on_start("live",live_metadata()).unwrap();
+        e.apply(&json!({"action":"set_level_unit","unit":"absolute"})).unwrap();
+        e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        assert_eq!(e.state()["calibration"]["absolute_available"],false);assert_eq!(e.state()["display"]["unit"],"dBFS");
+        assert_eq!(e.apply(&json!({"action":"set_level_unit","unit":"absolute"})).unwrap_err().code,"CALIBRATION_INVALID");
+        e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":false}})).unwrap();assert_eq!(e.state()["calibration"]["absolute_available"],true);assert_eq!(e.state()["display"]["unit"],"dBm");
+    }
+
+    #[test]
+    fn frontend_low_rate_saved_iq_bypasses_without_filter_construction_panic(){
+        let mut e=engine();e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        e.on_start("replay",json!({"sample_rate":20.0,"center_hz":32256000.0,"input_metadata":{"mode_actual":"tuner"}})).unwrap();
+        let status=e.state()["frontend_status"].clone();assert_eq!(status["available"],false);assert_eq!(status["applied"],false);assert_eq!(status["reason"],"sample_rate_unavailable");
+        e.process_block(0,&vec![128u8;1024]).unwrap();e.on_stop("low_rate_test");
+    }
+
+    #[test]
+    fn frontend_deep_direct_replay_recording_flattens_known_mode_and_bypasses_on_replay(){
+        let mut e=engine();e.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        let mut nested=json!({"mode_actual":"direct_q"});for _ in 0..6{nested=json!({"input_metadata":nested});}
+        e.on_start("replay",json!({"sample_rate":2048000,"center_hz":32256000,"input_metadata":nested})).unwrap();
+        let status=e.state()["frontend_status"].clone();assert_eq!(status["input_mode"],"direct_q");assert_eq!(status["input_mode_basis"],"recorded_input_metadata");assert_eq!(status["applied"],false);
+        e.apply(&json!({"action":"iq_start"})).unwrap();let raw=frontend_tone_raw(16384);e.process_block(0,&raw).unwrap();e.on_stop("deep_replay_test");
+        let path=e.iq.as_ref().unwrap().meta_path.as_ref().unwrap();let meta:Value=serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let saved=&meta["global"]["spectrum_studio:input"];assert_eq!(saved["mode_actual"],"direct_q");assert_eq!(saved["frontend_processing"]["input_mode_basis"],"recorded_input_metadata");
+        let mut replay=engine();replay.apply(&json!({"action":"set_frontend","frontend":{"dc_reject_enabled":true}})).unwrap();
+        replay.on_start("replay",json!({"sample_rate":2048000,"center_hz":32256000,"input_metadata":saved})).unwrap();replay.process_block(0,&raw).unwrap();
+        assert_eq!(replay.state()["frontend_status"]["applied"],false);assert_eq!(replay.state()["frontend_status"]["reason"],"direct_sampling");
+        let mut reference=Analyzer::new(replay.analyzer.config.clone());reference.process(&crate::device::decode(&raw),0);assert_eq!(replay.analyzer.last_psd,reference.last_psd);
+        replay.on_stop("test");replay.on_start("replay",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        assert_eq!(replay.state()["frontend_status"]["input_mode_basis"],"requested_configuration_inference");
+    }
+
+    #[test]
+    fn electrical_mode_frequency_limits_reject_before_changing_a_running_stream(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        let before=e.configuration();let epoch=e.audio_epoch;
+        for patch in [
+            json!({"mode":"tuner","center_hz":23_999_999.0}),
+            json!({"mode":"direct_q","center_hz":28_800_001.0}),
+            json!({"mode":"direct_i","center_hz":28_800_001.0}),
+            json!({"center_hz":9_999.0}),json!({"center_hz":1_766_000_001.0}),
+        ]{
+            assert!(e.plan_input(&patch,true).is_err(),"{patch}");
+            assert!(e.apply(&json!({"action":"set_input","input":patch,"confirm_impacted":true})).is_err());
+            assert_eq!(e.configuration(),before);assert!(e.running);assert_eq!(e.audio_epoch,epoch);
+        }
+        for patch in [
+            json!({"mode":"tuner","center_hz":24_000_000.0}),
+            json!({"mode":"auto","center_hz":23_999_999.0}),
+            json!({"mode":"auto","center_hz":24_000_000.0}),
+            json!({"mode":"auto","center_hz":10_000.0}),
+            json!({"mode":"tuner","center_hz":1_766_000_000.0}),
+            json!({"mode":"direct_q","center_hz":28_800_000.0}),
+            json!({"mode":"direct_i","center_hz":28_800_000.0}),
+        ]{assert!(e.plan_input(&patch,true).is_ok(),"{patch}");}
+        assert_eq!(e.configuration(),before);e.on_stop("test");
+    }
+    #[test]
+    fn electrical_input_types_rate_gain_agc_ppm_and_index_boundaries_are_atomic(){
+        let mut e=engine();let before=e.configuration();
+        for patch in [json!({"mode":null}),json!({"mode":1}),json!({"mode":"unknown"}),
+            json!({"device_index":4294967296u64}),json!({"device_index":-1}),json!({"device_index":0.5}),
+            json!({"sample_rate":1_023_999.0}),json!({"sample_rate":2_400_001.0}),json!({"sample_rate":0}),
+            json!({"sample_rate":"2048000"}),json!({"center_hz":null}),json!({"center_hz":"32256000"}),
+            json!({"gain_db":-10.01}),json!({"gain_db":60.01}),json!({"gain_db":null}),
+            json!({"agc":1}),json!({"agc":null}),json!({"ppm":-501}),json!({"ppm":501}),json!({"ppm":0.5})]{
+            assert!(e.plan_input(&patch,true).is_err(),"{patch}");
+            assert!(e.apply(&json!({"action":"set_input","input":patch,"confirm_impacted":true})).is_err());
+            assert_eq!(e.configuration(),before);
+        }
+        for patch in [json!({"sample_rate":1024000}),json!({"sample_rate":1536000}),json!({"sample_rate":2048000}),json!({"sample_rate":2400000}),
+            json!({"gain_db":-10.0}),json!({"gain_db":60.0}),json!({"agc":true}),json!({"agc":false}),
+            json!({"ppm":-500}),json!({"ppm":500}),json!({"device_index":u32::MAX})]{assert!(e.plan_input(&patch,true).is_ok(),"{patch}");}
+        assert_eq!(e.configuration(),before);
+    }
+    #[test]
+    fn electrical_vfo_explicit_invalid_fields_never_fall_back_to_center_or_enable(){
+        let mut e=engine();let before=e.configuration();let epoch=e.audio_epoch;
+        for patch in [json!({"frequency_hz":null}),json!({"frequency_hz":"bad"}),json!({"bandwidth_hz":null}),json!({"bandwidth_hz":"bad"}),
+            json!({"mode":null}),json!({"mode":1}),json!({"enabled":null}),json!({"enabled":1}),json!({"wav_format":null}),json!({"wav_format":24}),
+            json!({"bandwidth_hz":0}),json!({"bandwidth_hz":-1}),json!({"bandwidth_hz":2048000})]{
+            assert!(e.apply(&json!({"action":"update_vfo","id":1,"patch":patch})).is_err(),"{patch}");
+            assert_eq!(e.configuration(),before);assert_eq!(e.audio_epoch,epoch);
+        }
+        assert!(e.make_vfo(&Value::Null,2).is_err());assert!(e.make_vfo(&json!({}),2).is_ok());
+        assert!(e.make_vfo(&json!({"mode":"am","wav_format":"pcm24","enabled":false}),2).is_ok());
+    }
+    #[test]
+    fn electrical_vfo_filter_edges_include_zero_and_reject_one_hz_outside(){
+        let mut e=engine();e.apply(&json!({"action":"set_input","input":{"center_hz":10000},"confirm_impacted":true})).unwrap();
+        let low=json!({"frequency_hz":5000,"bandwidth_hz":10000,"mode":"AM"});
+        assert!(e.make_vfo(&low,2).is_ok());
+        assert!(e.make_vfo(&json!({"frequency_hz":4999,"bandwidth_hz":10000,"mode":"AM"}),2).is_err());
+        assert!(e.make_vfo(&json!({"frequency_hz":-1,"bandwidth_hz":10000,"mode":"AM","enabled":false}),2).is_err());
+        let width=10000.0;let upper=e.center()+e.usable()/2.0-width/2.0;
+        assert!(e.make_vfo(&json!({"frequency_hz":upper,"bandwidth_hz":width,"mode":"AM"}),2).is_ok());
+        assert!(e.make_vfo(&json!({"frequency_hz":upper+1.0,"bandwidth_hz":width,"mode":"AM"}),2).is_err());
+        e.apply(&json!({"action":"add_vfo","vfo":low})).unwrap();let before=e.configuration();let id=e.vfos.last().unwrap().id;
+        assert!(e.apply(&json!({"action":"update_vfo","id":id,"patch":{"frequency_hz":4999}})).is_err());assert_eq!(e.configuration(),before);
+    }
+    #[test]
+    fn electrical_manual_marker_and_roi_zero_edges_reject_negative_rf_atomically(){
+        let mut e=engine();e.apply(&json!({"action":"set_input","input":{"center_hz":10000},"confirm_impacted":true})).unwrap();
+        e.apply(&json!({"action":"user_marker_add","frequency_hz":0})).unwrap();
+        e.apply(&json!({"action":"set_measurement","measurement":{"low_hz":0,"high_hz":20000}})).unwrap();
+        e.apply(&json!({"action":"set_trigger","trigger":{"low_hz":0,"high_hz":20000}})).unwrap();
+        assert!(e.band_valid(0.0,20000.0));assert!(!e.band_valid(-1.0,20000.0));let before=e.configuration();
+        for body in [json!({"action":"user_marker_add","frequency_hz":-1}),json!({"action":"user_marker_move","id":1,"frequency_hz":-1}),
+            json!({"action":"set_measurement","measurement":{"manual_markers":[{"frequency_hz":-1}]}}),
+            json!({"action":"set_measurement","measurement":{"low_hz":-1}}),json!({"action":"set_trigger","trigger":{"low_hz":-1}})]{
+            assert!(e.apply(&body).is_err(),"{body}");assert_eq!(e.configuration(),before);
+        }
+        let mut invalid=before.clone();invalid["trigger"]["low_hz"]=json!(-1);assert!(e.restore_configuration(&invalid).is_err());assert_eq!(e.configuration(),before);
+        assert_eq!(e.marker_level(-1.0).1,"out_of_band");
+    }
+    #[test]
+    fn electrical_interpolated_auto_peaks_and_visible_search_never_choose_negative_rf(){
+        let mut e=engine();e.apply(&json!({"action":"set_input","input":{"center_hz":10000},"confirm_impacted":true})).unwrap();
+        e.apply(&json!({"action":"set_measurement","measurement":{"low_hz":0,"high_hz":50000}})).unwrap();
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":10000})).unwrap();e.process_block(0,&trace_test_iq(16384,20.0)).unwrap();
+        e.analyzer.last_psd.fill(1e-18);let zero=(e.analyzer.config.fft_size as f64/2.0-e.center()/e.analyzer.bin_hz).round() as usize;
+        // The bin centered at RF zero contributes to the nonnegative ROI, but
+        // interpolation toward a stronger left neighbor places its peak below 0.
+        e.analyzer.last_psd[zero-1]=0.4;e.analyzer.last_psd[zero]=1.0;e.analyzer.last_psd[zero+1]=0.01;
+        e.analyzer.last_psd[zero+40]=0.1;
+        let raw_candidates=e.analyzer.measurements(0.0,50000.0,e.center(),99.0,6);
+        assert!(raw_candidates["markers"].as_array().unwrap().iter().any(|m|m["frequency_hz"].as_f64().unwrap()<0.0));
+        let frame=e.frame();let automatic=frame["measurements"]["markers"].as_array().unwrap();assert!(!automatic.is_empty());
+        assert!(automatic.iter().all(|m|m["frequency_hz"].as_f64().unwrap()>=0.0));
+        assert!(e.user_marker_peaks().unwrap().iter().all(|m|m["frequency_hz"].as_f64().unwrap()>=0.0));
+        e.measurement["marker_follow"]=json!(false);e.frozen_markers=vec![-1.0,20000.0];
+        assert!(e.frame()["measurements"]["markers"].as_array().unwrap().iter().all(|m|m["frequency_hz"].as_f64().unwrap()>=0.0));e.on_stop("test");
+    }
+    #[test]
+    fn electrical_display_span_endpoints_and_invalid_types_preserve_state(){
+        let mut e=engine();let usable=e.usable();
+        for span in [100.0,usable]{e.apply(&json!({"action":"set_display","display":{"span_hz":span}})).unwrap();assert_eq!(e.display["span_hz"],span);}
+        let before=e.configuration();
+        for span in [json!(99),json!(usable+1.0),json!(0),Value::Null,json!("100")]{
+            assert!(e.apply(&json!({"action":"set_display","display":{"span_hz":span}})).is_err());assert_eq!(e.configuration(),before);
+        }
     }
 }

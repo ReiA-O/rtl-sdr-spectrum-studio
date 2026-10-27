@@ -1,7 +1,18 @@
 /* Isolated checks against production functions. No HTTP/browser/audio device/hardware. */
 const fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),assert=require('node:assert/strict'),crypto=require('node:crypto');
 const source=fs.readFileSync(path.resolve(__dirname,'../web/app.js'),'utf8');
-function extract(name){const starts=[...source.matchAll(/^  (?:async )?function (\w+)\(/gm)],i=starts.findIndex(m=>m[1]===name);assert(i>=0,name);return source.slice(starts[i].index,i+1<starts.length?starts[i+1].index:source.indexOf('\n  updateFftVisibility();drawAll();',starts[i].index)).trim();}
+// The legacy harness searched for the old bootstrap line after the last function.
+// Parse each candidate closing brace so bootstrap changes cannot leak the outer
+// IIFE into audioLoop; strings/templates/regular expressions are parsed by V8.
+function extract(name){
+ const start=[...source.matchAll(/^  (?:async )?function (\w+)\(/gm)].find(m=>m[1]===name);
+ assert(start,name);
+ for(let end=source.indexOf('}',start.index);end>=0;end=source.indexOf('}',end+1)){
+  const candidate=source.slice(start.index,end+1);
+  try{new vm.Script(candidate,{filename:'app.js:'+name});return candidate;}catch(error){if(!(error instanceof SyntaxError))throw error;}
+ }
+ throw new Error('Unterminated app function '+name);
+}
 const defaults={afc_enabled:false,afc_max_hz:1000,squelch_enabled:false,squelch_dbfs:-60,squelch_hysteresis_db:3,squelch_hang_ms:300,audio_gain_db:0,limiter_enabled:true,limiter_ceiling_dbfs:-2,click_suppression_enabled:true,wav_audio:'demod'};
 const limits={afc_max_hz:{low:1,high:5000,label:'AFC補正上限'},squelch_dbfs:{low:-160,high:10,label:'RFしきい値'},squelch_hysteresis_db:{low:0,high:30,label:'ヒステリシス'},squelch_hang_ms:{low:0,high:5000,label:'保持時間'},audio_gain_db:{low:-24,high:36,label:'音声ゲイン'},limiter_ceiling_dbfs:{low:-24,high:0,label:'保護上限'}};
 const names=['audioConditionsKey','validAudioEpoch','syncStateAudioEpoch','audioPacketMatchesState','vfoEditState','markVfoEdited','receptionConfig','wavRouteLabel','readVfoReception','readVfoBasic','applyVfoSection','receptionReadout','vfoReceptionHtml','vfoCardHtml','syncVfoField','flushAudio','playPcm','audioLoop'];

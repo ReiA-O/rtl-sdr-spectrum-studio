@@ -104,6 +104,12 @@ impl RtlSource {
             let mode=config["mode"].as_str().unwrap_or("auto");
             let direct=if mode=="direct_i"{1}else if mode=="direct_q" ||(mode=="auto"&&center<24_000_000){2}else{0};
             check((lib.set_direct)(dev,direct),"入力モード")?;
+            // Blog's automatic mode can enter direct sampling while its initial
+            // frequency is still zero. Finish that transition before set_rate
+            // chooses tuner bandwidth/IF; a later tuner init would overwrite it.
+            check((lib.set_center)(dev,center),"初期同調")?;
+            let initial_mode=(lib.get_direct)(dev);
+            if initial_mode!=direct{return Err("初期同調後の入力モードが指定と一致しません。".into())}
             check((lib.set_rate)(dev,fs),"サンプルレート")?;
             let ppm=correction_ppm(config)?;let ppm_rc=(lib.set_ppm)(dev,ppm);if ppm_rc!=0&&ppm_rc!=-2{check(ppm_rc,"PPM補正")?;}
             check((lib.set_center)(dev,center),"中心周波数")?;
@@ -119,6 +125,8 @@ impl RtlSource {
                 "gain_db_requested":gain,"gain_db_actual":if direct==0&&!agc{Some((lib.get_gain)(dev)as f64/10.)}else{None},
                 "available_gains_db":gains.iter().map(|g|*g as f64/10.).collect::<Vec<_>>(),"agc":agc,"ppm":ppm,
                 "mode_requested":mode,"mode_actual":match (lib.get_direct)(dev){1=>"direct_i",2=>"direct_q",_=>"tuner"},
+                "initial_tuner_transition_completed_before_rate":true,"initial_direct_sampling_api":initial_mode,
+                "initialization_sequence":"mode, initial tune, rate/BW, PPM, final tune, gain, buffer",
                 "bias_tee_off_requested":true,"bias_tee_voltage_measured":false,"eeprom_written":false}))
         })();
         let mut metadata=match setup{Ok(v)=>v,Err(e)=>{unsafe{(lib.close)(dev);};return Err(e)}};

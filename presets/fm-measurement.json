@@ -29,6 +29,9 @@
     }
   },
   "calibration": null,
+  "frontend": {
+    "dc_reject_enabled": true
+  },
   "display": {
     "range_db": 30,
     "ref_level": -55.0,
