@@ -1,0 +1,29 @@
+{
+  "schema": "spectrum-studio-distribution-demo-1",
+  "files": [
+    {
+      "path": "demo_afg_fm_32mhz.sigmf-data",
+      "destination": "data/recordings/demo_afg_fm_32mhz.sigmf-data",
+      "bytes": 17039360,
+      "sha256": "98eeac276c5b39c0954a6b58cf032a6e2e2e3dae75b4cdcc7e18139f1d97483a"
+    },
+    {
+      "path": "demo_afg_fm_32mhz.sigmf-meta",
+      "destination": "data/recordings/demo_afg_fm_32mhz.sigmf-meta",
+      "bytes": 1822,
+      "sha256": "460bd3b8e62b0fcc30077be4ec47b1ce6ad30a40bff50fbce87c99cb58924396"
+    },
+    {
+      "path": "AFG_FM_32MHz_demo.json",
+      "destination": "data/settings/presets/AFG_FM_32MHz_demo.json",
+      "bytes": 2705,
+      "sha256": "da25254a1e865dbe8bff06271ca141ebaf519ed5442ad532941427919cc76046"
+    },
+    {
+      "path": "README.md",
+      "destination": "demo/README.md",
+      "bytes": 2550,
+      "sha256": "315ecfaa8583094300723ec9273fdafecca5fd4885921db5279557b9904bdb14"
+    }
+  ]
+}

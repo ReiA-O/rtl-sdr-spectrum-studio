@@ -1,0 +1,115 @@
+{
+  "analysis": {
+    "config": {
+      "average_seconds": 1.0,
+      "density_levels": 128,
+      "density_max_db": -20,
+      "density_metric": "rate",
+      "density_min_db": -110,
+      "detector": "sample",
+      "fft_size": 4096,
+      "max_density_history_mb": 64.0,
+      "overlap": 0.5,
+      "persistence_frames": 1000,
+      "persistence_mode": "exponential",
+      "persistence_seconds": 1.0,
+      "persistence_unit": "half_life",
+      "range_db": 90,
+      "ref_level": -30,
+      "sample_rate": 1024000,
+      "stats_mode": "persistence",
+      "switch_policy": "convert",
+      "waterfall_row_seconds": 0.1,
+      "waterfall_rows": 250,
+      "window": "hann"
+    },
+    "extra": {
+      "fft_mode": "manual",
+      "rbw_hz": 375
+    }
+  },
+  "calibration": null,
+  "frontend": {
+    "dc_reject_enabled": true
+  },
+  "display": {
+    "range_db": 90,
+    "ref_level": -30,
+    "span_hz": 900000,
+    "traces": {
+      "avg": false,
+      "live": true,
+      "max": true,
+      "min": true
+    }
+  },
+  "input": {
+    "agc": false,
+    "center_hz": 32256000,
+    "device_index": 0,
+    "gain_db": 49.6,
+    "mode": "auto",
+    "ppm": 0,
+    "sample_rate": 1024000
+  },
+  "layout": {
+    "bottom_ratio": 0.5,
+    "spectrum_ratio": 0.6,
+    "vfo_width": 340
+  },
+  "measurement": {
+    "delta_reference": 0,
+    "high_hz": 32100000,
+    "link_vfo": null,
+    "low_hz": 31900000,
+    "manual_markers": [],
+    "marker_count": 3,
+    "marker_follow": true,
+    "marker_mode": "auto",
+    "obw_percent": 99.0,
+    "selected_user_marker_id": null
+  },
+  "preferred_source": "live",
+  "requested_level_unit": "relative",
+  "selected_vfo_id": 1,
+  "trigger": {
+    "conditions": [],
+    "high_hz": 32100000,
+    "hysteresis_db": 3.0,
+    "link_vfo": null,
+    "logic": "OR",
+    "low_hz": 31900000,
+    "metric": "peak",
+    "min_duration_s": 0.0,
+    "mode": "one_shot",
+    "post_seconds": 2.0,
+    "pre_seconds": 1.0,
+    "rearm_s": 0.2,
+    "threshold_db": -60.0
+  },
+  "version": 1,
+  "vfos": [
+    {
+      "bandwidth_hz": 200000,
+      "enabled": true,
+      "frequency_hz": 32000000,
+      "id": 1,
+      "mode": "WFM",
+      "stopped_reason": null,
+      "wav_format": "PCM16",
+      "reception": {
+        "afc_enabled": false,
+        "afc_max_hz": 1000,
+        "squelch_enabled": false,
+        "squelch_dbfs": -60,
+        "squelch_hang_ms": 300,
+        "squelch_hysteresis_db": 3,
+        "audio_gain_db": 0,
+        "limiter_enabled": true,
+        "limiter_ceiling_dbfs": -2,
+        "click_suppression_enabled": true,
+        "wav_audio": "demod"
+      }
+    }
+  ]
+}

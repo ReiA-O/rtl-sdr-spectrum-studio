@@ -8,11 +8,67 @@ param(
     [string]$RuntimeDllPath,
     [string]$CargoMetadataPath,
     [string]$RustCopyrightPath,
+    [string]$DemoManifestPath,
     [string[]]$ForbiddenText = @()
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $project = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+
+
+# Only the four explicitly approved demo assets can enter a distribution.
+function Read-ApprovedDemoBundle([string]$ManifestPath) {
+    $manifestItem=Get-Item -LiteralPath $ManifestPath -ErrorAction Stop
+    if ($manifestItem -isnot [IO.FileInfo] -or $manifestItem.Length -lt 1 -or $manifestItem.Length -gt 262144 -or ($manifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Demo manifest must be a regular file of at most 256 KiB.' }
+    $manifestPathResolved=$manifestItem.FullName
+    $demoParent=[IO.Path]::GetDirectoryName($manifestPathResolved)
+    $catalogText=[IO.File]::ReadAllText($manifestPathResolved)
+    if (!$catalogText.TrimStart().StartsWith('{',[StringComparison]::Ordinal)) { throw 'Demo manifest root must be a JSON object.' }
+    $catalog=$catalogText | ConvertFrom-Json
+    if ($catalog -isnot [pscustomobject]) { throw 'Demo manifest must be an object.' }
+    $catalogFields=@($catalog.PSObject.Properties.Name)
+    if ($catalogFields.Count -ne 2 -or @($catalogFields | Where-Object { $_ -cnotin @('schema','files') }).Count -gt 0 -or $catalog.schema -isnot [string] -or $catalog.schema -cne 'spectrum-studio-distribution-demo-1') { throw 'Unsupported demo manifest fields or schema.' }
+    if ($catalog.files -isnot [array] -or $catalog.files.Count -ne 4) { throw 'Demo manifest must contain exactly four approved files.' }
+    $demoDestinations=@{
+        'demo_afg_fm_32mhz.sigmf-data'='data/recordings/demo_afg_fm_32mhz.sigmf-data'
+        'demo_afg_fm_32mhz.sigmf-meta'='data/recordings/demo_afg_fm_32mhz.sigmf-meta'
+        'AFG_FM_32MHz_demo.json'='data/settings/presets/AFG_FM_32MHz_demo.json'
+        'README.md'='demo/README.md'
+    }
+    $demoSeenSources=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $demoSeenDestinations=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $approvedFiles=@()
+    foreach ($demoEntry in $catalog.files) {
+        if ($demoEntry -isnot [pscustomobject]) { throw 'Demo file entry must be an object.' }
+        $entryFields=@($demoEntry.PSObject.Properties.Name)
+        if ($entryFields.Count -ne 4 -or @($entryFields | Where-Object { $_ -cnotin @('path','destination','bytes','sha256') }).Count -gt 0) { throw 'Unknown or missing demo file fields.' }
+        if ($demoEntry.path -isnot [string] -or $demoEntry.path -cnotin @($demoDestinations.Keys)) { throw 'Demo source path is not approved.' }
+        if ($demoEntry.destination -isnot [string] -or $demoEntry.destination -cne $demoDestinations[$demoEntry.path]) { throw 'Demo destination does not match the approved source.' }
+        if (!$demoSeenSources.Add($demoEntry.path) -or !$demoSeenDestinations.Add($demoEntry.destination)) { throw 'Duplicate demo source or destination.' }
+        if ($demoEntry.bytes -isnot [ValueType] -or $demoEntry.bytes -is [bool]) { throw 'Demo byte count must be a finite integer.' }
+        $byteCount=[double]$demoEntry.bytes
+        $maximum=if ($demoEntry.path -ceq 'demo_afg_fm_32mhz.sigmf-data') { 67108864 } else { 262144 }
+        if ([double]::IsNaN($byteCount) -or [double]::IsInfinity($byteCount) -or $byteCount -lt 1 -or $byteCount -gt $maximum -or $byteCount -ne [Math]::Floor($byteCount)) { throw 'Demo file exceeds its size limit or has an invalid byte count.' }
+        if ($demoEntry.path -ceq 'demo_afg_fm_32mhz.sigmf-data' -and ($byteCount -lt 2 -or $byteCount % 2 -ne 0)) { throw 'Demo IQ must contain complete interleaved I/Q byte pairs.' }
+        if ($demoEntry.sha256 -isnot [string] -or $demoEntry.sha256 -notmatch '^[A-Fa-f0-9]{64}$') { throw 'Demo SHA256 is invalid.' }
+        $sourcePath=[IO.Path]::GetFullPath((Join-Path $demoParent $demoEntry.path))
+        if (!$sourcePath.StartsWith($demoParent+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw 'Demo source escapes the manifest directory.' }
+        $sourceItem=Get-Item -LiteralPath $sourcePath -ErrorAction Stop
+        if ($sourceItem -isnot [IO.FileInfo] -or ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $sourceItem.Length -ne [long]$byteCount) { throw 'Demo source file type or size does not match.' }
+        $sourceHash=(Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($sourceHash -cne $demoEntry.sha256.ToLowerInvariant()) { throw 'Demo source SHA256 does not match.' }
+        $approvedFiles+=@{path=$demoEntry.path;source_path=$sourcePath;destination=$demoEntry.destination;bytes=[long]$byteCount;sha256=$sourceHash}
+    }
+    return [pscustomobject]@{manifest_path=$manifestPathResolved;manifest_sha256=(Get-FileHash -LiteralPath $manifestPathResolved -Algorithm SHA256).Hash.ToLowerInvariant();files=$approvedFiles}
+}
+
+$demoBundle=$null
+if (!$DemoManifestPath) {
+    $defaultDemoManifest=Join-Path $project 'demo\manifest.json'
+    if (Test-Path -LiteralPath $defaultDemoManifest -PathType Leaf) { $DemoManifestPath=$defaultDemoManifest }
+}
+if ($DemoManifestPath) { $demoBundle=Read-ApprovedDemoBundle $DemoManifestPath }
+
 if (!$OutputParent) { $OutputParent = Join-Path $project 'dist' }
 if (!$PresetPath) { $PresetPath = Join-Path $project 'presets\fm-measurement.json' }
 if (!$CargoMetadataPath) { $CargoMetadataPath = Join-Path $PSScriptRoot 'portable-support\cargo-metadata-windows.json' }
@@ -119,6 +175,20 @@ $presetName=[IO.Path]::GetFileName($PresetPath)
 Copy-New $PresetPath (Join-Path 'data\settings\presets' $presetName)
 Copy-New $PresetPath 'data\settings\last-session.json'
 [IO.Directory]::CreateDirectory((Join-Path $destination 'data\recordings')) | Out-Null
+
+$approvedDemoFiles=@()
+if ($demoBundle) {
+    foreach ($approvedDemoFile in $demoBundle.files) {
+        Copy-New $approvedDemoFile.source_path $approvedDemoFile.destination
+        $copiedDemoPath=Join-Path $destination $approvedDemoFile.destination
+        $copiedDemoHash=(Get-FileHash -LiteralPath $copiedDemoPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ((Get-Item -LiteralPath $copiedDemoPath).Length -ne $approvedDemoFile.bytes -or $copiedDemoHash -cne $approvedDemoFile.sha256) { throw 'Copied demo bytes differ from the approved manifest.' }
+        $approvedDemoFiles+=@{path=$approvedDemoFile.path;destination=$approvedDemoFile.destination;bytes=$approvedDemoFile.bytes;sha256=$copiedDemoHash}
+    }
+    Copy-New $demoBundle.manifest_path 'demo/manifest.json'
+    if ((Get-FileHash -LiteralPath (Join-Path $destination 'demo/manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $demoBundle.manifest_sha256) { throw 'Copied demo manifest changed during packaging.' }
+}
+
 Write-New 'studio-root.json' ('{"app_id":"rtl-sdr-spectrum-studio","layout_version":1,"distribution":"private-portable-development","package_version":"'+$PackageVersion+'"}'+"`n")
 $launcher=@'
 @echo off
@@ -136,7 +206,7 @@ $guide=@'
 
 1. ZIPをすべて書込み可能なフォルダーへ展開する。ZIP内から直接起動しない。
 2. `start-studio.cmd` を開く。ローカルブラウザー画面が開く。
-3. 受信機・周波数・ゲインを確認してから、画面の受信開始を押す。
+3. 実機で受信する場合は受信機・周波数・ゲインを確認してから、画面の受信開始を押す。同梱デモの再生は下記の手順を使う。
 4. 終了前に録音と受信を停止し、起動したコンソールで Ctrl+C を押す。
 
 Windows 10/11 x64 と通常のブラウザーを使用する。Rust/Python/Node/Build Toolsの追加は不要。
@@ -151,7 +221,7 @@ Windows 10/11 x64 と通常のブラウザーを使用する。Rust/Python/Node/
 画面を開かない診断: `start-studio.cmd --self-check`（受信・サーバー・録音は開始しない）。
 
 新しい版は別フォルダーへ展開する。既存版の上書き、dataフォルダーの削除、既存録音の移動は行わない。
-このZIPには元PCのIQ/WAV、履歴、校正情報、個人ファイルを含めない。元のユーザーデータは変更しない。
+このZIPには明示承認したAFGデモ以外の元PCのIQ/WAV、履歴、校正情報、個人ファイルを含めない。元のユーザーデータは変更しない。
 再生・スピーカー・持出先PCの実機動作は、それぞれのPCでの確認が必要。
 Spectrumの「ピークリセット」でMax／Min／Averageの履歴を同時にリセットし、現在のLiveから再集計する。受信・録音は継続し、入力条件・密度・Waterfall・Marker位置は維持する。
 Densityの上限・下限は同パネルで手動設定できる。新しい範囲では密度だけを再集計し、Spectrumの保持値やWaterfall・受信は維持する。
@@ -168,6 +238,22 @@ v0.4.0は同じ開発PCで設定境界・保存IQ API・50Ω終端の有限受�
 本体の画面はexeに内蔵し、外部サーバーからUI資産を取得しない。
 これは個人用の開発版。第三者への公開・配布用のライセンス選定や完全なクリーンPC受入れを済ませた意味ではない。
 '@
+
+if ($demoBundle) {
+    $guide+=@'
+
+
+## 実機なしで同梱AFGデモを再生する
+
+この版には、AFGで作ったFM信号をRTL-SDRで実収録した承認済みデモだけを同梱する。放送・会話などの個人収録データは含めない。受信機を接続せずに再生できる。
+「プリセット」→「AFG_FM_32MHz_demo」を読み込み、設定画面の×で閉じる→「保存データ」→「demo_afg_fm_32mhz」の「IQ再生」→上部「再生開始」→「音声ON」の順で操作する。
+対象は搬送波32 MHzのFM。デモ用VFOの周波数・帯域を使い、受信中心に局を置かない。元のIQは未補正であり、中心DC補正ON/OFFを比較できる。再生位置はIQ再生パネルのスライダーで変更できる。
+同梱データの由来・条件は `demo/README.md`、データと設定のhashは `demo/manifest.json` に記録する。再生開始・音声出力は手動で行い、実機受信を自動開始しない。
+'@
+} else {
+    $guide+="`n`nこのパッケージには保存IQのデモファイルを同梱していない。保存IQの再生は、アプリ内へSigMFのmetadataとdataを置き『保存データ』から開始する。`n"
+}
+
 Write-New 'はじめに.md' $guide
 foreach ($item in Get-ChildItem -LiteralPath (Join-Path $support 'licenses') -File) { Copy-New $item.FullName (Join-Path 'licenses' $item.Name) }
 foreach ($item in Get-ChildItem -LiteralPath (Join-Path $support 'sources') -File) { Copy-New $item.FullName (Join-Path 'third-party-source' $item.Name) }
@@ -193,10 +279,10 @@ Write-New 'licenses\rust-crates.json' (@{ resolved_windows_crates=$crateNotices;
 Copy-New (Join-Path $support 'NOTICE.md') 'licenses\THIRD-PARTY-NOTICES.md'
 Copy-New (Join-Path $support 'provenance.json') 'licenses\upstream-provenance.json'
 $files=@(Get-ChildItem -LiteralPath $destination -File -Recurse | ForEach-Object { @{ path=$_.FullName.Substring($destination.Length+1).Replace('\','/');bytes=$_.Length;sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() } })
-$manifest=@{ application='RTL-SDR Spectrum Studio';package_version=$PackageVersion;created_at=(Get-Date).ToString('o');architecture='windows-x64';web_assets='embedded in executable';startup_receive=$false;startup_arm=$false;startup_record=$false;user_data='New package-local data directory; no existing user recordings/session copied';initial_preset=$presetName;initial_preset_sha256=(Get-FileHash -LiteralPath $PresetPath -Algorithm SHA256).Hash.ToLowerInvariant();pe_images=$peInfo;files=$files }
+$manifest=@{ application='RTL-SDR Spectrum Studio';package_version=$PackageVersion;created_at=(Get-Date).ToString('o');architecture='windows-x64';web_assets='embedded in executable';startup_receive=$false;startup_arm=$false;startup_record=$false;user_data='New package-local data; approved AFG demo only when included; no private user recordings/session copied';approved_demo_included=($null -ne $demoBundle);approved_demo_manifest_sha256=$(if ($demoBundle) { $demoBundle.manifest_sha256 } else { $null });approved_demo_files=$approvedDemoFiles;initial_preset=$presetName;initial_preset_sha256=(Get-FileHash -LiteralPath $PresetPath -Algorithm SHA256).Hash.ToLowerInvariant();pe_images=$peInfo;files=$files }
 Write-New 'package-manifest.json' ($manifest | ConvertTo-Json -Depth 14)
-$validation=@{ pe_x64_and_dependencies_checked=$true;approved_binary_hash_matches=$true;no_absolute_path_in_initial_preset=$true;privacy_utf8_utf16_all_files_checked=($ForbiddenText.Count -gt 0);privacy_term_count=$ForbiddenText.Count;existing_user_data_modified=$false;existing_recordings_copied=$false;application_started_by_packager=$false;hardware_operated_by_packager=$false;self_check_executed=$false;clean_windows_pc_tested=$false;outside_laptop_rf_tested=$false }
-Write-New 'package-validation.json' ($validation | ConvertTo-Json)
+$validation=@{ pe_x64_and_dependencies_checked=$true;approved_binary_hash_matches=$true;no_absolute_path_in_initial_preset=$true;privacy_utf8_utf16_all_files_checked=($ForbiddenText.Count -gt 0);privacy_term_count=$ForbiddenText.Count;existing_user_data_modified=$false;private_user_recordings_copied=$false;approved_demo_included=($null -ne $demoBundle);approved_demo_files=$approvedDemoFiles;application_started_by_packager=$false;hardware_operated_by_packager=$false;self_check_executed=$false;clean_windows_pc_tested=$false;outside_laptop_rf_tested=$false }
+Write-New 'package-validation.json' ($validation | ConvertTo-Json -Depth 8)
 $privacyLatin1=[Text.Encoding]::GetEncoding(28591)
 foreach ($privacyFile in Get-ChildItem -LiteralPath $destination -File -Recurse) {
     $privacyBytes=[IO.File]::ReadAllBytes($privacyFile.FullName)

@@ -50,3 +50,7 @@ credentials*.json
 *.dll
 *.pdb
 *.zip
+
+# Explicit distribution fixture; all other captured media remain ignored
+!/demo/demo_afg_fm_32mhz.sigmf-data
+!/demo/demo_afg_fm_32mhz.sigmf-meta

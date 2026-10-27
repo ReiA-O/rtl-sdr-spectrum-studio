@@ -1,0 +1,53 @@
+{
+  "global": {
+    "core:datatype": "cu8",
+    "core:version": "1.2.6",
+    "core:sample_rate": 1024000,
+    "core:num_channels": 1,
+    "core:dataset": "demo_afg_fm_32mhz.sigmf-data",
+    "core:description": "AFG3102 CH1 laboratory FM signal recorded by RTL-SDR Spectrum Studio. Carrier32MHz; deviation+/-75kHz; modulation1kHz. Not a broadcast recording. Raw IQ bytes unchanged; metadata anonymized and sample origin rebased to zero.",
+    "spectrum_studio:input": {
+      "name": "AFG FM laboratory demo",
+      "mode_requested": "auto",
+      "mode_actual": "tuner",
+      "sample_rate": 1024000,
+      "center_hz": 32256000,
+      "gain_db_requested": 49.6,
+      "gain_db_actual": 49.6,
+      "agc": false,
+      "ppm": 0,
+      "frontend_processing": {
+        "method": "independent_iq_one_pole_dc_rejection",
+        "cutoff_hz": 20,
+        "dc_reject_enabled": true,
+        "dc_reject_applied_to_processing": true,
+        "recorded_iq_route": "raw_cu8_unmodified"
+      }
+    },
+    "spectrum_studio:recording": {
+      "state": "complete",
+      "samples": 8519680,
+      "gaps": []
+    },
+    "spectrum_studio:demo": {
+      "provenance": "Physical AFG signal captured through two nominal30dB attenuators by Studio; not digitally synthesized IQ.",
+      "afg_load_ohms": 50,
+      "afg_amplitude_setting_vpp": 0.02,
+      "afg_offset_setting_v": 0,
+      "attenuation_nominal_db": 60,
+      "rf_level_measured": false,
+      "carrier_hz": 32000000,
+      "fm_deviation_hz": 75000,
+      "audio_tone_hz": 1000,
+      "raw_sha256": "98eeac276c5b39c0954a6b58cf032a6e2e2e3dae75b4cdcc7e18139f1d97483a"
+    }
+  },
+  "captures": [
+    {
+      "core:sample_start": 0,
+      "core:global_index": 0,
+      "core:frequency": 32256000
+    }
+  ],
+  "annotations": []
+}
