@@ -22,7 +22,7 @@ function functionSource(name) {
   throw new Error(`Unterminated app function ${name}`);
 }
 const names = ['frontendPresentation','frontendRouteKey','frontendFrameMatchesState','frontendDisplayRoute',
-  'renderFrontend','changeFrontend','peakTunePlan','tunePeakFrequency','acceptFrame','refreshState','applyState'];
+  'renderFrontend','changeFrontend','vfoPassband','peakTunePlan','tunePeakFrequency','acceptFrame','refreshState','applyState'];
 const script = new vm.Script(names.map(functionSource).join('\n'));
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -49,7 +49,7 @@ function context(initial = state()) {
     finite:(n,f=0)=>Number.isFinite(Number(n))?Number(n):f,
     mhz:n=>Number(n||0)/1e6,formatHz:n=>String(n),
     levelUnit:()=> 'dBFS',asText:(id,value)=>{element(id).textContent=value;},
-    setValue(){},updateLinks(){},inputLocked:()=>false,notice(){},renderCalibration(){},renderDensityRange(){},renderVfos(){},renderMeasurements(){},
+    setValue(){},updateLinks(){},inputLocked:()=>false,notice(){},renderCalibration(){},renderDensityRange(){},renderVfos(){},renderModulation(){},renderMeasurements(){},
     renderDensityHistory(){},updateFftVisibility(){},updatePresetLoadState(){},applyLayout(){},
     drawAll(){},flushAudio(){},syncStateAudioEpoch(){},updateAudioCaption(){},audioConditionsKey:()=>'',
     requestFrame(){c.frameRequests++;},frameRequests:0,

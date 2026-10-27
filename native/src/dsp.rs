@@ -13,11 +13,33 @@ fn db(power: f64) -> f64 { 10.0 * power.max(1e-30).log10() }
 
 /// Fixed output headroom, not AGC or an S/N improvement. Nominal WFM
 /// ±75 kHz deviation maps to ±0.5 before audio filtering/de-emphasis.
-/// AM carrier-normalized envelope and NFM nominal-deviation units retain
-/// gain one. Floating output is not limited; the PCM sink counts clipping.
+/// AM carrier-normalized envelope, NFM nominal-deviation units and SSB real
+/// product-detected samples retain gain one. Floating output is not limited;
+/// the PCM sink counts clipping.
 pub fn demod_audio_scale(mode: &str) -> f64 {
     if mode.eq_ignore_ascii_case("WFM") { 0.5 } else { 1.0 }
 }
+
+pub const SSB_LOW_CUT_HZ:f64=300.0;
+pub const SSB_MIN_BANDWIDTH_HZ:f64=1000.0;
+pub const SSB_MAX_BANDWIDTH_HZ:f64=14100.0;
+
+/// RF passband offsets from the VFO reference. SSB uses the suppressed carrier
+/// as its reference; bandwidth remains the occupied one-sided RF width.
+pub fn vfo_passband_offsets(mode:&str,bandwidth_hz:f64)->Result<(f64,f64),String>{
+    if !bandwidth_hz.is_finite()||bandwidth_hz<=0.0{return Err("VFO帯域幅は正の有限値が必要です".into());}
+    match mode.to_ascii_uppercase().as_str(){
+        "AM"|"NFM"|"WFM"=>Ok((-bandwidth_hz/2.0,bandwidth_hz/2.0)),
+        "USB"|"LSB"=>{
+            if !(SSB_MIN_BANDWIDTH_HZ..=SSB_MAX_BANDWIDTH_HZ).contains(&bandwidth_hz){return Err("SSBの通過幅は1000〜14100 Hzで指定してください".into());}
+            let high=SSB_LOW_CUT_HZ+bandwidth_hz;
+            if mode.eq_ignore_ascii_case("USB"){Ok((SSB_LOW_CUT_HZ,high))}else{Ok((-high,-SSB_LOW_CUT_HZ))}
+        },
+        _=>Err("復調方式はAM/NFM/WFM/USB/LSBです".into()),
+    }
+}
+
+fn ssb_mode(mode:&str)->bool{mode.eq_ignore_ascii_case("USB")||mode.eq_ignore_ascii_case("LSB")}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -586,15 +608,36 @@ fn lowpass(fs:f64,cutoff:f64,length:usize)->Vec<f32> {
     let sum:f64=taps.iter().sum();taps.iter_mut().for_each(|x|*x/=sum);taps.into_iter().map(|v|v as f32).collect()
 }
 
+fn ssb_lowpass(fs:f64,cutoff:f64,length:usize)->Vec<f32>{
+    let length=length.max(65)|1;let middle=(length-1)as f64/2.0;
+    let mut taps:Vec<f64>=(0..length).map(|i|{
+        let distance=i as f64-middle;let phase=TAU*i as f64/(length-1)as f64;
+        let sinc=if distance.abs()<1e-15{2.0*cutoff/fs}else{(TAU*cutoff*distance/fs).sin()/(PI*distance)};
+        sinc*(0.42-0.5*phase.cos()+0.08*(2.0*phase).cos())
+    }).collect();
+    let sum:f64=taps.iter().sum();taps.iter_mut().for_each(|value|*value/=sum);taps.into_iter().map(|value|value as f32).collect()
+}
+
+fn ssb_bandpass(fs:f64,low:f64,high:f64)->Vec<Complex32>{
+    let length=((6.0*fs/300.0).ceil()as usize).clamp(65,8191)|1;
+    let middle=(length-1)as f64/2.0;let center=(low+high)/2.0;
+    ssb_lowpass(fs,(high-low)/2.0,length).into_iter().enumerate().map(|(index,tap)|{
+        Complex32::from_polar(tap,(TAU*center*(index as f64-middle)/fs)as f32)
+    }).collect()
+}
+
 struct Fir {
     taps:usize, fft_len:usize, history:Vec<Complex32>, response:Vec<Complex32>,
     forward:Arc<dyn Fft<f32>>, inverse:Arc<dyn Fft<f32>>, work:Vec<Complex32>,scratch:Vec<Complex32>,
 }
 impl Fir {
     fn new(taps:Vec<f32>)->Self {
+        Self::new_complex(taps.into_iter().map(|tap|Complex32::new(tap,0.0)).collect())
+    }
+    fn new_complex(taps:Vec<Complex32>)->Self{
         let fft_len=(4096usize.max(taps.len()*8)).next_power_of_two();
         let mut planner=FftPlanner::<f32>::new();let forward=planner.plan_fft_forward(fft_len);let inverse=planner.plan_fft_inverse(fft_len);
-        let mut response=vec![Complex32::new(0.0,0.0);fft_len];for (i,t) in taps.iter().enumerate(){response[i].re=*t;}
+        let mut response=vec![Complex32::new(0.0,0.0);fft_len];response[..taps.len()].copy_from_slice(&taps);
         forward.process(&mut response);
         let scratch_len=forward.get_inplace_scratch_len().max(inverse.get_inplace_scratch_len());
         Self {taps:taps.len(),fft_len,history:vec![Complex32::new(0.0,0.0);taps.len()-1],response,
@@ -698,7 +741,7 @@ impl AfcTracker {
 pub struct VfoDemodulator {
     pub sample_rate:f64,pub frequency_offset_hz:f64,pub bandwidth_hz:f64,pub mode:String,pub audio_rate:u32,
     pub channel_rate:f64,pub factor:usize,
-    channel_filter:Fir,audio_filter:Fir,dc:OnePole,deemphasis:Option<OnePole>,
+    channel_filter:Fir,sideband_filter:Option<Fir>,audio_filter:Option<Fir>,dc:OnePole,deemphasis:Option<OnePole>,
     phase:f64,input_count:u64,previous_iq:Option<Complex32>,channel_count:u64,output_count:u64,previous_audio:Option<f64>,
     afc:AfcTracker,
 }
@@ -708,23 +751,42 @@ impl VfoDemodulator {
     }
     pub fn try_new(fs:f64,offset:f64,bw:f64,mode:&str,audio_rate:u32)->Result<Self,String> {
         let mode=mode.to_uppercase();
-        if !["AM","NFM","WFM"].contains(&mode.as_str()) || !fs.is_finite() || !offset.is_finite() || !bw.is_finite()
-            || fs<=0.0 || audio_rate==0 || bw<=0.0 || bw>=fs || offset.abs()+bw/2.0>fs/2.0 {
+        let(low,high)=vfo_passband_offsets(&mode,bw)?;
+        if !fs.is_finite() || !offset.is_finite() || !bw.is_finite()
+            || fs<=0.0 || audio_rate==0 || bw<=0.0 || bw>=fs || offset.abs()>fs/2.0 || offset+low< -fs/2.0 || offset+high>fs/2.0 {
             return Err("VFOの方式・帯域・周波数が不正です".into());
         }
-        let target=(bw*1.25).max(audio_rate as f64*4.0);let factor=((fs/target) as usize).max(1);let channel_rate=fs/factor as f64;
+        let ssb=ssb_mode(&mode);let audio_high=SSB_LOW_CUT_HZ+bw;
+        if ssb&&(audio_high>audio_rate as f64*0.45||audio_high>fs*0.45){return Err("SSB音声帯域が入力または音声出力のNyquist余裕を超えています".into());}
+        // Linear SSB detection can decimate before its narrow sideband filter.
+        // Wide SSB settings keep extra rate for the existing linear resampler.
+        let target=if ssb{(audio_rate as f64*1.25).max(audio_high*8.0)}else{(bw*1.25).max(audio_rate as f64*4.0)};
+        let factor=((fs/target) as usize).max(1);let channel_rate=fs/factor as f64;
         let transition=(bw*0.25).min(channel_rate/2.0-bw/2.0).max(500.0);
         let input_taps=((4.0*fs/transition) as usize).clamp(65,4095);
         let cutoff=(audio_rate as f64*0.45).min(if mode=="WFM"{15000.0}else{5000.0_f64.min(bw*0.4)});
         let audio_taps=((4.0*channel_rate/(audio_rate as f64/2.0-cutoff).max(1000.0)) as usize).clamp(65,1023);
+        let channel_filter=if ssb{
+            let alias_edge=channel_rate/2.0;let gap=alias_edge-audio_high;
+            let taps=((6.0*fs/gap).ceil()as usize).clamp(65,4095)|1;
+            Fir::new(ssb_lowpass(fs,(audio_high+alias_edge)/2.0,taps))
+        }else{Fir::new(lowpass(fs,bw/2.0,input_taps))};
         Ok(Self {sample_rate:fs,frequency_offset_hz:offset,bandwidth_hz:bw,mode:mode.clone(),audio_rate,channel_rate,factor,
-            channel_filter:Fir::new(lowpass(fs,bw/2.0,input_taps)),audio_filter:Fir::new(lowpass(channel_rate,cutoff,audio_taps)),
+            channel_filter,sideband_filter:if ssb{Some(Fir::new_complex(ssb_bandpass(channel_rate,low,high)))}else{None},
+            // The SSB complex bandpass already rejects everything above 0.45
+            // output rate. Do not add a second -6 dB edge at the audio cutoff.
+            audio_filter:if ssb{None}else{Some(Fir::new(lowpass(channel_rate,cutoff,audio_taps)))},
             dc:OnePole::new(channel_rate,0.05),deemphasis:if mode=="WFM"{Some(OnePole::new(audio_rate as f64,50e-6))}else{None},
             phase:0.0,input_count:0,previous_iq:None,channel_count:0,output_count:0,previous_audio:None,afc:AfcTracker::new()})
     }
     pub fn reset(&mut self){let(enabled,max_hz)=(self.afc.enabled,self.afc.max_hz);*self=Self::new(self.sample_rate,self.frequency_offset_hz,self.bandwidth_hz,&self.mode,self.audio_rate);self.afc.configure(enabled,max_hz).expect("existing AFC config");}
-    pub fn set_afc(&mut self,enabled:bool,max_hz:f64)->Result<(),String>{self.afc.configure(enabled,max_hz)}
-    pub fn afc_status(&self)->Value{self.afc.status()}
+    pub fn set_afc(&mut self,enabled:bool,max_hz:f64)->Result<(),String>{
+        if enabled&&ssb_mode(&self.mode){return Err("SSBではAFCを有効にできません。抑圧搬送波の基準を手動で同調してください".into());}
+        self.afc.configure(enabled,max_hz)
+    }
+    pub fn afc_status(&self)->Value{
+        let mut status=self.afc.status();if ssb_mode(&self.mode){status["afc_status"]=json!("unsupported_mode");status["afc_enabled"]=json!(false);status["afc_offset_hz"]=json!(0.0);status["afc_locked"]=json!(false);status["quality_db"]=Value::Null;}status
+    }
     pub fn process(&mut self,iq:&[Complex32])->Vec<f32> {
         self.process_with_metrics(iq,None,self.afc.max_hz).audio
     }
@@ -733,6 +795,10 @@ impl VfoDemodulator {
     /// quality must be the independent wideband PSD gate; lack of quality
     /// freezes tracking, never silently switches to a blind tracking loop.
     pub fn process_with_metrics(&mut self,iq:&[Complex32],quality:Option<f64>,max_allowed_hz:f64)->DemodulatedBlock{
+        if ssb_mode(&self.mode){
+            let(audio,power,count)=self.process_segment(iq);
+            return DemodulatedBlock{audio,rf_dbfs:db(power/count.max(1)as f64),afc_offset_hz:0.0,afc_locked:false,quality_db:None,afc_status:"unsupported_mode".into()};
+        }
         let limit=if max_allowed_hz.is_finite(){max_allowed_hz.max(0.0).min(self.afc.max_hz)}else{0.0};
         self.afc.offset_hz=self.afc.offset_hz.clamp(-limit,limit);self.afc.quality=quality.filter(|v|v.is_finite());self.afc.effective_limit=limit;
         if self.afc.enabled&&(limit<=0.0||!self.afc.quality.is_some_and(|v|v>=6.0)){
@@ -765,20 +831,23 @@ impl VfoDemodulator {
         self.phase=(self.phase+omega*iq.len() as f64).rem_euclid(TAU);
         let filtered=self.channel_filter.process(&mixed);
         let offset=((self.factor as u64-self.input_count%self.factor as u64)%self.factor as u64) as usize;
-        let channel:Vec<Complex32>=filtered.iter().skip(offset).step_by(self.factor).copied().collect();
+        let mut channel:Vec<Complex32>=filtered.iter().skip(offset).step_by(self.factor).copied().collect();
         self.input_count+=iq.len() as u64;
         if channel.is_empty(){return (Vec::new(),0.0,0);}
+        if let Some(filter)=self.sideband_filter.as_mut(){channel=filter.process(&channel);}
         let rf_power=channel.iter().map(|z|(z.re as f64).powi(2)+(z.im as f64).powi(2)).sum();let rf_count=channel.len();
         self.afc.observe(&channel);
         let mut audio=Vec::with_capacity(channel.len());
-        if self.mode=="AM" {
+        if ssb_mode(&self.mode){
+            for z in &channel{audio.push(Complex32::new(z.re,0.0));}
+        }else if self.mode=="AM" {
             for z in &channel{let envelope=z.norm() as f64;let dc=self.dc.value(envelope);audio.push(Complex32::new(((envelope-dc)/dc.max(1e-4)) as f32,0.0));}
         }else{
             let deviation=if self.mode=="WFM"{75000.0}else{5000.0_f64.min(self.bandwidth_hz*0.2)};
             for z in &channel{let previous=self.previous_iq.unwrap_or(*z);let diff=(*z*previous.conj()).arg() as f64;
                 self.previous_iq=Some(*z);let value=diff*self.channel_rate/(TAU*deviation);let dc=self.dc.value(value);audio.push(Complex32::new((value-dc) as f32,0.0));}
         }
-        let filtered=self.audio_filter.process(&audio);
+        let filtered=if let Some(filter)=self.audio_filter.as_mut(){filter.process(&audio)}else{audio};
         let start=self.channel_count as f64;let end=start+filtered.len() as f64-1.0;let step=self.channel_rate/self.audio_rate as f64;
         let next=self.output_count as f64*step;
         let number=if next<=end+1e-9{(((end-next)/step+1e-9).floor() as usize)+1}else{0};
@@ -1122,6 +1191,135 @@ mod tests {
             let mut re=0.0;let mut im=0.0;let mut energy=0.0;
             for (i,v) in audio.iter().enumerate(){let phase=TAU*1000.0*i as f64/32000.0;re+=*v as f64*phase.cos();im+=*v as f64*phase.sin();energy+=(*v as f64).powi(2);}
             let fraction=2.0*(re*re+im*im)/(audio.len() as f64*energy);assert!(fraction>0.9,"{mode}: tone fraction {fraction}");
+        }
+    }
+    fn ssb_test_iq(length:usize,fs:f64,tones:&[(f64,f32)])->Vec<Complex32>{
+        (0..length).map(|index|tones.iter().fold(Complex32::new(0.0,0.0),|sum,(frequency,amplitude)|{
+            sum+Complex32::from_polar(*amplitude,(TAU*frequency*index as f64/fs).rem_euclid(TAU)as f32)
+        })).collect()
+    }
+    fn ssb_test_amplitude(audio:&[f32],frequency:f64)->f64{
+        let(mut re,mut im)=(0.0,0.0);
+        for(index,value)in audio.iter().enumerate(){let phase=TAU*frequency*index as f64/32000.0;re+=*value as f64*phase.cos();im+=*value as f64*phase.sin();}
+        2.0*(re*re+im*im).sqrt()/audio.len().max(1)as f64
+    }
+    #[test]
+    fn ssb_passbands_and_constructor_edges_are_directional(){
+        assert_eq!(vfo_passband_offsets("USB",2700.0).unwrap(),(300.0,3000.0));
+        assert_eq!(vfo_passband_offsets("lsb",2700.0).unwrap(),(-3000.0,-300.0));
+        for mode in ["AM","NFM","WFM"]{assert_eq!(vfo_passband_offsets(mode,12000.0).unwrap(),(-6000.0,6000.0));}
+        for bw in [f64::NAN,f64::INFINITY,-1.0,0.0,999.0,14101.0]{assert!(vfo_passband_offsets("USB",bw).is_err());}
+        assert!(vfo_passband_offsets("unknown",2700.0).is_err());
+        for(mode,edge,reference_outside)in [("USB",29000.0,-32001.0),("LSB",-29000.0,32001.0)]{
+            assert!(VfoDemodulator::try_new(64000.0,edge,2700.0,mode,32000).is_ok());
+            assert!(VfoDemodulator::try_new(64000.0,edge+if mode=="USB"{1.0}else{-1.0},2700.0,mode,32000).is_err());
+            assert!(VfoDemodulator::try_new(64000.0,reference_outside,2700.0,mode,32000).is_err());
+            for bw in [SSB_MIN_BANDWIDTH_HZ,SSB_MAX_BANDWIDTH_HZ]{assert!(VfoDemodulator::try_new(64000.0,0.0,bw,mode,32000).is_ok());}
+            assert!(VfoDemodulator::try_new(6400.0,0.0,2700.0,mode,32000).is_err());
+            assert!(VfoDemodulator::try_new(64000.0,0.0,2700.0,mode,6000).is_err());
+        }
+        for invalid in [f64::NAN,f64::INFINITY,f64::NEG_INFINITY]{
+            assert!(VfoDemodulator::try_new(invalid,0.0,2700.0,"USB",32000).is_err());
+            assert!(VfoDemodulator::try_new(64000.0,invalid,2700.0,"USB",32000).is_err());
+        }
+    }
+    #[test]
+    fn ssb_usb_and_lsb_recover_real_tone_and_reject_opposite_sideband(){
+        let fs=64000.0;let reference=8000.0;let length=64000;
+        for(mode,sign)in [("USB",1.0),("LSB",-1.0)]{
+            let iq=ssb_test_iq(length,fs,&[(reference+sign*1000.0,0.1),(reference-sign*1700.0,0.1)]);
+            let mut demod=VfoDemodulator::new(fs,reference,2700.0,mode,32000);
+            let audio=demod.process(&iq);assert_eq!(audio.len(),32000);let steady=&audio[3200..];
+            let desired=ssb_test_amplitude(steady,1000.0);let opposite=ssb_test_amplitude(steady,1700.0);
+            assert!((0.095..0.105).contains(&desired),"{mode}: desired={desired}");
+            assert!(opposite<desired*0.001,"{mode}: opposite={opposite}, desired={desired}");
+            assert!(steady.iter().all(|value|value.is_finite()));
+        }
+    }
+    #[test]
+    fn ssb_rf_level_uses_selected_band_not_the_broad_predecimator(){
+        let fs=64000.0;let reference=8000.0;let wanted=ssb_test_iq(128000,fs,&[(reference+1000.0,0.1)]);
+        let unwanted=ssb_test_iq(128000,fs,&[(reference-1000.0,0.1)]);
+        let mut a=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);a.process(&wanted[..64000]);
+        let good=a.process_with_metrics(&wanted[64000..],Some(100.0),1000.0);
+        let mut b=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);b.process(&unwanted[..64000]);
+        let rejected=b.process_with_metrics(&unwanted[64000..],Some(100.0),1000.0);
+        assert!((good.rf_dbfs+20.0).abs()<0.2,"{}",good.rf_dbfs);
+        assert!(rejected.rf_dbfs< -75.0,"{}",rejected.rf_dbfs);
+        assert_eq!(good.afc_status,"unsupported_mode");assert_eq!(good.afc_offset_hz,0.0);assert!(!good.afc_locked);assert_eq!(good.quality_db,None);
+    }
+    #[test]
+    fn ssb_cfo_has_correct_pitch_direction_and_manual_tune_restores_audio(){
+        let fs=64000.0;let reference=8000.0;
+        for(mode,sign)in [("USB",1.0),("LSB",-1.0)]{
+            for cfo in [-100.0,50.0]{
+                let iq=ssb_test_iq(64000,fs,&[(reference+cfo+sign*1000.0,0.1)]);
+                let mut untuned=VfoDemodulator::new(fs,reference,2700.0,mode,32000);
+                let audio=untuned.process(&iq);let shifted=1000.0+sign*cfo;
+                assert!(ssb_test_amplitude(&audio[3200..],shifted)>0.095,"{mode} CFO{cfo}");
+                assert!(ssb_test_amplitude(&audio[3200..],1000.0)<0.001);
+                let mut tuned=VfoDemodulator::new(fs,reference+cfo,2700.0,mode,32000);let recovered=tuned.process(&iq);
+                assert!(ssb_test_amplitude(&recovered[3200..],1000.0)>0.095);
+            }
+        }
+    }
+    #[test]
+    fn ssb_chunking_preserves_nco_decimation_and_audio_positions(){
+        let fs=1024000.0;let reference=-37000.0;let iq=ssb_test_iq(131072,fs,&[(reference+1000.0,0.1),(reference-1700.0,0.08)]);
+        let mut a=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);let whole=a.process(&iq);
+        let mut b=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);let mut split=vec![];let mut cursor=0;
+        let sizes=[1,7,37,997,8192,12001,4096,32768];let mut index=0;
+        while cursor<iq.len(){let end=(cursor+sizes[index%sizes.len()]).min(iq.len());split.extend(b.process(&iq[cursor..end]));cursor=end;index+=1;}
+        assert_eq!(whole.len(),split.len());assert_eq!(a.input_count,b.input_count);assert_eq!(a.output_count,b.output_count);
+        let phase_error=(a.phase-b.phase+PI).rem_euclid(TAU)-PI;assert!(phase_error.abs()<1e-7);
+        let maximum=whole.iter().zip(&split).map(|(x,y)|(*x as f64-*y as f64).abs()).fold(0.0_f64,f64::max);
+        assert!(maximum<2e-4,"max chunk error={maximum}");
+    }
+    #[test]
+    fn ssb_reset_and_empty_chunks_preserve_the_stream_contract(){
+        let iq=ssb_test_iq(32000,64000.0,&[(9000.0,0.1)]);let mut demod=VfoDemodulator::new(64000.0,8000.0,2700.0,"USB",32000);
+        demod.process(&iq);let before=(demod.phase,demod.input_count,demod.output_count);
+        let empty=demod.process_with_metrics(&[],Some(100.0),1000.0);assert!(empty.audio.is_empty());assert!(empty.rf_dbfs.is_finite());
+        assert_eq!((demod.phase,demod.input_count,demod.output_count),before);
+        demod.reset();let reset=demod.process(&iq);let mut fresh=VfoDemodulator::new(64000.0,8000.0,2700.0,"USB",32000);let expected=fresh.process(&iq);
+        assert_eq!(reset.len(),expected.len());assert!(reset.iter().zip(expected).all(|(x,y)|(*x-y).abs()<1e-6));
+        assert_eq!(demod.afc_status()["afc_status"],"unsupported_mode");
+    }
+    #[test]
+    fn ssb_predecimator_rejects_a_tone_that_would_alias_into_audio(){
+        let fs=256000.0;let reference=30000.0;let mut wanted=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);
+        let channel_rate=wanted.channel_rate;
+        let desired=ssb_test_iq(128000,fs,&[(reference+1000.0,0.1)]);
+        let alias=ssb_test_iq(128000,fs,&[(reference+channel_rate+1000.0,0.5)]);
+        assert!(reference+channel_rate+1000.0<fs/2.0);
+        let audio=wanted.process(&desired);let amplitude=ssb_test_amplitude(&audio[3200..],1000.0);
+        let mut rejected=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);let folded=rejected.process(&alias);
+        let residual=ssb_test_amplitude(&folded[3200..],1000.0);
+        assert!(amplitude>0.095);assert!(residual<amplitude*0.001,"alias amplitude={residual}, desired={amplitude}");
+    }
+    #[test]
+    fn ssb_sample_rate_matrix_and_full_supported_width_remain_finite(){
+        for fs in [64000.0,1024000.0,2400000.0]{
+            for(mode,sign)in [("USB",1.0),("LSB",-1.0)]{
+                let iq=ssb_test_iq((fs*0.08)as usize,fs,&[(8000.0+sign*1000.0,0.1)]);
+                let mut demod=VfoDemodulator::new(fs,8000.0,2700.0,mode,32000);let audio=demod.process(&iq);
+                assert!((audio.len()as i64-2560).abs()<=1);assert!(audio.iter().all(|x|x.is_finite()));
+                assert!(ssb_test_amplitude(&audio[1280..],1000.0)>0.09,"{mode} Fs{fs}");
+            }
+        }
+        for mode in ["USB","LSB"]{for bw in [1000.0,14100.0]{
+            let sign=if mode=="USB"{1.0}else{-1.0};let frequency=if bw==1000.0{800.0}else{14000.0};
+            let iq=ssb_test_iq(32000,64000.0,&[(sign*frequency,0.1)]);let mut demod=VfoDemodulator::new(64000.0,0.0,bw,mode,32000);let audio=demod.process(&iq);
+            assert!(audio.iter().all(|x|x.is_finite()));assert!(ssb_test_amplitude(&audio[3200..],frequency)>0.08,"{mode} BW{bw}");
+        }}
+    }
+    #[test]
+    fn ssb_afc_is_rejected_and_audio_is_not_normalized_or_limited(){
+        for mode in ["USB","LSB"]{
+            let mut demod=VfoDemodulator::new(64000.0,0.0,2700.0,mode,32000);assert!(demod.set_afc(true,1000.0).is_err());assert!(demod.set_afc(false,1000.0).is_ok());
+            assert_eq!(demod.afc_status()["afc_enabled"],false);assert_eq!(demod_audio_scale(mode),1.0);
+            let sign=if mode=="USB"{1.0}else{-1.0};let iq=ssb_test_iq(16000,64000.0,&[(sign*1000.0,2.0)]);let audio=demod.process(&iq);
+            assert!(audio[3200..].iter().any(|value|value.abs()>1.8),"{mode}: SSB must reach the PCM sink unclamped");
         }
     }
     #[test]

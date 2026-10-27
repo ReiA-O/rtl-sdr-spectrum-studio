@@ -5,6 +5,7 @@ use crate::dsp::{self, Analyzer, Config, VfoDemodulator};
 use crate::frontend::{CenterDcRejector,CENTER_DC_CUTOFF_HZ};
 use crate::recording::{IQRecorder, PreTriggerBuffer, WavRecorder};
 use crate::reception::{AudioProcessor, ReceptionConfig};
+use crate::modulation::{ModulationConfig,ModulationEstimator};
 use crate::trigger::TriggerController;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chrono::Utc;
@@ -54,6 +55,10 @@ impl Vfo {
         "mode":self.mode,"enabled":self.enabled,"stopped_reason":self.stopped_reason,"wav_format":self.wav_format,"reception":self.reception})}
     fn state(&self,selected:u64,running:bool)->Value{
         let mut value=self.config();value["selected"]=json!(self.id==selected);
+        if let Ok((low,high))=dsp::vfo_passband_offsets(&self.mode,self.bandwidth_hz){
+            value["rf_low_hz"]=json!(self.frequency_hz+low);value["rf_high_hz"]=json!(self.frequency_hz+high);
+        }
+        value["frequency_reference"]=json!(if ["USB","LSB"].contains(&self.mode.as_str()){"suppressed_carrier"}else{"channel_center"});
         value["wav_recording"]=json!(self.wav.as_ref().is_some_and(|r|r.active));
         value["audio_level"]=json!(self.audio_level);value["sample_count"]=json!(self.sample_count);
         value["reception_status"]=self.reception_status.clone();
@@ -102,9 +107,62 @@ pub struct Engine {
     source_metadata:Value,
     calibration:Option<Calibration>,
     requested_level_unit:String,
+    modulation_settings:Value,
+    modulation_estimator:Option<ModulationEstimator>,
+    modulation_context:Option<String>,
+    modulation_reference:Option<String>,
 }
 
 impl Engine {
+    fn default_modulation_settings()->Value{json!({"enabled":false,"bandwidth_hz":200_000.0,"carrier_reference_explicit":false})}
+    fn validate_modulation_settings(value:&Value)->Result<(),String>{
+        let fields=value.as_object().ok_or("方式推定設定はobjectが必要です")?;
+        if fields.keys().any(|k|!["enabled","bandwidth_hz","carrier_reference_explicit"].contains(&k.as_str())){return Err("未対応の方式推定項目です".into());}
+        for key in ["enabled","carrier_reference_explicit"]{if value[key].as_bool().is_none(){return Err(format!("{key}は真偽値が必要です"));}}
+        let width=value["bandwidth_hz"].as_f64().ok_or("推定観測幅は数値が必要です")?;
+        if !width.is_finite()||!(6000.0..=250_000.0).contains(&width){return Err("推定観測幅は6000〜250000 Hzです".into());}Ok(())
+    }
+    fn modulation_identity(&self)->String{
+        let v=self.vfos.iter().find(|v|v.id==self.selected);
+        json!([self.source,self.input,v.map(|v|(v.id,v.frequency_hz))]).to_string()
+    }
+    fn invalidate_modulation(&mut self,reason:&str){
+        if let Some(estimator)=self.modulation_estimator.as_mut(){estimator.reset(reason);}
+        self.modulation_context=None;self.modulation_reference=None;
+        self.modulation_settings["carrier_reference_explicit"]=json!(false);
+    }
+    fn sync_modulation(&mut self){
+        let identity=self.modulation_identity();
+        if self.modulation_reference.as_deref()!=Some(&identity){self.modulation_settings["carrier_reference_explicit"]=json!(false);}
+        if !self.running||!boolean(&self.modulation_settings,"enabled",false){self.modulation_estimator=None;self.modulation_context=None;return;}
+        let selected=self.vfos.iter().find(|v|v.id==self.selected);
+        let context=json!([identity,self.frontend,self.modulation_settings,selected.map(|v|(&v.mode,v.bandwidth_hz,v.enabled))]).to_string();
+        if self.modulation_context.as_deref()==Some(&context){return;}
+        self.modulation_context=Some(context);self.modulation_estimator=None;
+        if !boolean(&self.modulation_settings,"enabled",false){return;}
+        let Some(v)=selected.filter(|v|v.enabled)else{return;};
+        let width=num(&self.modulation_settings,"bandwidth_hz",200_000.0);let offset=v.frequency_hz-self.center();
+        let half=self.usable()/2.0;
+        let config=ModulationConfig{enabled:true,sample_rate:self.fs(),frequency_offset_hz:offset,bandwidth_hz:width,
+            carrier_reference_explicit:boolean(&self.modulation_settings,"carrier_reference_explicit",false),
+            // Quality references extend beyond the nominal signal window to
+            // +/- one full width. Keep these out of RF0 and usable rolloff too.
+            band_complete:v.frequency_hz-width>=0.0&&offset-width>=-half&&offset+width<=half,
+            // Observe raw IQ; a window containing physical zero IF cannot safely
+            // distinguish an actual carrier from the receiver's residual DC.
+            dc_affected:offset.abs()<=width/2.0+CENTER_DC_CUTOFF_HZ};
+        self.modulation_estimator=ModulationEstimator::new(config).ok();
+    }
+    fn modulation_state(&self)->Value{
+        let selected=self.vfos.iter().find(|v|v.id==self.selected);
+        let reason=if !boolean(&self.modulation_settings,"enabled",false){"disabled"}else if !self.running{"stopped"}else if selected.is_none_or(|v|!v.enabled){"vfo_disabled"}else{"observation_unavailable"};
+        let mut result=json!({"state":if reason=="disabled"{"disabled"}else{"hold"},"candidate":null,"proposed_mode":null,"evidence":"none","reasons":[reason],"features":null,"updated_sample":null,"observed_seconds":0.0});
+        if self.running&&boolean(&self.modulation_settings,"enabled",false)&&selected.is_some_and(|v|v.enabled){
+            if let Some(estimator)=&self.modulation_estimator{result=serde_json::to_value(estimator.snapshot()).unwrap_or(result);}
+        }
+        json!({"config":self.modulation_settings,"selected_vfo_id":self.selected,"reference_hz":selected.map(|v|v.frequency_hz),
+            "observation_route":"raw_iq_before_center_dc_and_demodulation","result":result})
+    }
     pub fn new(project:PathBuf)->Result<Self,String>{
         let input=json!({"center_hz":32_256_000.0,"sample_rate":2_048_000.0,"gain_db":20.7,"agc":false,"ppm":0,"mode":"auto","device_index":0});
         let config=Config::default();
@@ -123,7 +181,8 @@ impl Engine {
             vfos:vec![],selected:1,next_vfo:2,layout:json!({"spectrum_ratio":0.6,"vfo_width":340,"bottom_ratio":0.5}),
             notifications:VecDeque::new(),notification_id:0,audio_chunks:VecDeque::new(),audio_sequence:0,audio_epoch:0,
             frozen_markers:vec![],had_blocks:false,trigger_last_frame:None,pending_input_change:false,
-            overload_streak:0,overload_notice:false,source_metadata:json!({}),calibration:None,requested_level_unit:"relative".into()};
+            overload_streak:0,overload_notice:false,source_metadata:json!({}),calibration:None,requested_level_unit:"relative".into(),
+            modulation_settings:Self::default_modulation_settings(),modulation_estimator:None,modulation_context:None,modulation_reference:None};
         engine.vfos.push(engine.make_vfo(&json!({"id":1,"frequency_hz":32_000_000.0,"bandwidth_hz":200_000.0,"mode":"WFM","enabled":true,"wav_format":"PCM16"}),1)?);
         let last=engine.settings_dir().join("last-session.json");
         if last.exists(){
@@ -214,8 +273,11 @@ impl Engine {
         self.notification_id+=1;self.notifications.push_back(json!({"id":self.notification_id,"timestamp":Utc::now().to_rfc3339(),"level":level,"message":message}));
         while self.notifications.len()>50{self.notifications.pop_front();}
     }
-    fn in_band(input:&Value,frequency:f64,width:f64)->bool{
-        frequency.is_finite()&&width.is_finite()&&width>0.0&&frequency-width/2.0>=0.0&&(frequency-num(input,"center_hz",0.0)).abs()+width/2.0<=Self::usable_for(input)/2.0
+    fn in_band(input:&Value,frequency:f64,width:f64,mode:&str)->bool{
+        let Ok((low,high))=dsp::vfo_passband_offsets(mode,width)else{return false;};
+        let center=num(input,"center_hz",0.0);let half=Self::usable_for(input)/2.0;
+        frequency.is_finite()&&frequency>0.0&&(frequency-center).abs()<=half
+            &&frequency+low>=0.0&&frequency+low>=center-half&&frequency+high<=center+half
     }
     fn afc_reference_in_band(offset:f64,bandwidth:f64,usable:f64)->bool{
         offset.is_finite()&&bandwidth.is_finite()&&usable.is_finite()&&bandwidth>0.0&&offset.abs()+bandwidth<=usable/2.0
@@ -229,19 +291,22 @@ impl Engine {
         if fields.get("enabled").is_some_and(|v|v.as_bool().is_none()){return Err("VFOの有効状態は真偽値で指定してください".into());}
         if fields.get("id").is_some_and(|v|identifier(v).is_none()){return Err("VFO IDが不正です".into());}
         let id=value.get("id").and_then(identifier).unwrap_or(fallback);
-        let frequency=num(value,"frequency_hz",self.center());let bandwidth=num(value,"bandwidth_hz",200_000.0);
         let mode=text(value,"mode","WFM").to_uppercase();let enabled=boolean(value,"enabled",true);
+        let ssb=["USB","LSB"].contains(&mode.as_str());
+        let frequency=num(value,"frequency_hz",self.center());let bandwidth=num(value,"bandwidth_hz",if ssb{2700.0}else{200_000.0});
         let format=text(value,"wav_format","PCM16").to_uppercase();
         let reception=match value.get("reception"){None=>ReceptionConfig::default(),Some(value)=>serde_json::from_value::<ReceptionConfig>(value.clone()).map_err(|e|format!("受信補助設定が不正です：{e}"))?};
         reception.validate()?;
-        if !["AM","NFM","WFM"].contains(&mode.as_str()){return Err("復調方式はAM/NFM/WFMです".into());}
+        if !["AM","NFM","WFM","USB","LSB"].contains(&mode.as_str()){return Err("復調方式はAM/NFM/WFM/USB/LSBです".into());}
         if !["PCM16","PCM24"].contains(&format.as_str()){return Err("WAV形式はPCM16/PCM24です".into());}
-        if !frequency.is_finite()||!bandwidth.is_finite()||bandwidth<=0.0||bandwidth>=self.fs()||frequency-bandwidth/2.0<0.0{return Err("VFOの周波数・帯域幅が不正です。フィルター下端は0 Hz以上にしてください".into());}
-        if enabled&&!Self::in_band(&self.input,frequency,bandwidth){return Err("復調フィルター全幅が有効受信帯域内に入る必要があります".into());}
+        if ssb&&reception.afc_enabled{return Err("USB/LSBではAFCを適用できません。AFCをOFFにし、基準周波数を手動で調整してください".into());}
+        let (low,_)=dsp::vfo_passband_offsets(&mode,bandwidth)?;
+        if !frequency.is_finite()||frequency<=0.0||!bandwidth.is_finite()||bandwidth<=0.0||bandwidth>=self.fs()||frequency+low<0.0{return Err("VFOの周波数・帯域幅が不正です。フィルター下端は0 Hz以上にしてください".into());}
+        if enabled&&!Self::in_band(&self.input,frequency,bandwidth,&mode){return Err("VFO基準周波数と復調フィルター全幅が有効受信帯域内に入る必要があります".into());}
         let mut demod=if enabled{Some(VfoDemodulator::try_new(self.fs(),frequency-self.center(),bandwidth,&mode,AUDIO_RATE)?)}else{None};
         if let Some(demod)=demod.as_mut(){demod.set_afc(reception.afc_enabled,reception.afc_max_hz)?;}
         let audio_processor=AudioProcessor::try_new(reception.clone(),AUDIO_RATE)?;
-        Ok(Vfo{id,frequency_hz:frequency,bandwidth_hz:bandwidth,mode,enabled,stopped_reason:value.get("stopped_reason").and_then(Value::as_str).map(str::to_owned),
+        Ok(Vfo{id,frequency_hz:frequency,bandwidth_hz:bandwidth,mode,enabled,stopped_reason:if enabled{None}else{value.get("stopped_reason").and_then(Value::as_str).map(str::to_owned)},
             wav_format:format,demod,wav:None,audio_level:-300.0,sample_count:0,reception,audio_processor,reception_status:json!({"available":false,"reason":"not_started"})})
     }
     fn vfo_index(&self,id:&Value)->Result<usize,ActionError>{let id=identifier(id).ok_or("VFO IDが不正です")?;self.vfos.iter().position(|v|v.id==id).ok_or_else(||ActionError::bad("VFOが見つかりません"))}
@@ -295,7 +360,8 @@ impl Engine {
     fn linked_band(&self,config:&Value)->Result<(f64,f64),String>{
         if let Some(id)=config.get("link_vfo").and_then(identifier){
             let vfo=self.vfos.iter().find(|v|v.id==id).ok_or("連動先VFOがありません")?;
-            Ok((vfo.frequency_hz-vfo.bandwidth_hz/2.0,vfo.frequency_hz+vfo.bandwidth_hz/2.0))
+            let (low,high)=dsp::vfo_passband_offsets(&vfo.mode,vfo.bandwidth_hz)?;
+            Ok((vfo.frequency_hz+low,vfo.frequency_hz+high))
         }else{Ok((num(config,"low_hz",self.center()-100_000.0),num(config,"high_hz",self.center()+100_000.0)))}
     }
     // The main metric/threshold fields are the primary condition. UI rows are
@@ -319,21 +385,22 @@ impl Engine {
         (peak,power)
     }
     fn vfo_conditions(&self,index:usize)->Value{let v=&self.vfos[index];let gain=dsp::demod_audio_scale(&v.mode);
-        let normalization=if v.mode=="AM"{"carrier-normalized envelope deviation"}else if v.mode=="WFM"{"phase discriminator divided by 75000 Hz; 50 us de-emphasis"}else{"phase discriminator divided by min(5000 Hz, bandwidth*0.2)"};
+        let normalization=if v.mode=="AM"{"carrier-normalized envelope deviation"}else if v.mode=="WFM"{"phase discriminator divided by 75000 Hz; 50 us de-emphasis"}else if ["USB","LSB"].contains(&v.mode.as_str()){"coherent real product detection; suppressed-carrier reference; manual tuning"}else{"phase discriminator divided by min(5000 Hz, bandwidth*0.2)"};
         json!({"frequency_hz":v.frequency_hz,"bandwidth_hz":v.bandwidth_hz,"mode":v.mode,"audio_gain":gain,"audio_gain_db":20.0*gain.log10(),"normalization":normalization,
         "reception":v.reception,"wav_audio":v.reception.wav_audio,
         "audio_routing":if v.reception.wav_audio=="processed"{"AFC/filter/demod then RF squelch, user audio gain, limiter and click suppression"}else{"AFC/filter/demod; excludes RF squelch, user audio gain, limiter and click suppression"},
         "input":self.input,"source":self.source,"input_metadata":self.source_metadata,"source_sample":self.last_sample,
         "frontend_processing":self.frontend_processing()})}
     fn reset_dsp(&mut self)->Result<(),String>{
+        self.invalidate_modulation("source_reset");
         self.reset_frontend_state();
         let mut config=self.analyzer.config.clone();config.sample_rate=self.fs();
         if text(&self.analysis_extra,"fft_mode","rbw")=="rbw"{config.fft_size=dsp::fft_size_for_rbw(self.fs(),num(&self.analysis_extra,"rbw_hz",750.0),&config.window);}
         dsp::validate_config(&config)?;self.analyzer.reset(Some(config));self.prebuffer=PreTriggerBuffer::new(self.fs(),PRE_BYTES)?;
         self.trigger=TriggerController::new(self.fs(),Self::trigger_controller_config(&self.trigger_config))?;
-        let center=self.center();let fs=self.fs();let usable=self.usable();
+        let center=self.center();let fs=self.fs();
         for vfo in &mut self.vfos{
-            if vfo.enabled&&(vfo.frequency_hz-center).abs()+vfo.bandwidth_hz/2.0>usable/2.0{vfo.enabled=false;vfo.stopped_reason=Some("現在の有効受信帯域外です。中心周波数を戻して手動で再開できます。".into());}
+            if vfo.enabled&&!Self::in_band(&self.input,vfo.frequency_hz,vfo.bandwidth_hz,&vfo.mode){vfo.enabled=false;vfo.stopped_reason=Some("現在の有効受信帯域外です。中心周波数を戻して手動で再開できます。".into());}
             vfo.demod=if vfo.enabled{Some(VfoDemodulator::try_new(fs,vfo.frequency_hz-center,vfo.bandwidth_hz,&vfo.mode,AUDIO_RATE)?)}else{None};
             if let Some(demod)=vfo.demod.as_mut(){demod.set_afc(vfo.reception.afc_enabled,vfo.reception.afc_max_hz)?;}
             vfo.audio_processor.note_gap();vfo.reception_status=json!({"available":false,"reason":"source_reset"});
@@ -363,6 +430,7 @@ impl Engine {
         self.pending_input_change=false;self.overload_streak=0;self.overload_notice=false;Ok(())
     }
     pub fn on_stop(&mut self,reason:&str){
+        self.invalidate_modulation("stopped");
         self.reset_frontend_state();
         self.running=false;self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();self.trigger.disarm();
         for v in &mut self.vfos{v.audio_processor.note_gap();if let Some(d)=v.demod.as_mut(){d.reset();}v.reception_status=json!({"available":false,"reason":"stopped"});}
@@ -399,6 +467,7 @@ impl Engine {
                 "frontend_reason":if self.input_locked(){"IQのArm・保存中は中心補正を変更できません"}else if self.wav_active(){"WAV録音中は中心補正を変更できません"}else{""},"reason":if self.input_locked(){"IQ待機・保存中"}else if self.wav_active(){"WAV録音中は中心周波数・サンプルレートをロック"}else{""}},
             "device":self.device,"performance":self.performance,"replay":self.replay,"layout":self.layout,"notifications":self.notifications,
             "calibration":calibration,"frontend":self.frontend,"frontend_status":self.frontend_status(),
+            "modulation_inference":self.modulation_state(),
             "implementation":{"engineering_defaults":true,"vfo_limit":"performance-dependent","weak_signal_processing":"optional_not_implemented","d03":"original_subject_pending"}})
     }
     pub fn audio(&self,after:u64)->Value{
@@ -469,6 +538,7 @@ impl Engine {
         let gap=if self.had_blocks{start.saturating_sub(self.last_sample)}else{0};
         if self.had_blocks&&start<self.last_sample{return Err("入力サンプルの順序が逆転しました".into());}
         if gap>0{
+            self.invalidate_modulation("gap");
             self.reset_frontend_state();
             self.audio_epoch=self.audio_epoch.saturating_add(1);
             self.audio_chunks.clear();for v in &mut self.vfos{if let Some(d)=v.demod.as_mut(){d.reset();}v.audio_processor.note_gap();v.reception_status=json!({"available":false,"reason":"gap"});
@@ -477,6 +547,8 @@ impl Engine {
         }
         self.prebuffer.append(start,raw)?;
         let mut iq:Vec<Complex32>=raw.chunks_exact(2).map(|v|Complex32::new((v[0]as f32-127.5)/127.5,(v[1]as f32-127.5)/127.5)).collect();
+        self.sync_modulation();
+        if let Some(estimator)=self.modulation_estimator.as_mut(){estimator.observe(start,&iq);}
         // Recording/pre-trigger retain the original bytes. Only this shared
         // analysis/demodulation/trigger branch receives center rejection.
         if self.frontend_effective(){self.center_dc_rejector.process_in_place(&mut iq);}
@@ -525,14 +597,16 @@ impl Engine {
             // AFC compares noise sidebands out to +/- one full bandwidth.
             // Both references must fit the provisional usable acquisition
             // band, not merely Nyquist, or edge rolloff can inflate quality.
-            let reference_in_band=Self::afc_reference_in_band(v.frequency_hz-center,v.bandwidth_hz,usable);
+            let ssb=["USB","LSB"].contains(&v.mode.as_str());
+            let reference_in_band=!ssb&&Self::afc_reference_in_band(v.frequency_hz-center,v.bandwidth_hz,usable);
             let quality=if reference_in_band{self.analyzer.afc_quality(v.frequency_hz-center,v.bandwidth_hz)}else{None};
             let margin=(usable/2.0-(v.frequency_hz-center).abs()-v.bandwidth_hz/2.0).max(0.0);
             let Some(demod)=v.demod.as_mut()else{continue;};
             let block=demod.process_with_metrics(&iq,quality,margin);
             let before=v.audio_processor.status();let processed=v.audio_processor.process(&block.audio,block.rf_dbfs);
             let mut status=v.audio_processor.status();merge(&mut status,&demod.afc_status());
-            status["afc_quality_reason"]=json!(if !v.reception.afc_enabled{"disabled"}else if !reference_in_band{"noise_reference_outside_usable_band"}else if quality.is_none(){"quality_unavailable"}else{"reference_in_usable_band"});
+            status["afc_quality_reason"]=json!(if ssb{"unsupported_mode"}else if !v.reception.afc_enabled{"disabled"}else if !reference_in_band{"noise_reference_outside_usable_band"}else if quality.is_none(){"quality_unavailable"}else{"reference_in_usable_band"});
+            if ssb{status["afc_status"]=json!("unsupported_mode");status["afc_offset_hz"]=json!(0.0);status["afc_locked"]=json!(false);}
             if v.reception.afc_enabled&&!reference_in_band{status["afc_status"]=json!("reference_outside_usable_band");}
             status["available"]=json!(!block.audio.is_empty());status["reason"]=json!(if block.audio.is_empty(){"awaiting_audio"}else{"current"});
             status["updated_sample"]=json!(end);status["wav_audio"]=json!(v.reception.wav_audio);
@@ -587,7 +661,7 @@ impl Engine {
         if self.source=="replay"{return Err(ActionError::locked("IQ再生中は元の入力条件を変更できません"));}
         if self.input_locked(){return Err(ActionError::locked("IQのArm開始から保存終了まで入力条件を変更できません"));}
         if self.wav_active()&&changed.iter().any(|k|["center_hz","sample_rate"].contains(k)){return Err(ActionError::locked("WAV録音中は中心周波数とサンプルレートを変更できません"));}
-        let impacted:Vec<Value>=self.vfos.iter().filter(|v|v.enabled&&!Self::in_band(&candidate,v.frequency_hz,v.bandwidth_hz)).map(|v|v.config()).collect();
+        let impacted:Vec<Value>=self.vfos.iter().filter(|v|v.enabled&&!Self::in_band(&candidate,v.frequency_hz,v.bandwidth_hz,&v.mode)).map(|v|v.config()).collect();
         if !impacted.is_empty()&&!confirmed{return Err(ActionError{message:"この変更で帯域外になるVFOの無効化を確認してください".into(),code:"VFO_IMPACT".into(),impacted_vfos:impacted});}
         Ok(candidate)
     }
@@ -611,6 +685,7 @@ impl Engine {
         json!({"version":1,"input":input,"analysis":{ "config":self.analyzer.config,"extra":self.analysis_extra},
         "display":self.display,"measurement":self.measurement,"trigger":self.trigger_config,"layout":self.layout,"frontend":self.frontend,
         "calibration":self.calibration.as_ref().map(Calibration::to_json),"requested_level_unit":self.requested_level_unit,
+        "modulation_inference":{"enabled":self.modulation_settings["enabled"],"bandwidth_hz":self.modulation_settings["bandwidth_hz"],"carrier_reference_explicit":false},
         "vfos":self.vfos.iter().map(Vfo::config).collect::<Vec<_>>(),"selected_vfo_id":self.selected,"preferred_source":if self.source=="demo"{"demo"}else{"live"}})}
     fn save_last(&self)->Result<(),String>{
         fs::create_dir_all(self.settings_dir()).map_err(|e|e.to_string())?;
@@ -622,6 +697,9 @@ impl Engine {
         let mut input=self.input.clone();merge(&mut input,&value["input"]);Self::validate_input(&input).map_err(|e|e.message)?;
         input["gain_actual_db"]=Value::Null;
         let mut frontend=json!({"dc_reject_enabled":true});
+        let mut modulation_settings=Self::default_modulation_settings();
+        if let Some(patch)=value.get("modulation_inference"){merge(&mut modulation_settings,patch);Self::validate_modulation_settings(&modulation_settings)?;}
+        modulation_settings["carrier_reference_explicit"]=json!(false);
         if let Some(patch)=value.get("frontend"){Self::validate_frontend_patch(patch).map_err(|e|e.message)?;merge(&mut frontend,patch);}
         let calibration=if value["calibration"].is_null(){None}else{Some(Calibration::from_json(&value["calibration"])?)};
         let unit=text(value,"requested_level_unit","relative");if !["relative","absolute"].contains(&unit){return Err("レベル単位設定が不正です".into());}
@@ -633,8 +711,9 @@ impl Engine {
         let trigger=TriggerController::new(config.sample_rate,Self::trigger_controller_config(&trigger_config))?;
         if trigger.pre_seconds>PRE_BYTES as f64/2.0/config.sample_rate{return Err("プリトリガがメモリー容量を超えます".into());}
         let mut measurement=self.measurement.clone();merge(&mut measurement,&value["measurement"]);Self::validate_measurement(&mut measurement).map_err(|e|e.message)?;
+        let settings=value["vfos"].as_array().ok_or("VFO設定がありません")?;
         let old_input=self.input.clone();self.input=input;
-        let mut vfos=vec![];let settings=value["vfos"].as_array().ok_or("VFO設定がありません")?;
+        let mut vfos=vec![];
         for(index,setting)in settings.iter().enumerate(){match self.make_vfo(setting,index as u64+1){Ok(v)=>{if vfos.iter().any(|old:&Vfo|old.id==v.id){self.input=old_input;return Err("VFO IDが重複しています".into());}vfos.push(v)},Err(error)=>{self.input=old_input;return Err(error);}}}
         self.vfos=vfos;self.selected=value["selected_vfo_id"].as_u64().filter(|id|self.vfos.iter().any(|v|v.id==*id)).unwrap_or_else(||self.vfos.first().map(|v|v.id).unwrap_or(0));
         self.next_vfo=self.vfos.iter().map(|v|v.id).max().unwrap_or(0)+1;self.analyzer=Analyzer::new(config);self.analysis_extra=value["analysis"]["extra"].clone();
@@ -642,7 +721,8 @@ impl Engine {
         self.display=display;self.measurement=measurement;self.trigger_config=trigger_config;self.trigger=trigger;
         self.prebuffer=PreTriggerBuffer::new(self.fs(),PRE_BYTES)?;if value["layout"].is_object(){self.layout=value["layout"].clone();}
         self.source=if value["preferred_source"]=="demo"{"demo"}else{"live"}.into();self.calibration=calibration;self.requested_level_unit=unit.into();
-        self.frontend=frontend;self.reset_frontend_state();
+        self.frontend=frontend;self.reset_frontend_state();self.modulation_settings=modulation_settings;
+        self.modulation_estimator=None;self.modulation_context=None;self.modulation_reference=None;
         self.source_metadata=json!({});self.audio_chunks.clear();self.frozen_markers.clear();self.had_blocks=false;self.trigger_last_frame=None;self.last_sample=0;
         self.performance=json!({"processing_ms":0.0,"load_percent":0.0,"instant_load_percent":0.0,"gap_samples":0,"dropped_samples":0,"valid_frames":0,"input_samples":0});Ok(())
     }
@@ -694,7 +774,7 @@ impl Engine {
         json!({"files":files,"presets":presets})
     }
     pub fn apply(&mut self,body:&Value)->Result<Value,ActionError>{
-        let frontend_before=self.frontend.clone();self.apply_action(body)?;
+        let frontend_before=self.frontend.clone();self.apply_action(body)?;self.sync_modulation();
         let frontend_noop=text(body,"action","")=="set_frontend"&&frontend_before==self.frontend;
         if text(body,"action","")!="trace_reset"&&!frontend_noop{
             if let Err(error)=self.save_last(){self.notify(&format!("設定の保存に失敗しました：{error}"),"warning");}
@@ -703,6 +783,12 @@ impl Engine {
     }
     fn apply_action(&mut self,body:&Value)->Result<(),ActionError>{
         match text(body,"action",""){
+            "set_modulation_inference"=>{
+                let patch=&body["config"];if !patch.is_object(){return Err("方式推定設定が不正です".into());}
+                let mut candidate=self.modulation_settings.clone();merge(&mut candidate,patch);Self::validate_modulation_settings(&candidate)?;
+                self.modulation_settings=candidate;
+                self.modulation_reference=if boolean(&self.modulation_settings,"carrier_reference_explicit",false){Some(self.modulation_identity())}else{None};
+            },
             "trace_reset"=>self.analyzer.reset_traces(),
             "set_frontend"=>{
                 Self::validate_frontend_patch(&body["frontend"])?;
@@ -716,7 +802,7 @@ impl Engine {
                 let patch=&body["input"];let candidate=self.plan_input(patch,boolean(body,"confirm_impacted",false))?;
                 let changed=patch.as_object().unwrap().keys().any(|key|!same(&self.input[key.as_str()],&candidate[key.as_str()]));
                 if !changed{return Ok(());}
-                for v in &mut self.vfos{if v.enabled&&!Self::in_band(&candidate,v.frequency_hz,v.bandwidth_hz){
+                for v in &mut self.vfos{if v.enabled&&!Self::in_band(&candidate,v.frequency_hz,v.bandwidth_hz,&v.mode){
                     if let Some(writer)=v.wav.as_mut().filter(|w|w.active){writer.stop("input_band_changed");}
                     v.enabled=false;v.demod=None;v.stopped_reason=Some("中心周波数の変更を承認したため無効化。再開は手動です。".into());
                 }}
@@ -1673,5 +1759,140 @@ mod tests{
         for span in [json!(99),json!(usable+1.0),json!(0),Value::Null,json!("100")]{
             assert!(e.apply(&json!({"action":"set_display","display":{"span_hz":span}})).is_err());assert_eq!(e.configuration(),before);
         }
+    }
+    #[test]
+    fn ssb_default_bandwidth_and_state_reference_are_derived_without_preset_fields(){
+        let e=engine();
+        for(mode,low,high)in [("USB",300.0,3000.0),("LSB",-3000.0,-300.0)]{
+            let v=e.make_vfo(&json!({"mode":mode}),2).unwrap();assert_eq!(v.bandwidth_hz,2700.0);
+            let state=v.state(2,false);assert_eq!(state["frequency_reference"],"suppressed_carrier");
+            assert_eq!(state["rf_low_hz"],e.center()+low);assert_eq!(state["rf_high_hz"],e.center()+high);
+            for key in ["rf_low_hz","rf_high_hz","frequency_reference"]{assert!(v.config().get(key).is_none());}
+        }
+        let old=e.vfos[0].state(1,false);assert_eq!(old["frequency_reference"],"channel_center");
+        assert_eq!(old["rf_low_hz"],31_900_000.0);assert_eq!(old["rf_high_hz"],32_100_000.0);
+    }
+    #[test]
+    fn ssb_usable_and_reference_edges_are_inclusive_and_reject_one_hz_outside(){
+        let e=engine();let low=e.center()-e.usable()/2.0;let high=e.center()+e.usable()/2.0;
+        for(mode,edge,step)in [("USB",high-3000.0,1.0),("LSB",low+3000.0,-1.0),("USB",low,-1.0),("LSB",high,1.0)]{
+            assert!(e.make_vfo(&json!({"mode":mode,"frequency_hz":edge}),2).is_ok(),"{mode} {edge}");
+            assert!(e.make_vfo(&json!({"mode":mode,"frequency_hz":edge+step}),2).is_err(),"{mode} {edge}+{step}");
+        }
+    }
+    #[test]
+    fn ssb_rf_zero_and_bandwidth_limits_are_validated_before_any_change(){
+        let mut e=engine();e.apply(&json!({"action":"set_input","input":{"center_hz":10000},"confirm_impacted":true})).unwrap();
+        assert!(e.make_vfo(&json!({"mode":"LSB","frequency_hz":3000}),2).is_ok());
+        assert!(e.make_vfo(&json!({"mode":"LSB","frequency_hz":2999}),2).is_err());
+        for mode in ["USB","LSB"]{
+            for width in [1000.0,14100.0]{assert!(e.make_vfo(&json!({"mode":mode,"bandwidth_hz":width,"frequency_hz":20000}),2).is_ok());}
+            for width in [999.0,14101.0]{assert!(e.make_vfo(&json!({"mode":mode,"bandwidth_hz":width,"frequency_hz":20000}),2).is_err());}
+            assert!(e.make_vfo(&json!({"mode":mode,"frequency_hz":-1,"enabled":false}),2).is_err());
+        }
+        let before=e.configuration();assert!(e.apply(&json!({"action":"add_vfo","vfo":{"mode":"LSB","frequency_hz":2999}})).is_err());assert_eq!(e.configuration(),before);
+    }
+    #[test]
+    fn ssb_afc_requires_explicit_off_in_the_same_atomic_mode_change(){
+        let mut e=engine();e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"afc_enabled":true}}})).unwrap();
+        let before=e.configuration();
+        assert!(e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":"USB","bandwidth_hz":2700}})).unwrap_err().message.contains("AFC"));
+        assert_eq!(e.configuration(),before);
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":"USB","bandwidth_hz":2700,"reception":{"afc_enabled":false}}})).unwrap();
+        assert_eq!(e.vfos[0].mode,"USB");assert!(!e.vfos[0].reception.afc_enabled);let before=e.configuration();
+        assert!(e.apply(&json!({"action":"update_vfo","id":1,"patch":{"reception":{"afc_enabled":true}}})).is_err());assert_eq!(e.configuration(),before);
+    }
+    #[test]
+    fn ssb_linked_measurement_and_trigger_use_the_actual_sideband(){
+        let mut e=engine();
+        for(mode,lo,hi)in [("USB",300.0,3000.0),("LSB",-3000.0,-300.0)]{
+            e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":mode,"bandwidth_hz":2700}})).unwrap();
+            e.apply(&json!({"action":"set_measurement","measurement":{"link_vfo":1}})).unwrap();
+            e.apply(&json!({"action":"set_trigger","trigger":{"link_vfo":1}})).unwrap();
+            let state=e.state();let frequency=e.vfos[0].frequency_hz;
+            assert_eq!(e.linked_band(&e.measurement).unwrap(),(frequency+lo,frequency+hi));
+            for key in ["measurement","trigger"]{assert_eq!(state[key]["low_hz"],frequency+lo);assert_eq!(state[key]["high_hz"],frequency+hi);}
+        }
+    }
+    #[test]
+    fn ssb_center_impact_checks_the_full_sideband_and_preserves_absolute_reference(){
+        let mut e=engine();let frequency=e.center()+e.usable()/2.0-3000.0;
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":"USB","frequency_hz":frequency,"bandwidth_hz":2700}})).unwrap();
+        let candidate=json!({"center_hz":e.center()-1.0});let before=e.configuration();
+        assert_eq!(e.plan_input(&candidate,false).unwrap_err().code,"VFO_IMPACT");assert_eq!(e.configuration(),before);
+        e.apply(&json!({"action":"set_input","input":candidate,"confirm_impacted":true})).unwrap();
+        assert_eq!(e.vfos[0].frequency_hz,frequency);assert!(!e.vfos[0].enabled);
+    }
+    #[test]
+    fn ssb_linked_trigger_arm_prevents_mode_and_bandwidth_edits(){
+        let mut e=engine();e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":"USB","bandwidth_hz":2700}})).unwrap();
+        e.apply(&json!({"action":"set_trigger","trigger":{"link_vfo":1,"pre_seconds":0,"threshold_db":10}})).unwrap();
+        e.on_start("demo",json!({})).unwrap();e.apply(&json!({"action":"arm"})).unwrap();let before=e.configuration();
+        for patch in [json!({"mode":"LSB"}),json!({"bandwidth_hz":3000}),json!({"frequency_hz":32000100})]{
+            assert_eq!(e.apply(&json!({"action":"update_vfo","id":1,"patch":patch})).unwrap_err().code,"locked");assert_eq!(e.configuration(),before);
+        }
+        e.on_stop("test");
+    }
+    #[test]
+    fn ssb_preset_roundtrip_preserves_am_fm_and_both_sideband_references(){
+        let mut e=engine();let original=e.vfos[0].config();
+        for(mode,width)in [("AM",10000),("NFM",12500),("USB",2700),("LSB",2700)]{
+            e.apply(&json!({"action":"add_vfo","vfo":{"mode":mode,"bandwidth_hz":width,"frequency_hz":e.center()}})).unwrap();
+        }
+        let saved=e.configuration();let mut restored=engine();restored.restore_configuration(&saved).unwrap();
+        assert_eq!(restored.configuration(),saved);assert_eq!(restored.vfos[0].config(),original);
+        let mut invalid=saved.clone();invalid["vfos"][3]["reception"]["afc_enabled"]=json!(true);let before=restored.configuration();
+        assert!(restored.restore_configuration(&invalid).is_err());assert_eq!(restored.configuration(),before);
+    }
+    #[test]
+    fn ssb_processed_status_never_claims_afc_lock_or_tracking(){
+        let mut e=engine();e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":"USB","bandwidth_hz":2700}})).unwrap();
+        e.on_start("demo",json!({})).unwrap();e.process_block(0,&trace_test_iq(8192,20.0)).unwrap();
+        let status=&e.state()["vfos"][0]["reception_status"];
+        assert_eq!(status["afc_status"],"unsupported_mode");assert_eq!(status["afc_quality_reason"],"unsupported_mode");
+        assert_eq!(status["afc_offset_hz"],0.0);assert_eq!(status["afc_locked"],false);e.on_stop("test");
+    }
+    #[test]
+    fn inference_default_off_legacy_restore_and_strict_atomic_configuration(){
+        let mut e=engine();assert_eq!(e.state()["modulation_inference"]["config"]["enabled"],false);assert!(e.modulation_estimator.is_none());
+        let before=e.configuration();
+        for config in [json!({"enabled":1}),json!({"bandwidth_hz":"6000"}),json!({"bandwidth_hz":5999}),json!({"bandwidth_hz":250001}),json!({"carrier_reference_explicit":null}),json!({"unknown":true})]{
+            assert!(e.apply(&json!({"action":"set_modulation_inference","config":config})).is_err());assert_eq!(e.configuration(),before);
+        }
+        e.apply(&json!({"action":"set_modulation_inference","config":{"enabled":true,"bandwidth_hz":6000}})).unwrap();
+        let mut legacy=before.clone();legacy.as_object_mut().unwrap().remove("modulation_inference");e.restore_configuration(&legacy).unwrap();
+        assert_eq!(e.modulation_settings,Engine::default_modulation_settings());
+        let mut invalid=before.clone();invalid["modulation_inference"]=json!({"enabled":true,"bandwidth_hz":true});assert!(e.restore_configuration(&invalid).is_err());assert_eq!(e.configuration(),before);
+        for bad_vfos in [Value::Null,json!({}),json!("invalid")]{let mut broken=before.clone();broken["input"]["center_hz"]=json!(33_000_000);broken["vfos"]=bad_vfos;assert!(e.restore_configuration(&broken).is_err());assert_eq!(e.configuration(),before);}
+    }
+    #[test]
+    fn enabled_vfo_clears_historical_stop_reason_after_valid_manual_update(){
+        let mut e=engine();e.apply(&json!({"action":"stop_vfo","id":1})).unwrap();assert!(e.vfos[0].stopped_reason.is_some());
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"mode":"USB","bandwidth_hz":2700,"enabled":true}})).unwrap();
+        assert!(e.vfos[0].enabled);assert!(e.vfos[0].stopped_reason.is_none());assert_eq!(e.state()["vfos"][0]["stopped_reason"],Value::Null);
+    }
+    #[test]
+    fn inference_carrier_confirmation_expires_on_retune_selection_stop_and_restart(){
+        let mut e=engine();e.on_start("demo",json!({})).unwrap();
+        let enable=json!({"action":"set_modulation_inference","config":{"enabled":true,"bandwidth_hz":6000,"carrier_reference_explicit":true}});
+        e.apply(&enable).unwrap();assert_eq!(e.modulation_settings["carrier_reference_explicit"],true);
+        let saved=e.configuration();assert_eq!(saved["modulation_inference"]["carrier_reference_explicit"],false);
+        e.apply(&json!({"action":"update_vfo","id":1,"patch":{"frequency_hz":32000010}})).unwrap();assert_eq!(e.modulation_settings["carrier_reference_explicit"],false);
+        e.apply(&enable).unwrap();e.apply(&json!({"action":"add_vfo","vfo":{"mode":"AM","bandwidth_hz":10000}})).unwrap();
+        e.apply(&json!({"action":"select_vfo","id":2})).unwrap();assert_eq!(e.modulation_settings["carrier_reference_explicit"],false);
+        e.apply(&enable).unwrap();e.on_stop("test");assert_eq!(e.modulation_settings["carrier_reference_explicit"],false);assert_eq!(e.state()["modulation_inference"]["result"]["reasons"][0],"stopped");
+        let mut restored=engine();restored.restore_configuration(&saved).unwrap();assert_eq!(restored.modulation_settings["enabled"],true);assert_eq!(restored.modulation_settings["carrier_reference_explicit"],false);assert!(!restored.running);
+        restored.apply(&enable).unwrap();assert_eq!(restored.modulation_settings["carrier_reference_explicit"],true);restored.apply(&json!({"action":"update_vfo","id":1,"patch":{"frequency_hz":32000020}})).unwrap();assert_eq!(restored.modulation_settings["carrier_reference_explicit"],false);
+    }
+    #[test]
+    fn inference_uses_raw_independent_route_and_never_changes_demod_or_recorded_iq(){
+        let mut e=engine();e.on_start("demo",json!({})).unwrap();
+        e.apply(&json!({"action":"set_modulation_inference","config":{"enabled":true,"bandwidth_hz":12000}})).unwrap();
+        let vfo=e.vfos[0].config();let input=e.input.clone();let epoch=e.audio_epoch;
+        e.apply(&json!({"action":"iq_start"})).unwrap();let raw=frontend_tone_raw(131072);e.process_block(0,&raw).unwrap();
+        assert_eq!(e.vfos[0].config(),vfo);assert_eq!(e.input,input);assert_eq!(e.audio_epoch,epoch);
+        assert_eq!(e.state()["modulation_inference"]["observation_route"],"raw_iq_before_center_dc_and_demodulation");
+        e.apply(&json!({"action":"iq_stop"})).unwrap();assert_eq!(fs::read(e.iq.as_ref().unwrap().data_path.as_ref().unwrap()).unwrap(),raw);
+        e.apply(&json!({"action":"set_modulation_inference","config":{"enabled":false}})).unwrap();assert!(e.modulation_estimator.is_none());e.on_stop("test");
     }
 }

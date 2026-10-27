@@ -2,6 +2,8 @@
 
 これは開発PCで明示実行する手順です。受取側PCはMicrosoft公式Visual C++ v14ランタイム（x64）を用意してZIPを展開し、起動します。Rust/Python/Node/Build Toolsを必要としません。作成側にはRust MSVCとMicrosoft C++ Build Tools、Windows PowerShellが必要です。自動USBドライバー導入・受信開始・機器設定変更は行いません。
 
+v0.5.0はSSBと任意の方式推定を追加する検証中の候補です。下記の候補包装コマンドは公開操作ではありません。完成ZIP・対応ソースの検査と版ごとの結果を確認してから配布を判断します。v0.5.0の公開タグ、最終asset名・hash・合格件数は未確定です。
+
 ## 1. テストとビルド
 
 ```powershell
@@ -10,7 +12,10 @@ node tests\ui-static-boundaries.cjs
 node tests\ui-reception-boundaries.cjs
 node --test tests\frontend-ui.test.cjs
 node --test tests\audio-ui-state.test.cjs tests\app-shutdown.test.cjs tests\frequency-axes-pan.test.cjs
+node --test tests\ssb-ui.test.cjs tests\modulation-ui.test.cjs
 ```
+
+`--all-targets`でSSB復調・VFO境界と変調方式推定のRust試験も実行します。JavaScriptはブラウザーや実機を使わない境界検査です。JSONを出力するharnessは新規出力先へ保存し、以前の検証結果を上書きしません。
 
 配布バイナリーへ開発PCのソースパスを埋めないため、パスをremapしてビルドします。空白を含むパスを扱えるよう、区切り付きのRust flagsを使用します。これらの環境変数は現在のPowerShell内だけに設定します。
 
@@ -29,11 +34,13 @@ cargo build --manifest-path native\Cargo.toml --release --locked --bin rtl-spect
 
 ## 2. 公開プレビューの入力
 
-公開pre-releaseのタグは **`v0.4.1-preview.1`**、パッケージ版は **`0.4.1-public-preview.1`**、アプリ内部版は **`0.4.1`** です。[同じリリース](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.1-preview.1) にWindows x64のデモ同梱ZIPと、全対応ソースZIPを用意します。ファイル名・サイズ・SHA256は各リリースassetとmanifestで照合してください。
+今回のアプリ内部版は **`0.5.0`**、packagerの既定は検証用の **`0.5.0-dev`** です。公開用の名前は公開前の確認で別途確定します。SSBと推定はアプリ本体の変更で、追加の機械学習モデルや依存ダウンロードを要求しません。[MODULATION.md](MODULATION.md)に処理範囲を記載します。
+
+公開済みv0.4.1のタグは **`v0.4.1-preview.1`**、パッケージ版は **`0.4.1-public-preview.1`**、アプリ内部版は **`0.4.1`** です。[同じリリース](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.1-preview.1) のWindows x64デモ同梱ZIP・対応ソースZIPは従来版の成果物として保持します。ファイル名・サイズ・SHA256は各リリースassetとmanifestで照合してください。
 
 公開版に用いるuser-spaceの`rtlsdr.dll`は、RTL-SDR Blog V1.4.0の固定ソースとlibusb 1.0.30の公式tarballからMSVCでビルドしたものです。libusbを静的リンクし、Microsoft CRTは`/MD`で動的リンクします。承認済みDLLは192,000 bytes、SHA256 `761de6ef2f57047f1dfbbf2346cb53247b2974f5d1fb11b64f9498b650cafc05` です。Windows USBドライバーの導入・変更は行いません。
 
-対応ソースZIPのトップは`RTL-SDR-Spectrum-Studio-0.4.1-source/`です。
+v0.5.0の対応ソースZIPは`RTL-SDR-Spectrum-Studio-0.5.0-source/`をトップとする構成を予定します。従来のv0.4.1では`RTL-SDR-Spectrum-Studio-0.4.1-source/`です。新しいSSB／推定の本体・UI・試験・文書も含め、最終ZIPと対応する内容を照合します。
 
 - 自作コード・UI・テスト・ライセンス。
 - `Cargo.lock`に固定した全66 crateのvendorソースと原通知。
@@ -68,12 +75,14 @@ $binary = 'native\target-portable\release\rtl-spectrum-studio.exe'
 $hash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash
 $driverDll = Read-Host '承認済みsource-built rtlsdr.dllのパス'
 $driverSources = Read-Host '承認済み6ファイルを含むdriver sourceフォルダー'
-.\tools\package-studio.ps1 -BinaryPath $binary -ExpectedBinarySha256 $hash -PackageVersion 0.4.1-public-preview.1 -CargoMetadataPath $prepared.cargo_metadata_path -PublicRelease -DriverDllPath $driverDll -DriverSourceDirectory $driverSources
+.\tools\package-studio.ps1 -BinaryPath $binary -ExpectedBinarySha256 $hash -PackageVersion 0.5.0-dev -CargoMetadataPath $prepared.cargo_metadata_path -PublicRelease -DriverDllPath $driverDll -DriverSourceDirectory $driverSources
 ```
 
 公開ZIPに`vcruntime140.dll`やWindows system DLLを同梱しません。受取側は初回起動前に [Microsoft公式Visual C++ v14 Redistributable（x64）](https://aka.ms/vc14/vc_redist.x64.exe) を導入または更新します。ビルドに用いたMSVCと同じかそれより新しい対応版を使います。[Microsoftの導入案内](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170) を参照してください。アプリ・起動scriptからruntimeのダウンロードやインストールは行いません。保存IQ再生だけでもアプリ用runtimeは必要です。
 
 同名成果物を置換せず、`dist/`へ時刻付きで新規作成します。元の`data/`は読まず、個人情報のない`presets/fm-measurement.json`を新しいsettingsの初期値へコピーします。別プリセットを使う場合は`-PresetPath`で明示します。Rust標準ライブラリーの通知の場所を変えた場合は`-RustCopyrightPath`を指定できます。
+
+初期設定では方式推定はOFFです。USB/LSB用の搬送波基準の確認を、利用者の個人設定や検証中のセッションから配布プリセットへ持ち込みません。保存設定の読込みでもその確認はtrueへ復元しません。同梱AFGデモは従来のWFM設定を維持し、SSBや推定精度の実RFデモとは扱いません。
 
 初期プリセットはv0.4.0から中心DC補正ONを維持します。中心付近の実信号にも影響し、処理中のレベルは相対表示になります。中心AM局は搬送波が抑えられて包絡復調が崩れる場合があるため、OFF比較か、受信中心を局からずらしてVFOで合わせる運用を使います。RF感度／S/N改善ではありません。原IQ保存は補正前です。パッケージ生成の成功と、[VALIDATION.md](VALIDATION.md) の製品受入れは別の確認です。
 
@@ -93,6 +102,15 @@ Windows ZIPとは別に、全対応ソースZIPも同じpre-releaseへ添付し�
 
 ## 4. 別工程の確認
 
+v0.5.0の最終実行物の検証は準備中です。SSB／推定の実装・単体検査と、包装した同じexeの再生API・実GUI・対応ソースの再ビルドを分けて記録します。特に次の追加項目を確認します。
+
+- USB/LSBで基準と片側帯域、幅1000/14100 Hz、RF 0 Hz、有効帯域の両端を正しく扱い、無効な変更で既存設定を壊さないこと。VFO連動の測定・トリガも同じ帯域を使うこと。
+- SSB適用とAFC OFFが一つの操作になり、APIでSSB+AFC ONを拒否すること。ピークは帯域内配置と表示し、基準の自動復元とは表示しないこと。原IQ・旧AM/FMプリセット・既存VFO絶対Hzを保持すること。
+- 推定は既定OFF、選択VFOと独立観測幅だけを対象とし、候補・根拠・保留を区別すること。FM候補から方式を勝手に選ばず、全候補で方式・幅・VFO Hz・中心を自動変更しないこと。
+- 搬送波基準の確認と古い結果を条件変更・停止・欠落・シーク等で解除し、プリセットから確認をtrueへ復元しないこと。合成・保存IQの成功を実RFの正答率や聴感へ一般化しないこと。
+
+以下は継続するv0.4.1の検査範囲と履歴です。
+
 v0.4.1の最新仕様の追加純JS検査は音声9・終了9・周波数目盛り/PanとVFO追加15の33件です。先行候補の追加29件・総合95件の成功は仕様変更前の結果として保持します。成功・失敗の結果は [VALIDATION.md](VALIDATION.md) へ記録し、単体検査を実GUIやRFの合格と扱いません。特に新exeへ埋め込んだ画面を使い、次を確認します。
 
 - 音声の現在状態と次の操作、開始失敗時のOFF維持、受信停止などの補足表示。
@@ -106,6 +124,8 @@ v0.4.1の最新仕様の追加純JS検査は音声9・終了9・周波数目盛�
 デモの固定4ファイルとmanifestはバイト列で検査します。Git取得時もmanifestと一致するよう、IQはbinary、同梱metadata・preset・README・manifestは固定pathの-text属性で改行変換を抑止します。通常sourceの改行方針は維持します。
 
 ## 配布履歴と今回の変更
+
+v0.5.0ではSSBと任意の変調方式推定を追加します。最終候補の包装・対応ソース・API・GUI検証は未完了で、v0.4.1の既存Releaseやhashを置き換えません。GPL方針、固定source-built driver、CRT別導入、全66 crateの対応source提供を継続する予定です。公開結果は確定後に[VALIDATION.md](VALIDATION.md)へ記録します。
 
 v0.4.0-preview.1の公開Windows ZIP・対応source ZIP・検証要約・SHA256SUMSは保持します。当時の起動診断・再生14項目・USB境界24項目・sourceオフラインビルドの成功は当時のartifactへ対応します。v0.4.1は画面と版番号を含む新exeのため、新しいZIP・source ZIPのhashと実行検証を別に記録します。driver `761de6ef…`・CRT別導入・66crateのsource提供は継続します。
 

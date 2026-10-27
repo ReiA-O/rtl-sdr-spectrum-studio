@@ -10,7 +10,7 @@
 </head>
 <body>
   <header class="app-header">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">▥</span><div><h1>Spectrum Studio</h1><span class="subtitle">RTL-SDR · AM / FM</span></div></div>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">▥</span><div><h1>Spectrum Studio</h1><span class="subtitle">RTL-SDR · AM / FM / SSB</span></div></div>
     <div class="session-status"><span id="statusDot" class="status-dot"></span><strong id="sessionStatus">接続を確認中</strong><span id="sourceBadge" class="badge">停止中</span><span id="deviceName" class="muted">RTL-SDR</span></div>
     <div class="header-actions">
       <label class="source-label"><span class="sr-only">受信元</span><select id="sourceSelect"><option value="live">RTL-SDR 実機</option><option value="demo">合成信号</option></select></label>
@@ -78,12 +78,13 @@
       <div class="audio-toolbar"><div class="audio-switch"><span id="audioState" class="audio-state" role="status" aria-live="polite" aria-atomic="true">現在：音声OFF</span><button id="audioButton" type="button" class="button audio-button" aria-pressed="false" aria-label="現在：音声OFF。音声をONにする" aria-describedby="audioStatus" title="現在：音声OFF。押すとONになります。">音声をONにする</button></div><label class="volume-control">音量<input id="volume" type="range" min="0" max="1" step="0.01" value="0.2" aria-label="スピーカー音量"></label></div>
       <div id="audioStatus" class="audio-caption">スピーカー出力はOFFです。選択中の1局だけを出力します。</div>
       <div id="vfoList" class="vfo-list" aria-label="VFO設定。各局の受信・音声補助を開いて設定できます"><div class="vfo-empty">受信するVFOを追加してください</div></div>
+      <details class="modulation-panel"><summary>変調方式の参考推定 <span id="modulationBadge" class="badge">OFF</span></summary><form id="modulationForm" class="modulation-form"><label class="check"><input id="modulationEnabled" type="checkbox">選択VFOの方式を推定する</label><label>推定用の観測幅<div class="input-unit"><input id="modulationWidth" type="number" min="6" max="250" step="1" value="200"><span>kHz</span></div></label><label class="check"><input id="modulationReference" type="checkbox">このVFOを搬送波基準として左右を比較</label><p class="section-note">USB／LSBの候補は基準位置に依存します。同調・選択・停止後は基準指定を解除します。</p><button class="button mini" type="submit">推定設定を適用</button></form><div id="modulationResult" class="modulation-result" role="status">推定はOFFです。</div><p id="modulationReason" class="section-note">方式・周波数は自動で変更しません。</p><button id="modulationApply" class="button mini" type="button" disabled>候補を適用</button><p class="section-note">判定は参考です。弱信号・混信・無変調・中心DCなどでは保留します。FM候補のNFM／WFMはVFOで選んでください。</p></details>
       <section class="capture-section" aria-label="IQ記録とトリガ"><div class="section-label"><span>IQ記録</span><span id="iqBadge" class="badge">待機</span></div><div class="capture-buttons"><button id="iqButton" class="button">● IQ保存</button><button id="armButton" class="button trigger-button">トリガ待機</button><button id="triggerSettingsButton" class="button icon-button" aria-label="トリガ設定">⚙</button></div><div class="trigger-summary"><span id="triggerState">Disarmed</span><span id="triggerPreAvailable">プリバッファ — s</span></div><div class="trigger-level"><span id="triggerSummary">Peak / — dBFS</span><span id="recordingElapsed"></span></div></section>
       <section id="replayPanel" class="replay-section" hidden><div class="section-label"><span>IQ再生</span><button id="replayCloseButton" class="text-button">ライブへ戻る</button></div><div id="replayName" class="muted small-text"></div><input id="replaySeek" type="range" min="0" max="1" step="0.01" value="0" aria-label="IQの再生位置"><div class="replay-time"><span id="replayPosition">0.00 s</span><span id="replayDuration">— s</span></div></section>
       <div class="panel-bottom"><span id="processingStatus">処理負荷 —</span><span id="sampleCounter">—</span></div>
     </aside>
   </main>
-  <footer class="app-footer"><span id="footerStatus">ローカル接続を確認しています</span><span id="footerRight">AM / NFM / WFM · IQ / WAV</span></footer>
+  <footer class="app-footer"><span id="footerStatus">ローカル接続を確認しています</span><span id="footerRight">AM / NFM / WFM / USB / LSB · IQ / WAV</span></footer>
 
   <dialog id="settingsDialog" class="settings-dialog"><form method="dialog" class="dialog-heading"><h2>受信と解析の設定</h2><button aria-label="設定を閉じる" class="icon-button">×</button></form><div class="settings-tabs" role="tablist"><button class="active" data-tab="receiver" role="tab">入力・FFT</button><button data-tab="persistence" role="tab">密度・残像</button><button data-tab="measurement" role="tab">測定・Marker</button><button data-tab="calibration" role="tab">レベル校正</button><button data-tab="trigger" role="tab">トリガ</button><button data-tab="presets" role="tab">設定保存</button></div>
     <div class="dialog-content">

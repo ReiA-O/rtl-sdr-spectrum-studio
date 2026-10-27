@@ -3,6 +3,7 @@ pub mod device;
 pub mod dsp;
 pub mod engine;
 pub mod frontend;
+pub mod modulation;
 pub mod recording;
 pub mod reception;
 pub mod runtime;

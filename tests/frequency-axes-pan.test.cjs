@@ -21,7 +21,7 @@ function context(initial=fixture()){
     previousFrontend:'same',preferredSource:null,extraConditions:[],seenNotifications:new Set(),lastDeviceError:null,lastAudioConditions:'',audioSequence:0,lastAudioVfo:null,
     finite:(v,f=0)=>Number.isFinite(Number(v))?Number(v):f,clamp:(v,a,b)=>Math.max(a,Math.min(b,v)),mhz:v=>Number(v||0)/1e6,formatHz:String,
     $:element,document:{activeElement:null},asText:(id,value)=>{element(id).textContent=value;},setValue(){},updateLinks(){},inputLocked:()=>false,
-    levelUnit:()=> 'dBFS',frontendRouteKey:()=> 'same',notice(){},renderCalibration(){},renderDensityRange(){},renderVfos(){},renderMeasurements(){},renderFrontend(){},updateFftVisibility(){},updatePresetLoadState(){},renderConditions(){},applyLayout(){},flushAudio(){},syncStateAudioEpoch(){},updateAudioCaption(){},audioConditionsKey:()=>'',selectedVfo:()=>c.state?.vfos?.[0],
+    levelUnit:()=> 'dBFS',frontendRouteKey:()=> 'same',notice(){},renderCalibration(){},renderDensityRange(){},renderVfos(){},renderModulation(){},renderMeasurements(){},renderFrontend(){},updateFftVisibility(){},updatePresetLoadState(){},renderConditions(){},applyLayout(){},flushAudio(){},syncStateAudioEpoch(){},updateAudioCaption(){},audioConditionsKey:()=>'',selectedVfo:()=>c.state?.vfos?.[0],
     drawAll(){c.draws++;},draws:0,requestFrame(){c.requests++;},requests:0,cancelPendingVfoTune(){c.cancelledPending++;},cancelledPending:0,
     toast:(message,type)=>messages.push({message,type}),sent,messages,elements,
     action:async(name,data,options={})=>{if(options.guard&&!await options.guard())return null;const payload=typeof data==='function'?data():data;sent.push({name,data:clone(payload),options});return {ok:true};},console};

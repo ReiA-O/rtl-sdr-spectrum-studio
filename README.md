@@ -2,7 +2,9 @@
 
 RTL-SDRでAM/FM放送のIQ取得・音声復調・録音と、受信帯域の観測を行うWindows向け開発版です。Rust本体がローカルHTTPサーバーを動かし、exeに内蔵した画面を通常のブラウザーへ表示します。Pythonは数値比較・単体テスト用の参照実装で、アプリの実行には使いません。
 
-**公開プレビュー `v0.4.1-preview.1`** の取得先は [Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.1-preview.1) です。Windows x64用のデモ同梱ZIPと、アプリ・全66 Rust crate・RTL-SDR/libusbの固定ソース・patch・ビルド手順を収めた対応ソースZIPを一緒に配布します。パッケージ版は **`0.4.1-public-preview.1`**、アプリ内部の版は **`0.4.1`** です。取得するassetの正確なファイル名とSHA256はリリースの案内・同梱manifestで確認してください。
+**最新プレビュー：[v0.5.0-preview.1](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.5.0-preview.1)**。USB／LSB復調と任意の変調方式推定を追加しました。Windows ZIPを別フォルダーへ展開し、旧アプリを正常終了してから `start-studio.cmd` を起動します。VFOでUSB／LSBを選べます。「変調方式の参考推定」は既定OFFで、候補の採用は手動です。Native146件・純JS124件、最終配布実行物の保存IQ再生21項目・方式推定51項目・実GUI16項目を確認しました。[検証範囲](docs/VALIDATION.md)と[SSB／方式推定の案内](docs/MODULATION.md)を参照してください。対応ソースと再ビルド結果は同じReleaseに添付します。実RFでのSSB聴感・推定精度は未検証です。
+
+**公開済みプレビュー `v0.4.1-preview.1`** の取得先は [Releases](https://github.com/ReiA-O/rtl-sdr-spectrum-studio/releases/tag/v0.4.1-preview.1) です。Windows x64用のデモ同梱ZIPと、アプリ・全66 Rust crate・RTL-SDR/libusbの固定ソース・patch・ビルド手順を収めた対応ソースZIPを一緒に配布します。パッケージ版は **`0.4.1-public-preview.1`**、アプリ内部の版は **`0.4.1`** です。取得するassetの正確なファイル名とSHA256はリリースの案内・同梱manifestで確認してください。以下のv0.5.0の追加機能は、この既存ZIPには含まれません。
 
 v0.4.1は、帯域を決めてピークを選び、VFOで復調し、原IQを保存する受信経路を維持し、音声操作・終了操作・周波数表示を更新する版です。中心DC補正式、原IQの保存方式、ドライバーと同梱デモIQはv0.4.0から変更していません。旧版の数値検証はその条件での結果として保持し、新しい画面・配布実行物・RF gain反映の確認とは分けます。結果と未検証部分は [VALIDATION.md](docs/VALIDATION.md) に記載します。
 
@@ -23,7 +25,15 @@ AFG3102から32 MHz・FM偏移±75 kHz・1 kHzの試験音を出力し、Studio�
 
 FMでは最大のスペクトルピークが搬送中心とは限らないため、最初は同梱プリセットのVFO **32.000 MHz・WFM・200 kHz** で再生してください。手動FFT4096点、実効RBW375 Hzの設定です。既存の測定用初期プリセットは置き換えません。IQは`.sigmf-meta`と`.sigmf-data`をセットで扱い、復調音のWAVと区別します。
 
-## v0.4.1の画面操作
+## v0.5.0のSSBと方式推定（検証済み候補）
+
+- VFOでUSB／LSBを選ぶと、既定の通過幅は2.7 kHzになります。基準周波数は抑圧搬送波の位置です。USBは基準の上側300 Hz〜300 Hz＋幅、LSBは下側300 Hz〜300 Hz＋幅を通します。幅の範囲は1.0〜14.1 kHzで、実機性能の保証値ではありません。
+- 方式を適用するとAFCもOFFへ切り替えます。SSBは手動同調で、外側の帯域端だけをドラッグして幅を変更します。ピークの「帯域内に配置」は信号を通過帯域の中央へ置く補助で、搬送波位置の復元ではありません。基準の微調整が必要です。
+- 方式推定は既定OFFです。選択VFOの周辺を、復調幅とは別の観測幅6〜250 kHz（既定200 kHz）で調べます。中心DC補正前・復調前の原IQを観測し、現在の復調方式とは独立に候補と根拠・保留理由を表示します。
+- 推定は方式・幅・VFO周波数・受信中心を自動変更しません。FM候補からNFM／WFMを選び分ける操作は利用者が行います。USB／LSBの区別には搬送波基準の明示が必要で、基準不明や弱信号・混信・無変調などでは保留します。一致度は正答確率ではありません。
+- 搬送波基準の確認は、同調・選択VFO・入力・ソースの変更、停止などで解除し、プリセットや再起動からtrueへ復元しません。古い推定結果も条件変更・欠落・シーク・推定OFFで無効にします。既存のVFO絶対Hz非追従とAM/FMプリセットは維持します。
+
+## v0.4.1から継続する画面操作
 
 - 音声は「現在：音声ON/OFF」と、次に行う「音声をON/OFFにする」を別に表示します。開始処理が成功するまでONとは表示しません。ON設定でも受信停止・接続待ち・出力対象なしの場合は、その理由を補足表示します。
 - ヘッダーの「アプリ終了」で確認画面を承認し、受信・再生と録音の終了処理を行います。「終了しました。ブラウザーのタブを閉じてください。」を確認してからタブを閉じます。未適用の編集値は適用されません。タブを閉じるだけではサーバーは終了しません。
@@ -35,10 +45,10 @@ FMでは最大のスペクトルピークが搬送中心とは限らないため
 ## 主な機能
 
 - Spectrum・密度表示・Waterfall・複数VFOを同時表示。共通FFTから全有効フレームを集計します。
-- AM/NFM/WFMモノラル復調、選択VFOだけのスピーカー出力、VFO別WAV録音。
+- AM/NFM/WFMに加え、v0.5.0候補ではUSB/LSBのモノラル復調に対応。選択VFOだけのスピーカー出力、VFO別WAV録音。
 - 中心DC補正は手動ON/OFF。独立I/Qの公称20 Hz一極追従減算を、表示・ピーク検索・測定・トリガ・復調の共通経路へ適用します。原IQは未補正のまま保存します。
-- 自動／ユーザーマーカーのピークを選んで、選択VFOをその周波数へ同調できます。受信中心は自動変更せず、有効帯域外の同調を拒否します。
-- VFOごとの任意AFC（初期OFF）、RFスケルチ、音声ゲイン・sampleピーク保護・既知不連続のクリック抑制。AFCは手動でOFFへ戻せ、名目局周波数と受信中心を保持します。
+- 自動／ユーザーマーカーのピークから選択VFOを同調できます。SSBではピークを帯域中央へ配置し、基準を手動調整します。受信中心は自動変更せず、VFO基準と全通過帯域が有効取得帯域に収まらない指定を拒否します。
+- AM/FM用のVFOごとの任意AFC（初期OFF）、RFスケルチ、音声ゲイン・sampleピーク保護・既知不連続のクリック抑制。AFCは手動でOFFへ戻せ、名目局周波数と受信中心を保持します。USB/LSBにはAFCを適用しません。
 - WAVは復調音（音声補助前、既定）／聴取処理後を選択。中心DC補正・AFC・同調フィルターは両方へ反映し、スケルチ・音声ゲイン等は処理後経路へ反映します。
 - 中心周波数・Span・RBW/FFT・Ref Level・Rangeの調整、TraceとPersistence、測定用プリセット。
 - Spectrumの「ピークリセット」でMax／Min／Averageを同時にリセットし、受信や録音を続けたまま現在のLiveから再集計。
@@ -90,11 +100,14 @@ node tests\ui-static-boundaries.cjs
 node tests\ui-reception-boundaries.cjs
 node --test tests\frontend-ui.test.cjs
 node --test tests\audio-ui-state.test.cjs tests\app-shutdown.test.cjs tests\frequency-axes-pan.test.cjs
+node --test tests\ssb-ui.test.cjs tests\modulation-ui.test.cjs
 # Python参照テストを使う場合だけNumPyが必要
 python -m unittest discover -s tests -v
 ```
 
-最新仕様の追加純JavaScript検査は、音声状態9件（audio-ui-state）、終了処理9件（app-shutdown）、周波数目盛り・中心移動・VFO追加15件（frequency-axes-pan）の計33件です。既存回帰66件と合わせた構成は99件で、軸だけの自動承認と一般手入力D24の分離、最新中心へのVFO追加と新規選択、低中心周波数での帯域制限も対象です。最終候補での総合結果と実GUI・実機は [VALIDATION.md](docs/VALIDATION.md) へ分けて記録します。先行v0.4.1候補では追加29件＋回帰66件＝JS95件とNative108件が成功しましたが、その先行候補は今回の軸確認省略・新規VFO配置変更前です。
+v0.5.0ではNative146件（library142＋main4、外部保存IQ fixture1件ignored）・純JavaScript124件が成功しました。SSBの左右帯域端・RF 0 Hz・VFO基準位置・AFC拒否・プリセット互換、方式推定の候補／保留・条件変更時の無効化・設定を自動変更しないことを含みます。最終候補の正確なexeで保存IQ再生21項目と方式推定51項目も成功しました。実GUIと最終対応ソースは別工程で、結果・候補ZIPとexeのhash・未検証条件を [VALIDATION.md](docs/VALIDATION.md) に記録します。
+
+v0.4.1の追加純JavaScript検査は、音声状態9件（audio-ui-state）、終了処理9件（app-shutdown）、周波数目盛り・中心移動・VFO追加15件（frequency-axes-pan）の計33件でした。既存回帰66件と合わせた構成は99件で、軸だけの自動承認と一般手入力D24の分離、最新中心へのVFO追加と新規選択、低中心周波数での帯域制限も対象です。結果と実GUI・実機は [VALIDATION.md](docs/VALIDATION.md) に分けて記録します。先行v0.4.1候補では追加29件＋回帰66件＝JS95件とNative108件が成功しましたが、その先行候補は軸確認省略・新規VFO配置変更前です。これらをv0.5.0の合格件数へ読み替えません。
 
 旧v0.4.0ではRust108件・JavaScript66件が合格しました。JavaScriptはブラウザー・ネットワーク・実機を使わない状態遷移テストで、中心補正の表示、録音中のロック、旧frame棄却、ピーク選局も含みます。保存実機IQを明示指定する追加テスト1件は通常の`cargo test`ではignoredになり、個人の録音データは同梱しません。数値境界と製品API・実機・GUIの結果は [VALIDATION.md](docs/VALIDATION.md) で区別します。
 

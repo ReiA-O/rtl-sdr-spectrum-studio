@@ -23,6 +23,7 @@
   let vfoSelectionIntent, vfoSelectionGeneration = 0, vfoSelectionPromise = Promise.resolve(true), canvasGestureTarget = 'empty';
   let densityRangeDisplayContext = null, densityRangeEditContext = null, densityRangeEditGeneration = 0;
   let frequencyPan = null, frequencyPanPending = false;
+  let modulationUiIdentity = null;
   const dirtyForms = new Set();
   const vfoEdits = new Map();
   const receptionDefaults = Object.freeze({afc_enabled:false,afc_max_hz:1000,squelch_enabled:false,squelch_dbfs:-60,squelch_hysteresis_db:3,squelch_hang_ms:300,audio_gain_db:0,limiter_enabled:true,limiter_ceiling_dbfs:-2,click_suppression_enabled:true,wav_audio:'demod'});
@@ -94,7 +95,7 @@
     const reason=frontendChanging?'処理と表示を切り替えています。':view.reason;
     asText('frontendLockReason',reason);$('frontendLockReason').hidden=!reason;
     const route=frontendChanging?'補正状態を切替中':frontendDisplayRoute(state,frame,connectionError);
-    asText('footerRight',`${route} · 原IQは未補正保存 · AM / NFM / WFM`);
+    asText('footerRight',`${route} · 原IQは未補正保存 · AM / NFM / WFM / USB / LSB`);
   }
   async function changeFrontend() {
     const desired=$('dcRejectEnabled').checked===true,view=frontendPresentation(state,connectionError);
@@ -104,21 +105,34 @@
     try{return await action('set_frontend',{frontend:{dc_reject_enabled:desired}},{message:desired?'中心DC補正をON設定にしました。原IQは未補正で保存します':'中心DC補正をOFFにしました'});}
     finally{frontendChanging=false;frontendPendingValue=null;renderFrontend();renderMeasurements(frame?.measurements || {});}
   }
+  function vfoPassband(frequency,bandwidth,mode='WFM') {
+    if(!Number.isFinite(frequency)||frequency<=0||!Number.isFinite(bandwidth)||bandwidth<=0||!['AM','NFM','WFM','USB','LSB'].includes(mode))return null;
+    const ssb=['USB','LSB'].includes(mode);if(ssb&&(bandwidth<1000||bandwidth>14100))return null;
+    const low=mode==='USB'?300:mode==='LSB'?-300-bandwidth:-bandwidth/2;
+    const high=mode==='USB'?300+bandwidth:mode==='LSB'?-300:bandwidth/2;
+    return {low_hz:frequency+low,high_hz:frequency+high,ssb,resize_edge:mode==='USB'?'high':mode==='LSB'?'low':null};
+  }
+  function boundedVfoBandwidth(mode,bandwidth) { return clamp(bandwidth,1000,['USB','LSB'].includes(mode)?14100:Infinity); }
+  function vfoBandwidthFromEdge(mode,reference,frequency) {
+    return boundedVfoBandwidth(mode,Math.round(mode==='USB'?frequency-reference-300:mode==='LSB'?reference-300-frequency:2*Math.abs(frequency-reference)));
+  }
   function peakTunePlan(current,vfo,frequency,disconnected=false) {
     if(!current||disconnected)return {error:'アプリとの接続を確認してください。'};
     if(!vfo)return {error:'選局するVFOを追加・選択してください。'};
     if(vfo.enabled===false)return {error:'選択中のVFOを再開してから選局してください。'};
     if(typeof frequency!=='number'||!Number.isFinite(frequency)||frequency<=0)return {error:'ピーク周波数を確認してください。'};
-    const center=current.input?.center_hz,fs=current.input?.sample_rate,bw=vfo.bandwidth_hz;
+    const center=current.input?.center_hz,fs=current.input?.sample_rate,bw=vfo.bandwidth_hz,mode=vfo.mode||'WFM';
     if(!Number.isFinite(center)||!Number.isFinite(fs)||fs<=0||!Number.isFinite(bw)||bw<=0)return {error:'受信帯域とVFO帯域幅を確認してください。'};
     const declared=current.input?.usable_bandwidth_hz,usable=Number.isFinite(declared)&&declared>0?Math.min(declared,fs*.9):fs*.9;
-    if(Math.abs(frequency-center)+bw/2>usable/2)return {error:'このピークではVFO帯域が取得範囲を超えます。中心・スパンまたは復調帯域幅を確認してください。'};
-    return {id:vfo.id,patch:{frequency_hz:frequency}};
+    const reference=frequency-(mode==='USB'?300+bw/2:mode==='LSB'?-300-bw/2:0),band=vfoPassband(reference,bw,mode);
+    if(!band||band.low_hz<0||Math.abs(reference-center)>usable/2||band.low_hz<center-usable/2||band.high_hz>center+usable/2)return {error:'このピークではVFO基準または復調帯域が取得範囲を超えます。受信中心または復調帯域幅を確認してください。'};
+    return {id:vfo.id,patch:{frequency_hz:reference}};
   }
   function peakTuneButton(marker,label,compact=false) {
     const plan=peakTunePlan(state,selectedVfo(),marker?.frequency_hz,connectionError),dirty=selectedVfo()&&vfoEditState(selectedVfo().id).basic.dirty;
     const reason=frontendChanging?'中心補正の切替完了を待ってください。':dirty?'選択中VFOの未適用設定を先に適用してください。':plan.error;
-    return `<button type="button" class="${compact?'peak-tune-chip':'button mini peak-tune-button'}" data-peak-key="${escapeHtml(label)}" data-peak-frequency="${escapeHtml(marker?.frequency_hz)}" data-peak-label="${escapeHtml(label)}" ${reason?'disabled':''} title="${escapeHtml(reason||`${label}の周波数へVFO ${selectedVfo()?.id}を同調`)}" aria-label="${escapeHtml(label)} ${mhz(marker?.frequency_hz).toFixed(6)} MHzへ選局">${compact?`<b>${escapeHtml(label)}</b>${mhz(marker.frequency_hz).toFixed(5)} · ${dbText(markerLevel(marker))}`:'選局'}</button>`;
+    const ssb=['USB','LSB'].includes(selectedVfo()?.mode),description=ssb?`${label}をVFO ${selectedVfo()?.id}の帯域内に配置・基準の微調整が必要`:`${label}の周波数へVFO ${selectedVfo()?.id}を同調`;
+    return `<button type="button" class="${compact?'peak-tune-chip':'button mini peak-tune-button'}" data-peak-key="${escapeHtml(label)}" data-peak-frequency="${escapeHtml(marker?.frequency_hz)}" data-peak-label="${escapeHtml(label)}" ${reason?'disabled':''} title="${escapeHtml(reason||description)}" aria-label="${escapeHtml(description)}">${compact?`<b>${escapeHtml(label)}</b>${mhz(marker.frequency_hz).toFixed(5)} · ${dbText(markerLevel(marker))}`:ssb?'帯域内に配置':'選局'}</button>`;
   }
   async function tunePeakFrequency(frequency,label='ピーク') {
     if(frontendChanging){toast('中心補正の切替完了を待ってください。','warning');return null;}
@@ -132,10 +146,57 @@
       if(check.error||vfoEditState(vfo.id).basic.dirty){toast(check.error||'VFOに新しい未適用設定があります。先に適用してください。','warning');return false;}
       return true;
     }});
-    if(result){toast(`${label}へVFO ${vfo.id}を同調しました${state?.running?'':'。受信開始で復調します'}`);focusSpectrum();}
+    if(result){toast(['USB','LSB'].includes(vfo.mode)?`${label}をVFO ${vfo.id}の帯域内に配置しました。基準の微調整が必要です`:`${label}へVFO ${vfo.id}を同調しました${state?.running?'':'。受信開始で復調します'}`);focusSpectrum();}
     return result;
   }
   function selectedVfo() { return (vfoSelectionIntent===undefined?null:state?.vfos?.find(v=>String(v.id)===String(vfoSelectionIntent))) || state?.vfos?.find(v => v.selected) || state?.vfos?.find(v => String(v.id) === String(state.selected_vfo_id)) || null; }
+  function modulationCandidatePlan(current,disconnected=false) {
+    const info=current?.modulation_inference,result=info?.result,vfo=current?.vfos?.find(v=>String(v.id)===String(current?.selected_vfo_id));
+    if(disconnected||!current?.running||!vfo?.enabled||!info?.config?.enabled||result?.state!=='candidate'||!['AM','USB','LSB'].includes(result.proposed_mode))return null;
+    if(String(info.selected_vfo_id)!==String(vfo.id)||info.reference_hz!==vfo.frequency_hz||result.proposed_mode===vfo.mode)return null;
+    const mode=result.proposed_mode,ssb=['USB','LSB'].includes(mode);if(ssb&&!info.config.carrier_reference_explicit)return null;
+    const bandwidth=ssb?2700:10000,band=vfoPassband(vfo.frequency_hz,bandwidth,mode),center=current.input?.center_hz,fs=current.input?.sample_rate;
+    const usable=Math.min(current.input?.usable_bandwidth_hz||fs*.9,fs*.9);
+    if(!band||!Number.isFinite(usable)||Math.abs(vfo.frequency_hz-center)>usable/2||band.low_hz<0||band.low_hz<center-usable/2||band.high_hz>center+usable/2)return null;
+    const patch={mode,bandwidth_hz:bandwidth};if(ssb)patch.reception={afc_enabled:false};
+    return {id:vfo.id,reference_hz:vfo.frequency_hz,mode,patch};
+  }
+  function modulationReadout(current,disconnected=false) {
+    const info=current?.modulation_inference,result=info?.result||{},enabled=info?.config?.enabled===true;
+    if(disconnected)return {badge:'接続待ち',text:'推定結果を確認できません。',reason:'アプリとの再接続を待っています。'};
+    if(!enabled)return {badge:'OFF',text:'推定はOFFです。',reason:'方式・周波数は自動で変更しません。'};
+    if(!current?.running)return {badge:'保留',text:'受信・再生は停止中です。',reason:'開始後、新しいIQを観測します。'};
+    const labels={disabled:'推定はOFFです',stopped:'受信・再生は停止中です',vfo_disabled:'選択VFOは停止中です',observation_unavailable:'観測条件を確認してください',awaiting_samples:'IQの取得を待っています',insufficient_samples:'観測データがまだ足りません',stale_samples:'新しいIQが届いていません',gap:'欠落後の再観測中です',source_reset:'入力変更後の再観測中です',incomplete_band:'観測幅が有効取得帯域に収まっていません',band_incomplete:'観測幅が有効取得帯域に収まっていません',dc_affected:'観測幅に受信中心を含むためDCの影響を除外できません',weak_signal:'信号と雑音を十分に区別できません',noise_or_weak_signal:'信号と雑音を十分に区別できません',unmodulated_or_single_tone:'無変調と単一音のSSBを区別できません',carrier_reference_required:'USB／LSBを分ける搬送波基準が未指定です',unstable_candidate:'候補の継続を確認しています',mixed_or_ambiguous:'混信または方式が曖昧な信号です'};
+    Object.assign(labels,{configuration_changed:'設定変更後の再観測中です',sampling_resumed:'新しいIQの観測中です',sample_gap:'欠落後の再観測中です',noise_reference_out_of_band:'雑音比較用の帯域が取得範囲に収まりません',center_dc_affected:'観測幅に受信中心を含むためDCの影響を除外できません',sampling_resolution_insufficient:'観測時間と周波数分解能が足りません',non_finite_samples:'無効なサンプルを検出しました',clipping_suspected:'入力の振幅飽和が疑われます',signal_quality_insufficient:'信号と雑音を十分に区別できません',signal_at_band_edge:'信号が推定用の観測幅の端にあります',multiple_signals_suspected:'複数の信号が含まれる可能性があります',unmodulated_or_cw:'無変調と単一音のSSBを区別できません',ambiguous_features:'複数の方式が当てはまるため断定できません',stability_pending:'候補の継続を確認しています',carrier_reference_unconfirmed:'搬送波基準が未指定です',fm_family_only:'FMの特徴がありますがNFM／WFMは断定しません',sideband_relative_to_vfo_reference:'指定したVFO基準に対する側波帯候補です',am_features_consistent:'搬送波・振幅・位相の特徴がAMと整合します'});
+    const reasons=(result.reasons||[]).map(reason=>labels[reason]||'新しい観測を待っています');
+    const strength={none:'未取得',weak:'弱',moderate:'中',strong:'強'}[result.evidence]||'未取得';
+    const candidate=['AM','FM','SSB','USB','LSB'].includes(result.candidate)?result.candidate:null;
+    const relative=['USB','LSB'].includes(candidate)?'（VFO基準）':'';
+    const text=result.state==='candidate'&&candidate?`${candidate}候補${relative} · 根拠：${strength}`:candidate==='SSB'?`SSB候補（上下側帯域は保留） · 根拠：${strength}`:result.state==='collecting'?'観測中です。':'判定を保留しています。';
+    const reason=[...new Set(reasons),candidate==='FM'?'NFM／WFMはVFOで手動選択してください。':'',candidate==='SSB'?'搬送波基準が不明なためUSB／LSBを断定しません。':''].filter(Boolean).join(' ');
+    return {badge:result.state==='candidate'?'候補':result.state==='collecting'?'観測中':'保留',text,reason:reason||'候補は参考です。方式・周波数は自動で変更しません。'};
+  }
+  function renderModulation(force=false) {
+    const info=state?.modulation_inference,config=info?.config||{},identity=JSON.stringify([state?.source,state?.input,state?.selected_vfo_id,info?.reference_hz]);
+    if(modulationUiIdentity!==identity){$('modulationReference').checked=false;modulationUiIdentity=identity;}
+    if(force||!dirtyForms.has('modulationForm')){$('modulationEnabled').checked=config.enabled===true;$('modulationWidth').value=finite(config.bandwidth_hz,200000)/1000;$('modulationReference').checked=config.carrier_reference_explicit===true;}
+    const text=modulationReadout(state,connectionError);asText('modulationBadge',text.badge);asText('modulationResult',text.text);asText('modulationReason',text.reason);
+    const plan=modulationCandidatePlan(state,connectionError),dirty=selectedVfo()&&vfoEditState(selectedVfo().id).basic.dirty;
+    $('modulationApply').disabled=!plan||dirty||studioClosing||studioClosed;asText('modulationApply',plan?`${plan.mode}候補をVFO ${plan.id}へ適用`:'候補を適用');
+    $('modulationApply').title=dirty?'未適用のVFO編集を先に確認してください':'方式と既定BWを変更し、SSBではAFCをOFFにします。基準周波数は維持します。';
+  }
+  async function submitModulation(event) {
+    event.preventDefault();const width=num('modulationWidth')*1000;
+    if(!Number.isFinite(width)||width<6000||width>250000){toast('推定用の観測幅は6〜250 kHzです','error');return;}
+    await action('set_modulation_inference',{config:{enabled:$('modulationEnabled').checked,bandwidth_hz:width,carrier_reference_explicit:$('modulationReference').checked}},{form:'modulationForm',message:'参考推定の設定を適用しました'});
+  }
+  async function adoptModulation() {
+    const plan=modulationCandidatePlan(state,connectionError);if(!plan)return;
+    if(vfoEditState(plan.id).basic.dirty){toast('未適用のVFO編集を先に確認してください','error');return;}
+    await action('update_vfo',{id:plan.id,patch:plan.patch},{forceVfos:true,message:`${plan.mode}を手動適用しました。基準周波数は維持します`,guard:()=>{
+      const latest=modulationCandidatePlan(state,connectionError);return !!latest&&latest.id===plan.id&&latest.reference_hz===plan.reference_hz&&latest.mode===plan.mode&&!vfoEditState(plan.id).basic.dirty;
+    }});
+  }
   function audioConditionsKey(vfo) { return JSON.stringify([state?.running,state?.source,vfo?.id,vfo?.frequency_hz,vfo?.bandwidth_hz,vfo?.mode,vfo?.enabled]); }
   function validAudioEpoch(value) { return Number.isSafeInteger(value)&&value>=0; }
   function syncStateAudioEpoch() {
@@ -417,7 +478,7 @@
       asText('replayPosition',`${finite(r.position_seconds).toFixed(2)} s`); asText('replayDuration',`${finite(r.duration_seconds ?? r.total_seconds).toFixed(2)} s`);
     }
     if (state.layout && !drag?.layout) applyLayout(state.layout, false);
-    renderCalibration(force);renderDensityRange(force);renderVfos(force);renderMeasurements(frame?.measurements || {});renderFrontend();updateFftVisibility();updatePresetLoadState();
+    renderCalibration(force);renderDensityRange(force);renderVfos(force);renderModulation(force);renderMeasurements(frame?.measurements || {});renderFrontend();updateFftVisibility();updatePresetLoadState();
     const pv = a.persistence_mode === 'off' ? 'OFF' : a.persistence_mode === 'infinite' ? 'Infinite' : a.persistence_mode === 'window' ? '時間窓' : '指数減衰';
     asText('persistenceReadout',`${pv}${['off','infinite'].includes(a.persistence_mode) ? '' : ` · ${a.persistence_unit === 'frames' ? finite(a.persistence_frames).toLocaleString()+' FFT' : finite(a.persistence_seconds,1).toFixed(2)+' s'}`}`);
     for (const item of state.notifications || []) {
@@ -463,8 +524,27 @@
     const frequency=field('frequency'),bandwidth=field('bandwidth'),mode=field('mode'),format=field('wav-format');
     if(typeof frequency!=='string'||!frequency.trim()||typeof bandwidth!=='string'||!bandwidth.trim())return {error:'局周波数と復調帯域幅を入力してください。'};
     const hz=Number(frequency)*1e6,bw=Number(bandwidth)*1000;
-    if(!Number.isFinite(hz)||hz<=0||!Number.isFinite(bw)||bw<=0||!['AM','NFM','WFM'].includes(mode)||!['PCM16','PCM24'].includes(format))return {error:'局周波数・帯域幅・復調方式・WAV形式を確認してください。'};
-    return {patch:{frequency_hz:hz,bandwidth_hz:bw,mode,wav_format:format}};
+    if(!Number.isFinite(hz)||hz<=0||!Number.isFinite(bw)||bw<=0||!['AM','NFM','WFM','USB','LSB'].includes(mode)||!['PCM16','PCM24'].includes(format))return {error:'局周波数・帯域幅・復調方式・WAV形式を確認してください。'};
+    const band=vfoPassband(hz,bw,mode);
+    if(!band)return {error:'USB/LSBの通過帯域幅は1.0〜14.1 kHzで指定してください。'};
+    if(band.low_hz<0)return {error:'復調帯域の下端は0 Hz以上にしてください。'};
+    return {patch:{frequency_hz:hz,bandwidth_hz:bw,mode,wav_format:format,...(band.ssb?{reception:{afc_enabled:false}}:{})}};
+  }
+  function updateVfoModeUi(card) {
+    const mode=card.querySelector('[data-vfo-field=mode]')?.value,ssb=['USB','LSB'].includes(mode);
+    const frequency=card.querySelector('[data-vfo-field=frequency]');if(frequency)frequency.step=ssb?'0.00001':'0.001';
+    const bandwidth=card.querySelector('[data-vfo-field=bandwidth]');
+    if(bandwidth){bandwidth.min=ssb?'1':'0.1';bandwidth.max=ssb?'14.1':'';}
+    const label=card.querySelector('[data-vfo-frequency-label]');if(label)label.textContent=ssb?'抑圧搬送波の基準周波数':'局周波数（名目）';
+    const note=card.querySelector('[data-vfo-mode-note]');if(note){note.hidden=!ssb;note.textContent=ssb?`${mode}：基準から${mode==='USB'?'上側':'下側'}の300 Hz〜300 Hz＋帯域幅を通過。手動で基準を微調整してください。AFCは適用できません。`:'';}
+    for(const key of ['afc_enabled','afc_max_hz']){const field=card.querySelector(`[data-reception-field=${key}]`);if(field){field.disabled=ssb;if(key==='afc_enabled'&&ssb)field.checked=false;}}
+    const afcNote=card.querySelector('[data-vfo-afc-note]');if(afcNote){afcNote.hidden=!ssb;afcNote.textContent='USB/LSBはAFC適用外です。方式の適用時にAFCもOFFへ変更します。';}
+  }
+  function changeVfoMode(event) {
+    markVfoEdited(event);if(event.target.dataset.vfoField!=='mode')return;
+    const card=event.target.closest('.vfo-card');if(!card)return;
+    card.querySelector('[data-vfo-field=bandwidth]').value={AM:10,NFM:12.5,WFM:200,USB:2.7,LSB:2.7}[event.target.value];
+    updateVfoModeUi(card);
   }
   async function applyVfoSection(card,vfo,section) {
     const payload=section==='reception'?readVfoReception(card):readVfoBasic(card);if(payload.error){toast(payload.error,'error');return null;}
@@ -477,10 +557,11 @@
     const config=receptionConfig(vfo),s=vfo.reception_status || {},available=running===true&&vfo.enabled!==false&&s.available===true&&!connectionError;
     const route=vfo.wav_recording?vfo.wav_summary?.route:config.wav_audio;
     const wav=`${vfo.wav_recording?'WAV記録中':'WAV保存'}：${wavRouteLabel(route)}`;
-    if(!available){const reason=connectionError?'アプリとの接続待ち':!running?'受信停止中':vfo.enabled===false?'VFO停止中':s.reason==='gap'?'欠落後の音声待ち':'補助状態の更新待ち';return {available:false,afc:`AFC ${config.afc_enabled?'待機':'手動・補正OFF'} · 補正 — Hz`,rf:'RF — dBFS · SQL —',audio:'ピーク保護 — dB · 過大入力 — samples',state:reason,wav};}
+    const ssb=['USB','LSB'].includes(vfo.mode),ssbAfc='AFC 適用外（USB/LSB） · 手動同調';
+    if(!available){const reason=connectionError?'アプリとの接続待ち':!running?'受信停止中':vfo.enabled===false?'VFO停止中':s.reason==='gap'?'欠落後の音声待ち':'補助状態の更新待ち';return {available:false,afc:ssb?ssbAfc:`AFC ${config.afc_enabled?'待機':'手動・補正OFF'} · 補正 — Hz`,rf:'RF — dBFS · SQL —',audio:'ピーク保護 — dB · 過大入力 — samples',state:reason,wav};}
     const afcNames={disabled:'OFF',qualifying:'判定中',tracking:'追従中',quality_insufficient:'信号不足',out_of_band:'範囲外',reference_outside_usable_band:'帯域端で保留',no_samples:'音声待ち'};
     const offset=validLevel(s.afc_offset_hz)?`${Number(s.afc_offset_hz)>=0?'+':''}${Number(s.afc_offset_hz).toFixed(1)}`:'—';
-    const afc=`AFC ${config.afc_enabled?(afcNames[s.afc_status] || '判定中'):'手動・補正OFF'} · 補正 ${offset} Hz${config.afc_enabled&&s.afc_locked===true?' · LOCK':''}`;
+    const afc=ssb?ssbAfc:`AFC ${config.afc_enabled?(afcNames[s.afc_status] || '判定中'):'手動・補正OFF'} · 補正 ${offset} Hz${config.afc_enabled&&s.afc_locked===true?' · LOCK':''}`;
     const rf=`RF ${s.rf_available===true?dbText(s.rf_dbfs):'—'} dBFS · SQL ${config.squelch_enabled?(s.squelch_open===true?'開':'閉'):'OFF'}`;
     const reduction=config.limiter_enabled?`${dbText(s.limiter_reduction_db)} dB`:'OFF';
     const overload=typeof s.pre_overload_samples==='number'&&Number.isFinite(s.pre_overload_samples)?Math.max(0,s.pre_overload_samples).toLocaleString():'—';
@@ -494,7 +575,7 @@
   }
   function vfoCardHtml(v,index) {
     const id=escapeHtml(v.id);
-    return `<article class="vfo-card" data-vfo="${id}"><header class="vfo-card-header"><div class="vfo-name"><span class="vfo-color" style="background:${colors[index%colors.length]}"></span><strong>VFO ${id}</strong><span class="badge recording" data-vfo-rec hidden>REC</span></div><div class="vfo-header-actions"><button class="vfo-select" data-vfo-action="select">選択</button><button class="vfo-delete" data-vfo-action="delete" aria-label="VFO ${id}を削除">×</button></div></header><div class="vfo-fields"><label>局周波数（名目）<div class="input-unit"><input data-vfo-field="frequency" type="number" step="0.001" aria-label="VFO ${id} 周波数"><span>MHz</span></div></label><label>復調<select data-vfo-field="mode" aria-label="VFO ${id} 復調方式">${['AM','NFM','WFM'].map(mode=>`<option>${mode}</option>`).join('')}</select></label><label>復調帯域幅<div class="input-unit"><input data-vfo-field="bandwidth" type="number" step="0.1" min="0.1" aria-label="VFO ${id} 帯域幅"><span>kHz</span></div></label><label>状態<span class="vfo-state"></span></label></div><div class="vfo-actions"><button class="button" data-vfo-action="apply">適用</button><span class="vfo-edit-status" data-vfo-edit-status="basic"></span><button class="button record" data-vfo-action="record">● WAV</button><button class="button" data-vfo-action="resume" hidden>再開</button><select data-vfo-field="wav-format" aria-label="VFO ${id} WAV形式"><option>PCM16</option><option>PCM24</option></select></div><div class="vfo-reception-readout" aria-live="off"><div data-reception-readout="afc"></div><div data-reception-readout="rf"></div><div data-reception-readout="audio"></div><div data-reception-readout="wav"></div><span data-reception-readout="state"></span></div>${vfoReceptionHtml(v)}<div class="vfo-warning" hidden></div></article>`;
+    return `<article class="vfo-card" data-vfo="${id}"><header class="vfo-card-header"><div class="vfo-name"><span class="vfo-color" style="background:${colors[index%colors.length]}"></span><strong>VFO ${id}</strong><span class="badge recording" data-vfo-rec hidden>REC</span></div><div class="vfo-header-actions"><button class="vfo-select" data-vfo-action="select">選択</button><button class="vfo-delete" data-vfo-action="delete" aria-label="VFO ${id}を削除">×</button></div></header><div class="vfo-fields"><label><span data-vfo-frequency-label>局周波数（名目）</span><div class="input-unit"><input data-vfo-field="frequency" type="number" step="0.00001" aria-label="VFO ${id} 周波数"><span>MHz</span></div></label><label>復調<select data-vfo-field="mode" aria-label="VFO ${id} 復調方式">${['AM','NFM','WFM','USB','LSB'].map(mode=>`<option>${mode}</option>`).join('')}</select></label><label>復調帯域幅<div class="input-unit"><input data-vfo-field="bandwidth" type="number" step="0.1" min="0.1" aria-label="VFO ${id} 帯域幅"><span>kHz</span></div></label><label>状態<span class="vfo-state"></span></label></div><p class="vfo-mode-note" data-vfo-mode-note hidden></p><div class="vfo-actions"><button class="button" data-vfo-action="apply">適用</button><span class="vfo-edit-status" data-vfo-edit-status="basic"></span><button class="button record" data-vfo-action="record">● WAV</button><button class="button" data-vfo-action="resume" hidden>再開</button><select data-vfo-field="wav-format" aria-label="VFO ${id} WAV形式"><option>PCM16</option><option>PCM24</option></select></div><div class="vfo-reception-readout" aria-live="off"><div data-reception-readout="afc"></div><div data-reception-readout="rf"></div><div data-reception-readout="audio"></div><div data-reception-readout="wav"></div><span data-reception-readout="state"></span></div><p class="vfo-mode-note" data-vfo-afc-note hidden></p>${vfoReceptionHtml(v)}<div class="vfo-warning" hidden></div></article>`;
   }
   function syncVfoField(card,selector,value,protect,force=false) {
     const field=card.querySelector(selector);if(!field||protect||(!force&&document.activeElement===field))return;
@@ -519,6 +600,7 @@
       const values={frequency:mhz(v.frequency_hz).toFixed(6),bandwidth:(finite(v.bandwidth_hz)/1000).toFixed(2),mode:v.mode,'wav-format':v.wav_format || 'PCM16'};
       for(const [key,value] of Object.entries(values))syncVfoField(card,`[data-vfo-field=${key}]`,value,edits.basic.dirty&&!force,force);
       for(const [key,value] of Object.entries(receptionConfig(v)))if(key in receptionDefaults)syncVfoField(card,`[data-reception-field=${key}]`,value,edits.reception.dirty&&!force,force);
+      updateVfoModeUi(card);
       for(const section of ['basic','reception'])card.querySelector(`[data-vfo-edit-status=${section}]`).textContent=edits[section].dirty?'未適用':'';
       const readout=receptionReadout(v,state?.running);for(const key of ['afc','rf','audio','state','wav'])card.querySelector(`[data-reception-readout=${key}]`).textContent=readout[key];
       card.querySelector('.vfo-reception-readout').classList.toggle('unavailable',!readout.available);
@@ -562,7 +644,9 @@
     for(const id of ['userMarkerDeselect','userMarkerPeakLeft','userMarkerPeakRight','userMarkerPeakMax','userMarkerDelete'])$(id).disabled=!selected;
     const tunePlan=peakTunePlan(state,selectedVfo(),selected?.frequency_hz,connectionError),dirtyVfo=selectedVfo()&&vfoEditState(selectedVfo().id).basic.dirty;
     $('userMarkerTuneButton').disabled=!selected||frontendChanging||Boolean(tunePlan.error)||Boolean(dirtyVfo);
-    $('userMarkerTuneButton').title=frontendChanging?'中心補正の切替完了を待ってください。':dirtyVfo?'選択中VFOの未適用設定を先に適用してください。':tunePlan.error||'この周波数へ選択中VFOを同調';
+    const ssb=['USB','LSB'].includes(selectedVfo()?.mode);
+    $('userMarkerTuneButton').textContent=ssb?'帯域内に配置':'選局';
+    $('userMarkerTuneButton').title=frontendChanging?'中心補正の切替完了を待ってください。':dirtyVfo?'選択中VFOの未適用設定を先に適用してください。':tunePlan.error||(ssb?'帯域内に配置・基準の微調整が必要':'この周波数へ選択中VFOを同調');
     $('userMarkerReadout').classList.toggle('selected',Boolean(selected));
     $('userMarkerReadout').setAttribute('aria-busy',String(userSelectionPending));
     if(selected){
@@ -577,7 +661,7 @@
       asText('plotModeHint',`U${selected.id} 操作：クリックで配置 / ← → で隣接Peak　VFOの「選択」ボタンでVFO操作へ`);
     }else{
       asText('userMarkerName','U 未選択');asText('userMarkerFrequency','周波数 — MHz');asText('userMarkerLevel',`レベル — ${unit}`);asText('userMarkerOffset','中心から Δf — kHz');asText('userMarkerStatus','追加または U をクリックして選択');
-      asText('plotModeHint','ピーク A のボタンで選局　VFO：ドラッグ / ホイール / ← →　Shiftクリック：U追加');
+      asText('plotModeHint',ssb?'SSB：ピークは帯域内へ配置・基準を微調整　帯域幅：外側の端をドラッグ　Shiftクリック：U追加':'ピーク A のボタンで選局　VFO：ドラッグ / ホイール / ← →　Shiftクリック：U追加');
     }
   }
   function renderMeasurements(m = {}) {
@@ -656,11 +740,12 @@
     if(Number.isFinite(roiLow)&&Number.isFinite(roiHigh)){ctx.fillStyle='#507a9b12';ctx.fillRect(s.x(roiLow),p.top,s.x(roiHigh)-s.x(roiLow),p.height);ctx.strokeStyle='#678ea04d';ctx.setLineDash([3,4]);for(const f of [roiLow,roiHigh]){ctx.beginPath();ctx.moveTo(s.x(f),p.top);ctx.lineTo(s.x(f),p.top+p.height);ctx.stroke();}ctx.setLineDash([]);}
     (state?.vfos || []).forEach((v,k)=>{
       let f=finite(v.frequency_hz),bw=finite(v.bandwidth_hz);if(drag?.id===String(v.id)){f=drag.frequency_hz;bw=drag.bandwidth_hz;}
+      const band=vfoPassband(f,bw,v.mode||'WFM');if(!band)return;
       const selected=Boolean(v.selected||String(v.id)===String(state?.selected_vfo_id)),color=colors[k%colors.length];
-      ctx.fillStyle=color+(selected?'1d':'0a');ctx.fillRect(s.x(f-bw/2),p.top,s.x(f+bw/2)-s.x(f-bw/2),p.height);
+      ctx.fillStyle=color+(selected?'1d':'0a');ctx.fillRect(s.x(band.low_hz),p.top,s.x(band.high_hz)-s.x(band.low_hz),p.height);
       ctx.strokeStyle=color+(v.enabled===false?'55':selected?'dd':'77');ctx.lineWidth=selected?1.3:1;
-      for(const edge of [f-bw/2,f+bw/2]){ctx.beginPath();ctx.moveTo(s.x(edge),p.top);ctx.lineTo(s.x(edge),p.top+p.height);ctx.stroke();if(selected){ctx.fillStyle=color;ctx.fillRect(s.x(edge)-2,p.top+27,4,11);}}
-      ctx.beginPath();ctx.moveTo(s.x(f),p.top);ctx.lineTo(s.x(f),p.top+p.height);ctx.stroke();ctx.fillStyle=color;ctx.font='10px Consolas,monospace';ctx.textAlign='center';ctx.fillText(`V${v.id}`,s.x(f),p.top+11);
+      for(const [kind,edge]of [['low',band.low_hz],['high',band.high_hz]]){ctx.beginPath();ctx.moveTo(s.x(edge),p.top);ctx.lineTo(s.x(edge),p.top+p.height);ctx.stroke();if(selected&&(!band.ssb||kind===band.resize_edge)){ctx.fillStyle=color;ctx.fillRect(s.x(edge)-2,p.top+27,4,11);}}
+      ctx.beginPath();ctx.moveTo(s.x(f),p.top);ctx.lineTo(s.x(f),p.top+p.height);ctx.stroke();ctx.fillStyle=color;ctx.font='10px Consolas,monospace';ctx.textAlign='center';ctx.fillText(`V${v.id}${band.ssb?' '+v.mode:''}`,s.x(f),p.top+11);
     });
     const traces=state?.display?.traces || {live:true};
     for(const [key,field,color] of [['min','min_db','#a896df'],['max','max_db','#e9c16a'],['avg','avg_db','#d4e6ed'],['live','live_db','#5ad7e8']]) {
@@ -862,19 +947,19 @@
       return;
     }
     let best=null;
-    (state.vfos||[]).forEach(v=>{const x=p.s.left+(v.frequency_hz-p.s.low)/p.s.span*p.s.width,half=v.bandwidth_hz/2/p.s.span*p.s.width;for(const [kind,at] of [['center',x],['low',x-half],['high',x+half]]){const distance=Math.abs(p.x-at);if(distance<(kind==='center'?13:7)&&(!best||distance<best.distance))best={v,kind,distance};}});
+    (state.vfos||[]).forEach(v=>{const band=vfoPassband(v.frequency_hz,v.bandwidth_hz,v.mode||'WFM');if(!band)return;const x=frequency=>p.s.left+(frequency-p.s.low)/p.s.span*p.s.width,points=[['center',x(v.frequency_hz)]];for(const [kind,frequency]of [['low',band.low_hz],['high',band.high_hz]])if(!band.ssb||kind===band.resize_edge)points.push([kind,x(frequency)]);for(const [kind,at]of points){const distance=Math.abs(p.x-at);if(distance<(kind==='center'?13:7)&&(!best||distance<best.distance))best={v,kind,distance};}});
     if(!best){
       if(userHit){canvasGestureTarget='user';event.preventDefault();selectUserMarker(userHit.marker.id);}return;
     }
     canvasGestureTarget='vfo';
     const selection=(selectedUserMarker()||!best.v.selected)?activateVfo(best.v.id):Promise.resolve(true);
-    drag={id:String(best.v.id),kind:best.kind,frequency_hz:best.v.frequency_hz,bandwidth_hz:best.v.bandwidth_hz,initial_hz:p.hz,initial_frequency:best.v.frequency_hz,initial_bandwidth:best.v.bandwidth_hz,selection};
+    drag={id:String(best.v.id),kind:best.kind,mode:best.v.mode||'WFM',frequency_hz:best.v.frequency_hz,bandwidth_hz:best.v.bandwidth_hz,initial_hz:p.hz,initial_frequency:best.v.frequency_hz,initial_bandwidth:best.v.bandwidth_hz,selection};
     $('spectrumCanvas').setPointerCapture(event.pointerId);event.preventDefault();
     focusSpectrum();
   }
   function moveVfo(event) {
     const p=plotFrequency(event);hover={x:p.x,hz:p.hz};
-    if(drag?.id){if(drag.kind==='center')drag.frequency_hz=Math.round(drag.initial_frequency+p.hz-drag.initial_hz);else drag.bandwidth_hz=Math.max(1000,Math.round(2*Math.abs(p.hz-drag.initial_frequency)));}
+    if(drag?.id){if(drag.kind==='center')drag.frequency_hz=Math.round(drag.initial_frequency+p.hz-drag.initial_hz);else drag.bandwidth_hz=vfoBandwidthFromEdge(drag.mode,drag.initial_frequency,p.hz);}
     $('cursorReadout').hidden=p.x<p.s.left||p.x>p.s.left+p.s.width;asText('cursorReadout',`${mhz(p.hz).toFixed(6)} MHz`);drawSpectrum();
   }
   async function finishVfo(event) {
@@ -887,7 +972,7 @@
     const v=selectedVfo();if(!v)return;const step=event.shiftKey?10000:event.altKey?100:1000;
     const frequencyDelta=event.key==='ArrowLeft'?-step:event.key==='ArrowRight'?step:0,bandwidthDelta=['+','='].includes(event.key)?step:event.key==='-'?-step:0;
     if(frequencyDelta||bandwidthDelta){event.preventDefault();const selection=selectedUserMarker()?activateVfo(v.id):vfoSelectionPromise;
-      action('update_vfo',()=>{const current=state?.vfos?.find(item=>String(item.id)===String(v.id)) || v;return {id:v.id,patch:frequencyDelta?{frequency_hz:current.frequency_hz+frequencyDelta}:{bandwidth_hz:Math.max(1000,current.bandwidth_hz+bandwidthDelta)}};},{guard:async()=>Boolean(await selection)&&state?.vfos?.some(item=>String(item.id)===String(v.id))});
+      action('update_vfo',()=>{const current=state?.vfos?.find(item=>String(item.id)===String(v.id)) || v;return {id:v.id,patch:frequencyDelta?{frequency_hz:current.frequency_hz+frequencyDelta}:{bandwidth_hz:boundedVfoBandwidth(current.mode,current.bandwidth_hz+bandwidthDelta)}};},{guard:async()=>Boolean(await selection)&&state?.vfos?.some(item=>String(item.id)===String(v.id))});
     }
   }
   function vfoWheel(event) {
@@ -1029,10 +1114,11 @@
   $('densityRangeForm').addEventListener('input',beginDensityRangeEdit);$('densityRangeForm').addEventListener('submit',submitDensityRange);
   $('waterfallRowSeconds').addEventListener('change',()=>action('set_analysis',{analysis:{waterfall_row_seconds:num('waterfallRowSeconds')}}));
   $('addVfoButton').addEventListener('click',addCenteredVfo);
+  $('modulationForm').addEventListener('submit',submitModulation);$('modulationApply').addEventListener('click',adoptModulation);
   $('vfoList').addEventListener('click',vfoAction);
   $('vfoList').addEventListener('input',markVfoEdited);
   $('vfoList').addEventListener('focusin',event=>{if(event.target.matches('input,select')&&selectedUserMarker())selectUserMarker(null,{focus:false});});
-  $('vfoList').addEventListener('change',event=>{markVfoEdited(event);if(event.target.dataset.vfoField==='mode'){const card=event.target.closest('.vfo-card');card.querySelector('[data-vfo-field=bandwidth]').value={AM:10,NFM:12.5,WFM:200}[event.target.value];}});
+  $('vfoList').addEventListener('change',changeVfoMode);
   $('vfoList').addEventListener('keydown',event=>{if(event.key==='Enter'&&event.target.matches('input')){event.preventDefault();event.target.closest('.vfo-card').querySelector(event.target.dataset.receptionField?'[data-vfo-action=reception-apply]':'[data-vfo-action=apply]').click();}});
   $('audioButton').addEventListener('click',toggleAudio);$('shutdownButton').addEventListener('click',shutdownStudio);$('volume').addEventListener('input',()=>{if(audioGain)audioGain.gain.setTargetAtTime(num('volume'),audioContext.currentTime,.02);});
   $('iqButton').addEventListener('click',()=>action(state?.recording?.iq_active?'iq_stop':'iq_start'));
@@ -1077,7 +1163,7 @@
   $('replaySeek').addEventListener('change',()=>{flushAudio();audioSequence=0;action('replay_seek',{seconds:num('replaySeek')});});
   $('replayCloseButton').addEventListener('click',()=>{flushAudio();action('replay_close');});
   $('noticeDismiss').addEventListener('click',()=>notice(''));
-  for(const form of ['tuningForm','receiverForm','persistenceForm','measurementForm','triggerForm','densityRangeForm']) $(form).addEventListener('input',()=>dirtyForms.add(form));
+  for(const form of ['tuningForm','receiverForm','persistenceForm','measurementForm','triggerForm','densityRangeForm','modulationForm']) $(form).addEventListener('input',()=>dirtyForms.add(form));
   $('spectrumCanvas').addEventListener('pointerdown',event=>{if(!beginFrequencyPan(event))beginVfoDrag(event);});$('spectrumCanvas').addEventListener('pointermove',event=>{if(!moveFrequencyPan(event)){if(drag||!frequencyAxisHover(event))moveVfo(event);}});$('spectrumCanvas').addEventListener('pointerup',event=>{if(frequencyPan)finishFrequencyPan(event);else finishVfo(event);});$('spectrumCanvas').addEventListener('pointercancel',()=>{cancelFrequencyPan();drag=null;drawSpectrum();});
   $('spectrumCanvas').addEventListener('pointerleave',()=>{if(!drag){hover=null;$('cursorReadout').hidden=true;drawSpectrum();}});
   $('spectrumCanvas').addEventListener('keydown',vfoKey);$('spectrumCanvas').addEventListener('wheel',vfoWheel,{passive:false});
@@ -1088,7 +1174,7 @@
   window.addEventListener('resize',()=>requestAnimationFrame(drawAll));
   try{const saved=JSON.parse(localStorage.getItem('spectrum-studio-layout'));if(saved)applyLayout(saved,false);}catch{}
 
-  async function refreshState(force=false,fromAction=false){if(studioClosed)return;const epoch=stateEpoch;try{const next=await getJson('/api/state');if(!studioClosed&&(fromAction||(epoch===stateEpoch&&!actionInFlight)))applyState(next,force);}catch(error){if(studioClosed||studioClosing||epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;flushAudio();renderVfos();}renderFrontend();$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
+  async function refreshState(force=false,fromAction=false){if(studioClosed)return;const epoch=stateEpoch;try{const next=await getJson('/api/state');if(!studioClosed&&(fromAction||(epoch===stateEpoch&&!actionInFlight)))applyState(next,force);}catch(error){if(studioClosed||studioClosing||epoch!==stateEpoch||actionInFlight&&!fromAction)return;if(!connectionError){notice('アプリとの接続が切れています。再接続を待っています。','error');connectionError=true;flushAudio();renderVfos();renderModulation();}renderFrontend();$('statusDot').className='status-dot error';asText('sessionStatus','接続待ち');asText('footerStatus',error.message);updatePresetLoadState();}}
   async function stateLoop(){if(studioClosed)return;await refreshState();if(!studioClosed)stateTimer=setTimeout(stateLoop,1000);}
   function requestFrame(){if(studioClosed)return;clearTimeout(frameTimer);if(framePending){frameRefreshRequested=true;return;}frameTimer=setTimeout(frameLoop,0);}
   async function frameLoop(){

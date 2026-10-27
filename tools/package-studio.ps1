@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$BinaryPath,
     [Parameter(Mandatory=$true)][ValidatePattern('^[A-Fa-f0-9]{64}$')][string]$ExpectedBinarySha256,
-    [string]$PackageVersion = '0.4.1-dev',
+    [string]$PackageVersion = '0.5.0-dev',
     [string]$OutputParent,
     [string]$PresetPath,
     [string]$RuntimeDllPath,
@@ -278,6 +278,8 @@ Windows 10/11 x64 と通常のブラウザーを使用する。Rust/Python/Node/
 Spectrumの「ピークリセット」でMax／Min／Averageの履歴を同時にリセットし、現在のLiveから再集計する。受信・録音は継続し、入力条件・密度・Waterfall・Marker位置は維持する。
 Densityの上限・下限は同パネルで手動設定できる。新しい範囲では密度だけを再集計し、Spectrumの保持値やWaterfall・受信は維持する。
 VFOの「受信・音声補助」でAFC、RFスケルチ、音声ゲイン、ピーク保護、クリック抑制、WAV経路を設定する。AFC／スケルチは初期OFF。AFCをOFFに戻すと補正0になり、名目局周波数で受信する。
+USB／LSBはVFO周波数を抑圧搬送波の基準とし、既定2.7 kHz幅でUSBは基準+300〜3000 Hz、LSBは基準−3000〜−300 Hzを復調する。SSBではAFCは適用外。ピークの「帯域内に配置」後は基準を微調整する。個別WAV保存と原IQ保存を利用できる。
+変調方式の参考推定は既定OFF。選択VFOの周辺IQを復調方式とは独立に観測し、候補と保留理由を表示する。推定用の観測幅は復調用BWと別。方式・周波数は自動変更しない。USB／LSBは搬送波基準に依存し、弱信号・混信・無変調・中心DC・観測不足では保留する。結果を校正済み確率や実RFの保証精度とは扱わない。
 WAVの既定は「復調音（後処理なし）」で、AFC／帯域フィルターは適用される。「聴取処理後」を選ぶとスケルチ／音声ゲイン／保護を含めて保存する。条件変更中のWAVは分割し、経路と処理統計を記録する。
 音声補助とAFC自体は原IQやSpectrum／測定を変更しない。音声ピーク保護はsample振幅の保護で、true-peak規格の保証ではない。
 周波数目盛りまたは下の周波数範囲を左右ドラッグすると、Spanを維持して中心だけ移動する。VFOの周波数は追従しない。周波数軸ドラッグ／同軸キーでは、帯域外VFOを確認なしで停止する（VFO周波数は固定）。一般手入力の中心変更は無効化の確認を維持する。新規VFOは追加処理時の最新中心に作成して選択し、既存VFOは移動しない。Arm・IQ/WAV録音中、保存IQ再生中、未適用の同調編集がある時は操作できない。
