@@ -1264,16 +1264,19 @@ mod tests {
         }
     }
     #[test]
-    fn ssb_chunking_preserves_nco_decimation_and_audio_positions(){
-        let fs=1024000.0;let reference=-37000.0;let iq=ssb_test_iq(131072,fs,&[(reference+1000.0,0.1),(reference-1700.0,0.08)]);
-        let mut a=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);let whole=a.process(&iq);
-        let mut b=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);let mut split=vec![];let mut cursor=0;
-        let sizes=[1,7,37,997,8192,12001,4096,32768];let mut index=0;
-        while cursor<iq.len(){let end=(cursor+sizes[index%sizes.len()]).min(iq.len());split.extend(b.process(&iq[cursor..end]));cursor=end;index+=1;}
-        assert_eq!(whole.len(),split.len());assert_eq!(a.input_count,b.input_count);assert_eq!(a.output_count,b.output_count);
-        let phase_error=(a.phase-b.phase+PI).rem_euclid(TAU)-PI;assert!(phase_error.abs()<1e-7);
-        let maximum=whole.iter().zip(&split).map(|(x,y)|(*x as f64-*y as f64).abs()).fold(0.0_f64,f64::max);
-        assert!(maximum<2e-4,"max chunk error={maximum}");
+    fn ssb_usb_and_lsb_chunking_preserve_nco_decimation_and_audio_positions(){
+        let fs=1024000.0;let reference=-37000.0;
+        for(mode,sign)in [("USB",1.0),("LSB",-1.0)]{
+            let iq=ssb_test_iq(131072,fs,&[(reference+sign*1000.0,0.1),(reference-sign*1700.0,0.08)]);
+            let mut a=VfoDemodulator::new(fs,reference,2700.0,mode,32000);let whole=a.process(&iq);
+            let mut b=VfoDemodulator::new(fs,reference,2700.0,mode,32000);let mut split=vec![];let mut cursor=0;
+            let sizes=[1,7,37,997,8192,12001,4096,32768];let mut index=0;
+            while cursor<iq.len(){let end=(cursor+sizes[index%sizes.len()]).min(iq.len());split.extend(b.process(&iq[cursor..end]));cursor=end;index+=1;}
+            assert_eq!(whole.len(),split.len(),"{mode}");assert_eq!(a.input_count,b.input_count,"{mode}");assert_eq!(a.output_count,b.output_count,"{mode}");
+            let phase_error=(a.phase-b.phase+PI).rem_euclid(TAU)-PI;assert!(phase_error.abs()<1e-7,"{mode}: phase error={phase_error}");
+            let maximum=whole.iter().zip(&split).map(|(x,y)|(*x as f64-*y as f64).abs()).fold(0.0_f64,f64::max);
+            assert!(maximum<2e-4,"{mode}: max chunk error={maximum}");
+        }
     }
     #[test]
     fn ssb_reset_and_empty_chunks_preserve_the_stream_contract(){
