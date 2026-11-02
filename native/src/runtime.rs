@@ -16,17 +16,20 @@ impl Source {
     fn read(&mut self,stop:&AtomicBool)->Result<Option<Block>,String>{match self{
         Self::Live(source)=>source.read(),Self::Demo(source)=>Ok(source.read(stop)),
         Self::Replay{reader,deadline}=>{
-            let (start,raw,fs)={let mut r=guard(reader);let position=r.position_samples;
+            let (start,raw,fs,position)={let mut r=guard(reader);let position=r.position_samples;
                 let next=r.captures.iter().filter_map(|c|c["core:sample_start"].as_u64()).filter(|n|*n>position).min().unwrap_or(r.total_samples);
                 let count=BLOCK_SAMPLES.min(next.saturating_sub(position)as usize);
                 if count==0{return Err("REPLAY_END".into())}
-                let global=r.global_sample_for(position);let(_,raw)=r.read_chunk(count)?;(global,raw,r.sample_rate)};
+                let global=r.global_sample_for(position);let(_,raw)=r.read_chunk(count)?;(global,raw,r.sample_rate,position)};
             if raw.is_empty(){return Err("REPLAY_END".into())}
             *deadline+=Duration::from_secs_f64(raw.len()as f64/2.0/fs);
-            while Instant::now()<*deadline{if stop.load(Ordering::Acquire){return Ok(None)}thread::sleep(Duration::from_millis(1));}
+            // A stop while pacing must not consume the unprocessed block.
+            while Instant::now()<*deadline{if stop.load(Ordering::Acquire){guard(reader).seek_samples(position)?;return Ok(None)}thread::sleep(Duration::from_millis(1));}
             Ok(Some(Block{start,raw}))
         }
     }}
+    /// Returns a read but unprocessed block to Replay; live/demo streams cannot rewind.
+    fn unread(&self,block:&Block)->Result<(),String>{if let Self::Replay{reader,..}=self{let mut r=guard(reader);let position=r.position_samples.saturating_sub(block.raw.len()as u64/2);r.seek_samples(position)?;}Ok(())}
     fn close(&mut self)->Result<(),String>{match self{Self::Live(source)=>source.close(),_=>Ok(())}}
 }
 
@@ -82,7 +85,7 @@ impl Runtime {
             let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),String>{
                 while !signal.load(Ordering::Acquire){
                     if let Some(block)=source.read(&signal)?{
-                        if signal.load(Ordering::Acquire){break}
+                        if signal.load(Ordering::Acquire){source.unread(&block)?;break}
                         let replay_position=match &source{Source::Replay{reader,..}=>Some(guard(reader).position_seconds()),_=>None};
                         let started=Instant::now();let mut e=guard(&engine);e.process_block(block.start,&block.raw)?;
                         let elapsed=started.elapsed().as_secs_f64()*1000.0;let block_ms=block.raw.len()as f64/2.0/e.input["sample_rate"].as_f64().unwrap_or(2_048_000.)*1000.0;
@@ -167,6 +170,20 @@ impl Drop for Runtime{fn drop(&mut self){self.shutdown_requested.store(true,Orde
         let root=folder();let mut writer=crate::recording::IQRecorder::new(&root,1000.,1_000_000.,json!({}),10000,10.).unwrap();writer.start(&[]).unwrap();writer.write(&[128;8],100).unwrap();writer.write(&[129;4],110).unwrap();let saved=writer.stop("test");
         let reader=Arc::new(Mutex::new(ReplayReader::new(saved["meta_path"].as_str().unwrap()).unwrap()));let mut source=Source::Replay{reader:reader.clone(),deadline:Instant::now()};let flag=AtomicBool::new(false);
         let first=source.read(&flag).unwrap().unwrap();let second=source.read(&flag).unwrap().unwrap();assert_eq!((first.start,first.raw.len()),(100,8));assert_eq!((second.start,second.raw.len()),(110,4));assert!((guard(&reader).position_seconds()-0.006).abs()<1e-9);drop(source);drop(reader);drop(writer);cleanup(&root);
+    }
+    #[test]fn replay_stop_while_pacing_or_after_read_keeps_every_sample(){
+        let root=folder();let total=2*BLOCK_SAMPLES+1000;let data:Vec<u8>=(0..total*2).map(|i|(i%251)as u8).collect();
+        let mut writer=crate::recording::IQRecorder::new(&root,2_048_000.,1_000_000.,json!({}),10_000_000,10.).unwrap();writer.start(&[]).unwrap();writer.write(&data,0).unwrap();let saved=writer.stop("test");
+        let reader=Arc::new(Mutex::new(ReplayReader::new(saved["meta_path"].as_str().unwrap()).unwrap()));
+        let stopped=AtomicBool::new(true);let running=AtomicBool::new(false);
+        // Deadline far ahead: the stop is always seen while pacing.
+        let mut paced=Source::Replay{reader:reader.clone(),deadline:Instant::now()+Duration::from_secs(3600)};
+        assert!(paced.read(&stopped).unwrap().is_none());assert_eq!(guard(&reader).position_samples,0);
+        let mut source=Source::Replay{reader:reader.clone(),deadline:Instant::now()};
+        let first=source.read(&running).unwrap().unwrap();source.unread(&first).unwrap();assert_eq!(guard(&reader).position_samples,0);
+        let mut source=Source::Replay{reader:reader.clone(),deadline:Instant::now()};let mut seen=Vec::new();
+        loop{match source.read(&running){Ok(Some(block))=>{assert_eq!(block.start,seen.len()as u64/2);seen.extend(block.raw)},Err(e)if e=="REPLAY_END"=>break,other=>panic!("{:?}",other.map(|b|b.map(|b|b.start)))}}
+        assert_eq!(seen.len(),total*2);assert!(seen==data);drop(paced);drop(source);drop(reader);drop(writer);cleanup(&root);
     }
     #[test]fn numeric_noop_alias_keeps_arm_and_usb_failure_latch_rejects_restart(){
         let root=folder();let runtime=Runtime::new(root.clone()).unwrap();{let mut e=guard(&runtime.engine);e.on_start("demo",json!({"sample_rate":2048000.,"center_hz":32256000.})).unwrap();e.apply(&json!({"action":"arm"})).unwrap();}
