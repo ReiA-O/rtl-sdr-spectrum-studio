@@ -76,7 +76,11 @@ impl Runtime {
         let (mut source,metadata)=match source_name{
             "live"=>{let library=guard(&self.library).clone().ok_or_else(||error("RTL-SDRのDLLを読み込めません。ドライバー準備の記録を確認してください。","DEVICE"))?;let source=RtlSource::open(library,&input,signal.clone()).map_err(|e|error(e,"DEVICE"))?;let metadata=source.metadata.clone();(Source::Live(source),metadata)},
             "demo"=>{(Source::Demo(DemoSource::new(&input)),json!({"name":"模擬IQ（実機ではありません）","sample_rate":input["sample_rate"],"center_hz":input["center_hz"],"synthetic":true,"gain_db_actual":null,"available_gains_db":[],"stream_start_utc":chrono::Utc::now().to_rfc3339(),"stream_clock_accuracy":"host_synthetic_clock"}))},
-            "replay"=>{let reader=guard(&self.replay_reader).clone().ok_or_else(||error("再生するIQファイルを選択してください。","REPLAY"))?;let metadata={let r=guard(&reader);json!({"name":"保存IQ","sample_rate":r.sample_rate,"center_hz":r.center_hz,"input_metadata":r.input_metadata,"stream_start_utc":r.input_metadata.get("stream_start_utc"),"replay_path":r.meta_path.to_string_lossy()})};(Source::Replay{reader,deadline:Instant::now()},metadata)},
+            "replay"=>{let reader=guard(&self.replay_reader).clone().ok_or_else(||error("再生するIQファイルを選択してください。","REPLAY"))?;
+                // Start after the end replays from the beginning; a mid-file stop resumes in place.
+                let ended={let r=guard(&reader);(r.position_samples>=r.total_samples).then(||r.global_sample_for(0))};
+                if let Some(global)=ended{guard(&self.engine).reset_for_seek(global).map_err(|e|error(e,"REPLAY"))?;guard(&reader).seek_samples(0).map_err(|e|error(e,"REPLAY"))?;}
+                let metadata={let r=guard(&reader);json!({"name":"保存IQ","sample_rate":r.sample_rate,"center_hz":r.center_hz,"input_metadata":r.input_metadata,"stream_start_utc":r.input_metadata.get("stream_start_utc"),"replay_path":r.meta_path.to_string_lossy()})};(Source::Replay{reader,deadline:Instant::now()},metadata)},
             _=>return Err(error("受信ソースが不正です。","SOURCE")),
         };
         guard(&self.engine).on_start(source_name,metadata).map_err(|e|error(e,"START"))?;
@@ -184,6 +188,29 @@ impl Drop for Runtime{fn drop(&mut self){self.shutdown_requested.store(true,Orde
         let mut source=Source::Replay{reader:reader.clone(),deadline:Instant::now()};let mut seen=Vec::new();
         loop{match source.read(&running){Ok(Some(block))=>{assert_eq!(block.start,seen.len()as u64/2);seen.extend(block.raw)},Err(e)if e=="REPLAY_END"=>break,other=>panic!("{:?}",other.map(|b|b.map(|b|b.start)))}}
         assert_eq!(seen.len(),total*2);assert!(seen==data);drop(paced);drop(source);drop(reader);drop(writer);cleanup(&root);
+    }
+    fn replay_runtime(root:&std::path::Path,samples:usize)->(Arc<Runtime>,Arc<Mutex<ReplayReader>>){
+        let data:Vec<u8>=(0..samples*2).map(|i|(i%251)as u8).collect();let mut writer=crate::recording::IQRecorder::new(root,2_048_000.,1_000_000.,json!({}),100_000_000,10.).unwrap();writer.start(&[]).unwrap();writer.write(&data,0).unwrap();let saved=writer.stop("test");
+        let runtime=Runtime::new(root.to_path_buf()).unwrap();runtime.action(json!({"action":"replay_open","path":saved["meta_path"]})).unwrap();let reader=guard(&runtime.replay_reader).clone().unwrap();(runtime,reader)
+    }
+    fn wait_stopped(runtime:&Runtime){let until=Instant::now()+Duration::from_secs(20);while runtime.state()["running"].as_bool().unwrap(){assert!(Instant::now()<until,"replay did not stop");thread::sleep(Duration::from_millis(5));}}
+    #[test]fn replay_start_after_end_rewinds_and_reads_every_sample(){
+        let root=folder();let total=2*BLOCK_SAMPLES+1000;let (runtime,reader)=replay_runtime(&root,total);
+        let ended=|r:&Runtime|r.state()["notifications"].as_array().unwrap().iter().filter(|n|n["message"].as_str().is_some_and(|m|m.contains("最後まで再生しました"))).count();
+        for run in 1..=2{
+            runtime.action(json!({"action":"start"})).unwrap();wait_stopped(&runtime);let state=runtime.state();
+            assert!(state["device"]["error"].is_null(),"{}",state["device"]["error"]);assert_eq!(guard(&reader).position_samples,total as u64);
+            assert_eq!(state["performance"]["input_samples"],total);assert!((state["replay"]["position_seconds"].as_f64().unwrap()-total as f64/2_048_000.).abs()<1e-9);assert_eq!(ended(&runtime),run);
+        }
+        runtime.shutdown();drop(reader);drop(runtime);cleanup(&root);
+    }
+    #[test]fn replay_start_after_mid_stop_resumes_in_place(){
+        let root=folder();let total=4*BLOCK_SAMPLES;let (runtime,reader)=replay_runtime(&root,total);
+        runtime.action(json!({"action":"replay_seek","seconds":2.0*BLOCK_SAMPLES as f64/2_048_000.})).unwrap();let resume=guard(&reader).position_samples;assert!(resume>BLOCK_SAMPLES as u64&&resume<total as u64);
+        runtime.action(json!({"action":"start"})).unwrap();runtime.action(json!({"action":"stop"})).unwrap();
+        let position=guard(&reader).position_samples;assert!(position>=resume&&position<total as u64,"{position} vs {resume}");
+        assert!(runtime.state()["replay"]["position_seconds"].as_f64().unwrap()>=resume as f64/2_048_000.-1e-9);
+        runtime.shutdown();drop(reader);drop(runtime);cleanup(&root);
     }
     #[test]fn numeric_noop_alias_keeps_arm_and_usb_failure_latch_rejects_restart(){
         let root=folder();let runtime=Runtime::new(root.clone()).unwrap();{let mut e=guard(&runtime.engine);e.on_start("demo",json!({"sample_rate":2048000.,"center_hz":32256000.})).unwrap();e.apply(&json!({"action":"arm"})).unwrap();}

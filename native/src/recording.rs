@@ -348,6 +348,7 @@ impl ReplayReader {
         }
         let file = File::open(&data_path).map_err(|e| e.to_string())?;
         let bytes = file.metadata().map_err(|e| e.to_string())?.len();
+        if bytes == 0 { return Err("IQデータが空です（サンプルが0件のため再生できません）".into()); }
         if bytes%2 != 0 { return Err("truncated interleaved I/Q sample pair".into()); }
         let mut captures = metadata["captures"].as_array().cloned().unwrap_or_default();
         captures.sort_by_key(|c| c["core:sample_start"].as_u64().unwrap_or(0));
@@ -551,6 +552,13 @@ mod tests {
         let mut limited=IQRecorder::new(&path,10.0,1e6,json!({}),10,1.0).unwrap();limited.start(&[]).unwrap();
         assert_eq!(limited.write(&raw(10,128),0).unwrap(),5);assert!(!limited.active&&limited.limit_reached);
         assert_eq!(limited.stop_reason.as_deref(),Some("size_limit"));
+    }
+    #[test]
+    fn replay_rejects_empty_iq_data(){
+        let path=dir();let mut r=IQRecorder::new(&path,10.0,1e6,json!({}),1000,1.0).unwrap();r.start(&[]).unwrap();r.stop("manual");
+        let meta=r.meta_path.clone().unwrap();let data=meta.with_extension("sigmf-data");assert_eq!(fs::metadata(&data).unwrap().len(),0);
+        assert!(ReplayReader::new(&meta).err().unwrap().contains("IQデータが空です"));
+        fs::write(&data,[1u8]).unwrap();assert_eq!(ReplayReader::new(&meta).err().unwrap(),"truncated interleaved I/Q sample pair");
     }
     #[test]
     fn duration_cap_includes_source_gaps(){

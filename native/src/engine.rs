@@ -455,6 +455,7 @@ impl Engine {
         self.iq_triggered=false;self.iq_start_sample=None;
         if reason=="input_change"{self.pending_input_change=true;}
         else{self.pending_input_change=false;for v in &mut self.vfos{if let Some(writer)=v.wav.as_mut().filter(|r|r.active){writer.stop(reason);}}}
+        if reason=="replay_end"{self.notify("IQの最後まで再生しました。もう一度「再生開始」で先頭から再生します。","info");}
     }
     pub fn reset_for_seek(&mut self,sample:u64)->Result<(),String>{
         if self.input_locked()||self.wav_active(){return Err("IQ/トリガ/WAVを停止してからシークしてください".into());}
