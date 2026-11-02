@@ -435,6 +435,7 @@ impl Engine {
         self.running=false;self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();self.trigger.disarm();
         if reason!="input_change"{
             // The WAV closes here: drain the demodulator filter tail first.
+            // Playback is not drained: audio_chunks was cleared above and the epoch bump flushes the browser queue.
             let mut issues=vec![];
             for v in &mut self.vfos{
                 let(Some(writer),Some(demod))=(v.wav.as_mut().filter(|w|w.active),v.demod.as_mut())else{continue;};
@@ -1323,6 +1324,17 @@ mod tests{
         let streamed=e.vfos[0].wav.as_ref().unwrap().samples_written;let delay=e.vfos[0].demod.as_ref().unwrap().group_delay_samples();e.on_stop("manual");
         let wav=e.vfos[0].wav.as_ref().unwrap();assert!(!wav.active);assert!(wav.samples_written>streamed);
         assert!(wav.samples_written<=streamed+(delay*AUDIO_RATE as u64).div_ceil(2048000)+1,"{} {streamed} {delay}",wav.samples_written);
+    }
+    #[test]
+    fn closing_stop_drains_the_tail_once_and_only_into_wav(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.process_block(0,&reception_fm_iq(65536)).unwrap();
+        let(sequence,epoch)=(e.audio_sequence,e.audio_epoch);assert!(!e.audio_chunks.is_empty());let streamed=e.vfos[0].wav.as_ref().unwrap().samples_written;
+        e.on_stop("manual");let written=e.vfos[0].wav.as_ref().unwrap().samples_written;assert!(written>streamed);
+        // The tail reached the WAV only: the playback queue stays empty and its sequence does not move.
+        assert!(e.audio_chunks.is_empty());assert_eq!(e.audio_sequence,sequence);assert_eq!(e.audio_epoch,epoch+1);
+        assert!(e.vfos[0].demod.as_mut().unwrap().flush().is_empty());
+        e.on_stop("manual");assert_eq!(e.vfos[0].wav.as_ref().unwrap().samples_written,written);assert!(e.audio_chunks.is_empty());assert_eq!(e.audio_sequence,sequence);
     }
     #[test]
     fn wav_split_destination_failure_returns_applied_configuration_with_explicit_recording_error(){

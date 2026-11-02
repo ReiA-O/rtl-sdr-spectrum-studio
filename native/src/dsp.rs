@@ -789,12 +789,16 @@ impl VfoDemodulator {
     /// End-of-stream drain: zero IQ pushes the samples still held in the FIR
     /// histories through the normal path. Output stops at the audio span of
     /// the real input plus its group delay, so no padding is emitted.
+    /// Recovers only the group delay D, not the whole taps-1 history: audio past
+    /// ceil((N+D)*ar/fs) would describe time after the last real sample. The
+    /// padding is not counted as input, so a repeated flush adds nothing; still
+    /// reset() before new input. Engine::on_stop sends it to WAV only, not audio_chunks.
     pub fn flush(&mut self)->Vec<f32>{
         if self.input_count==0{return Vec::new();}
-        let delay=self.group_delay_samples();let before=self.output_count;
-        let limit=(((self.input_count+delay)as f64*self.audio_rate as f64/self.sample_rate)-1e-9).ceil().max(0.0) as u64;
+        let delay=self.group_delay_samples();let before=self.output_count;let real=self.input_count;
+        let limit=(((real+delay)as f64*self.audio_rate as f64/self.sample_rate)-1e-9).ceil().max(0.0) as u64;
         let pad=delay+2*self.factor as u64+(self.sample_rate/self.audio_rate as f64).ceil() as u64;
-        let(mut audio,_,_)=self.process_segment(&vec![Complex32::new(0.0,0.0);pad as usize]);
+        let(mut audio,_,_)=self.process_segment(&vec![Complex32::new(0.0,0.0);pad as usize]);self.input_count=real;
         audio.truncate(limit.saturating_sub(before) as usize);audio
     }
     pub fn set_afc(&mut self,enabled:bool,max_hz:f64)->Result<(),String>{
@@ -1327,6 +1331,48 @@ mod tests {
             assert!(audio.len()>streamed&&audio.len()<=limit&&audio.iter().all(|v|v.is_finite()),"{mode}: {streamed} {} {limit}",audio.len());
         }
         let mut idle=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);assert!(idle.flush().is_empty());
+    }
+    fn flush_test_iq(mode:&str,length:usize,fs:f64)->Vec<Complex32>{if ssb_mode(mode){ssb_test_iq(length,fs,&[(17000.0,0.1)])}else{analog_signal(0,length,fs,16000.0,0.0,mode)}}
+    const FLUSH_MODES:[(&str,f64);4]=[("AM",12000.0),("NFM",25000.0),("WFM",200000.0),("USB",2700.0)];
+    #[test]
+    fn flush_after_reset_or_idle_is_empty_and_one_flush_stops_at_the_limit(){
+        let fs=256000.0;let n=128000usize;
+        for(mode,bw)in FLUSH_MODES{
+            let mut d=VfoDemodulator::new(fs,16000.0,bw,mode,32000);assert!(d.flush().is_empty(),"{mode}: no input, no tail");
+            let streamed=d.process(&flush_test_iq(mode,n,fs)).len();let limit=((n as u64+d.group_delay_samples())*32000).div_ceil(256000)as usize;
+            assert_eq!(streamed+d.flush().len(),limit,"{mode}");
+            d.process(&flush_test_iq(mode,n,fs));d.reset();assert!(d.flush().is_empty(),"{mode}: reset discards the held tail");
+        }
+    }
+    #[test]
+    fn repeated_flush_without_reset_adds_no_audio(){
+        let fs=256000.0;let n=128000usize;
+        for(mode,bw)in FLUSH_MODES{
+            let mut d=VfoDemodulator::new(fs,16000.0,bw,mode,32000);d.process(&flush_test_iq(mode,n,fs));d.flush();
+            let again=d.flush();assert!(again.is_empty(),"{mode}: second flush emitted {} samples (peak {})",again.len(),again.iter().fold(0.0f32,|m,v|m.max(v.abs())));
+        }
+    }
+    #[test]
+    fn flushed_analog_tail_matches_continued_demodulation_until_the_last_quarter_millisecond(){
+        // 0.5 s of 1 kHz modulation: 10 DC-tracker time constants (50 ms), so the
+        // streamed part is steady. The tail (<=1.4 ms) moves the DC/de-emphasis
+        // IIR states by at most 1-exp(-1.4/50)=2.8% of the edge deviation.
+        let fs=256000.0;let n=128000usize;let edge=8;// 0.25 ms: past the channel (>=6 kHz) and audio (>=4.8 kHz) FIR main lobes
+        // The last `edge` samples are the truncation transient itself: only bounded against blow-up (measured AM 1.55, NFM 2.53, WFM 0.85 x steady peak).
+        let rms=|part:&[f32]|(part.iter().map(|v|(*v as f64).powi(2)).sum::<f64>()/part.len()as f64).sqrt();
+        // Expected demodulated 1 kHz amplitude: AM depth 0.3; NFM 2.5 kHz/5 kHz; WFM 30 kHz/75 kHz x 50 us de-emphasis x WFM scale 0.5.
+        let wfm=0.4/(1.0+(TAU*1000.0*50e-6).powi(2)).sqrt()*0.5;
+        for((mode,bw),amplitude)in FLUSH_MODES[..3].iter().zip([0.3,0.5,wfm]){
+            let mut d=VfoDemodulator::new(fs,16000.0,*bw,mode,32000);let mut audio=d.process(&flush_test_iq(mode,n,fs));let streamed=audio.len();audio.extend(d.flush());
+            // Reference: the same signal continued past n, so it carries no end-of-input effect.
+            let reference=VfoDemodulator::new(fs,16000.0,*bw,mode,32000).process(&flush_test_iq(mode,n+25600,fs));
+            let len=audio.len();let steady=rms(&audio[8000..12000]);let expected=amplitude/2f64.sqrt();
+            let error=audio[streamed..len-edge].iter().zip(&reference[streamed..len-edge]).map(|(a,b)|(a-b).abs()as f64).fold(0.0,f64::max)/steady;
+            let window=rms(&audio[len-64..])/steady;let peak=audio[len-edge..].iter().fold(0.0f32,|m,v|m.max(v.abs()))as f64/(steady*2f64.sqrt());
+            println!("{mode}: tail={} steady_rms={steady:.4} expected={expected:.4} max_tail_error/steady={error:.4} last_64_rms/steady={window:.4} edge_peak/steady_peak={peak:.3}",len-streamed);
+            assert!(audio.iter().all(|v|v.is_finite()),"{mode}");assert!((steady/expected-1.0).abs()<0.02,"{mode}: steady rms={steady} expected={expected}");
+            assert!(error<0.1,"{mode}: tail error {error}");assert!((0.9..1.15).contains(&window),"{mode}: last 2 ms rms ratio {window}");assert!(peak<4.0,"{mode}: edge peak {peak}");
+        }
     }
     #[test]
     fn ssb_predecimator_rejects_a_tone_that_would_alias_into_audio(){

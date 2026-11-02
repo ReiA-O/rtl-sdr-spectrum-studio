@@ -212,6 +212,65 @@ impl Drop for Runtime{fn drop(&mut self){self.shutdown_requested.store(true,Orde
         assert!(runtime.state()["replay"]["position_seconds"].as_f64().unwrap()>=resume as f64/2_048_000.-1e-9);
         runtime.shutdown();drop(reader);drop(runtime);cleanup(&root);
     }
+    fn gapped_replay(root:&std::path::Path,first:usize,skip:u64,second:usize)->Arc<Mutex<ReplayReader>>{
+        let mut writer=crate::recording::IQRecorder::new(root,2_048_000.,1_000_000.,json!({}),100_000_000,10.).unwrap();writer.start(&[]).unwrap();
+        writer.write(&vec![128;first*2],0).unwrap();writer.write(&vec![130;second*2],first as u64+skip).unwrap();let saved=writer.stop("test");
+        let reader=ReplayReader::new(saved["meta_path"].as_str().unwrap()).unwrap();assert_eq!(reader.captures.len(),2);Arc::new(Mutex::new(reader))
+    }
+    fn drain_replay(source:&mut Source,e:&mut Engine)->Vec<u64>{
+        let flag=AtomicBool::new(false);let mut starts=vec![];
+        loop{match source.read(&flag){Ok(Some(block))=>{starts.push(block.start);e.process_block(block.start,&block.raw).unwrap()},Err(x)if x=="REPLAY_END"=>break starts,other=>panic!("{:?}",other.map(|b|b.map(|b|b.start)))}}
+    }
+    #[test]fn replay_rewind_around_a_capture_gap_keeps_boundary_start_and_gap_detection(){
+        let root=folder();let first=BLOCK_SAMPLES+500;let skip=12_345u64;let second=BLOCK_SAMPLES/2;
+        let (block,boundary)=(BLOCK_SAMPLES as u64,first as u64);let (resumed,end)=(boundary+skip,boundary+skip+second as u64);
+        let reader=gapped_replay(&root,first,skip,second);let running=AtomicBool::new(false);let stopped=AtomicBool::new(true);
+        let replay=||Source::Replay{reader:reader.clone(),deadline:Instant::now()};let position=||guard(&reader).position_samples;
+        // A block cut short at the capture start rewinds to its own start, never across the boundary.
+        guard(&reader).seek_samples(block).unwrap();let mut source=replay();let cut=source.read(&running).unwrap().unwrap();
+        assert_eq!((cut.start,cut.raw.len(),position()),(block,1000,boundary));source.unread(&cut).unwrap();assert_eq!(position(),block);
+        // Stops at the first block of the second capture leave the reader on the boundary; the re-read keeps its global start.
+        guard(&reader).seek_samples(boundary).unwrap();let mut paced=Source::Replay{reader:reader.clone(),deadline:Instant::now()+Duration::from_secs(3600)};
+        assert!(paced.read(&stopped).unwrap().is_none());assert_eq!(position(),boundary);
+        let mut source=replay();let after=source.read(&running).unwrap().unwrap();assert_eq!((after.start,after.raw.len()),(resumed,second*2));
+        source.unread(&after).unwrap();assert_eq!(position(),boundary);assert_eq!(source.read(&running).unwrap().unwrap().start,resumed);
+        let mut e=Engine::new(root.clone()).unwrap();let metadata=json!({"sample_rate":2_048_000.,"center_hz":1_000_000.});
+        let notices=|e:&Engine|e.state()["notifications"].as_array().unwrap().iter().filter(|n|n["message"].as_str().is_some_and(|m|m.contains(&format!("入力欠落を検出：{skip} samples")))).count();
+        // Uninterrupted: the boundary is one gap of `skip` samples.
+        guard(&reader).seek_samples(0).unwrap();e.on_start("replay",metadata.clone()).unwrap();
+        assert_eq!(drain_replay(&mut replay(),&mut e),vec![0,block,resumed]);assert_eq!((e.performance["gap_samples"].as_u64(),e.performance["input_samples"].as_u64()),(Some(skip),Some(end)));assert_eq!(notices(&e),1);e.on_stop("replay_end");
+        // Stop with the last pre-boundary block unread: the resumed run still detects the gap at the boundary.
+        guard(&reader).seek_samples(0).unwrap();e.on_start("replay",metadata.clone()).unwrap();let mut source=replay();
+        let b=source.read(&running).unwrap().unwrap();e.process_block(b.start,&b.raw).unwrap();let b=source.read(&running).unwrap().unwrap();source.unread(&b).unwrap();e.on_stop("manual");
+        e.on_start("replay",metadata.clone()).unwrap();assert_eq!(drain_replay(&mut replay(),&mut e),vec![block,resumed]);
+        assert_eq!((e.performance["gap_samples"].as_u64(),e.performance["input_samples"].as_u64()),(Some(skip),Some(end)));assert_eq!(notices(&e),2);e.on_stop("replay_end");
+        // Stop with the first post-boundary block unread: the resumed run starts at that capture's global index.
+        // on_start resets the DSP and its gap tracking, so the boundary is not reported a second time.
+        guard(&reader).seek_samples(0).unwrap();e.on_start("replay",metadata.clone()).unwrap();let mut source=replay();
+        for _ in 0..2{let b=source.read(&running).unwrap().unwrap();e.process_block(b.start,&b.raw).unwrap();}
+        let b=source.read(&running).unwrap().unwrap();assert_eq!(b.start,resumed);source.unread(&b).unwrap();e.on_stop("manual");assert_eq!(position(),boundary);
+        e.on_start("replay",metadata).unwrap();assert_eq!(drain_replay(&mut replay(),&mut e),vec![resumed]);
+        assert_eq!((e.performance["gap_samples"].as_u64(),e.performance["input_samples"].as_u64()),(Some(0),Some(end)));assert_eq!(notices(&e),2);
+        e.on_stop("replay_end");drop(e);drop(paced);drop(source);drop(reader);cleanup(&root);
+    }
+    #[test]fn replay_stop_start_cycles_lose_no_block_and_finish_every_sample(){
+        let root=folder();let total=12*BLOCK_SAMPLES;let (runtime,reader)=replay_runtime(&root,total);let position=||guard(&reader).position_samples;
+        let processed=|r:&Runtime|r.state()["performance"]["input_samples"].as_u64().unwrap();let mut previous=0u64;
+        for cycle in 0..4{
+            runtime.action(json!({"action":"start"})).unwrap();
+            // Even cycles stop at once (mostly while pacing the first block); odd cycles wait for a processed block.
+            if cycle%2==1{let until=Instant::now()+Duration::from_secs(20);while processed(&runtime)<=previous{assert!(Instant::now()<until,"cycle {cycle}: no block processed");thread::sleep(Duration::from_millis(2));}}
+            runtime.action(json!({"action":"stop"})).unwrap();let state=runtime.state();
+            assert!(!state["running"].as_bool().unwrap());assert!(state["device"]["error"].is_null(),"{}",state["device"]["error"]);
+            // No read block is dropped: the reader sits at the end of the last processed block, or where the cycle began.
+            let done=processed(&runtime);let now=position();assert_eq!(now,if done>0{done}else{previous},"cycle {cycle}");
+            assert!(now>=previous&&now<total as u64,"cycle {cycle}: {now}");previous=now;
+        }
+        assert!(previous>0);runtime.action(json!({"action":"start"})).unwrap();wait_stopped(&runtime);let state=runtime.state();
+        assert!(state["device"]["error"].is_null(),"{}",state["device"]["error"]);assert_eq!(state["performance"]["input_samples"],total);assert_eq!(position(),total as u64);
+        assert_eq!(state["notifications"].as_array().unwrap().iter().filter(|n|n["message"].as_str().is_some_and(|m|m.contains("最後まで再生しました"))).count(),1);
+        runtime.shutdown();drop(reader);drop(runtime);cleanup(&root);
+    }
     #[test]fn numeric_noop_alias_keeps_arm_and_usb_failure_latch_rejects_restart(){
         let root=folder();let runtime=Runtime::new(root.clone()).unwrap();{let mut e=guard(&runtime.engine);e.on_start("demo",json!({"sample_rate":2048000.,"center_hz":32256000.})).unwrap();e.apply(&json!({"action":"arm"})).unwrap();}
         runtime.action(json!({"action":"set_input","patch":{"center_hz":32256000}})).unwrap();assert!(runtime.state()["trigger"]["armed"].as_bool().unwrap());assert!(runtime.state()["running"].as_bool().unwrap());runtime.action(json!({"action":"stop"})).unwrap();*guard(&runtime.live_blocked)=Some("test timeout".into());let result=runtime.action(json!({"action":"start","source":"live"}));assert_eq!(result.unwrap_err().code,"DEVICE_BUSY");runtime.shutdown();drop(runtime);cleanup(&root);
