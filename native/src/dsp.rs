@@ -780,6 +780,23 @@ impl VfoDemodulator {
             phase:0.0,input_count:0,previous_iq:None,channel_count:0,output_count:0,previous_audio:None,afc:AfcTracker::new()})
     }
     pub fn reset(&mut self){let(enabled,max_hz)=(self.afc.enabled,self.afc.max_hz);*self=Self::new(self.sample_rate,self.frequency_offset_hz,self.bandwidth_hz,&self.mode,self.audio_rate);self.afc.configure(enabled,max_hz).expect("existing AFC config");}
+    /// Input samples between an IQ sample and its audio: linear-phase FIR
+    /// group delays at input rate. Linear interpolation adds no delay.
+    pub(crate) fn group_delay_samples(&self)->u64{
+        let half=|filter:&Option<Fir>|filter.as_ref().map_or(0,|f|(f.taps as u64-1)/2);
+        (self.channel_filter.taps as u64-1)/2+self.factor as u64*(half(&self.sideband_filter)+half(&self.audio_filter))
+    }
+    /// End-of-stream drain: zero IQ pushes the samples still held in the FIR
+    /// histories through the normal path. Output stops at the audio span of
+    /// the real input plus its group delay, so no padding is emitted.
+    pub fn flush(&mut self)->Vec<f32>{
+        if self.input_count==0{return Vec::new();}
+        let delay=self.group_delay_samples();let before=self.output_count;
+        let limit=(((self.input_count+delay)as f64*self.audio_rate as f64/self.sample_rate)-1e-9).ceil().max(0.0) as u64;
+        let pad=delay+2*self.factor as u64+(self.sample_rate/self.audio_rate as f64).ceil() as u64;
+        let(mut audio,_,_)=self.process_segment(&vec![Complex32::new(0.0,0.0);pad as usize]);
+        audio.truncate(limit.saturating_sub(before) as usize);audio
+    }
     pub fn set_afc(&mut self,enabled:bool,max_hz:f64)->Result<(),String>{
         if enabled&&ssb_mode(&self.mode){return Err("SSBではAFCを有効にできません。抑圧搬送波の基準を手動で同調してください".into());}
         self.afc.configure(enabled,max_hz)
@@ -1264,16 +1281,19 @@ mod tests {
         }
     }
     #[test]
-    fn ssb_chunking_preserves_nco_decimation_and_audio_positions(){
-        let fs=1024000.0;let reference=-37000.0;let iq=ssb_test_iq(131072,fs,&[(reference+1000.0,0.1),(reference-1700.0,0.08)]);
-        let mut a=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);let whole=a.process(&iq);
-        let mut b=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);let mut split=vec![];let mut cursor=0;
-        let sizes=[1,7,37,997,8192,12001,4096,32768];let mut index=0;
-        while cursor<iq.len(){let end=(cursor+sizes[index%sizes.len()]).min(iq.len());split.extend(b.process(&iq[cursor..end]));cursor=end;index+=1;}
-        assert_eq!(whole.len(),split.len());assert_eq!(a.input_count,b.input_count);assert_eq!(a.output_count,b.output_count);
-        let phase_error=(a.phase-b.phase+PI).rem_euclid(TAU)-PI;assert!(phase_error.abs()<1e-7);
-        let maximum=whole.iter().zip(&split).map(|(x,y)|(*x as f64-*y as f64).abs()).fold(0.0_f64,f64::max);
-        assert!(maximum<2e-4,"max chunk error={maximum}");
+    fn ssb_usb_and_lsb_chunking_preserve_nco_decimation_and_audio_positions(){
+        let fs=1024000.0;let reference=-37000.0;
+        for(mode,sign)in [("USB",1.0),("LSB",-1.0)]{
+            let iq=ssb_test_iq(131072,fs,&[(reference+sign*1000.0,0.1),(reference-sign*1700.0,0.08)]);
+            let mut a=VfoDemodulator::new(fs,reference,2700.0,mode,32000);let whole=a.process(&iq);
+            let mut b=VfoDemodulator::new(fs,reference,2700.0,mode,32000);let mut split=vec![];let mut cursor=0;
+            let sizes=[1,7,37,997,8192,12001,4096,32768];let mut index=0;
+            while cursor<iq.len(){let end=(cursor+sizes[index%sizes.len()]).min(iq.len());split.extend(b.process(&iq[cursor..end]));cursor=end;index+=1;}
+            assert_eq!(whole.len(),split.len(),"{mode}");assert_eq!(a.input_count,b.input_count,"{mode}");assert_eq!(a.output_count,b.output_count,"{mode}");
+            let phase_error=(a.phase-b.phase+PI).rem_euclid(TAU)-PI;assert!(phase_error.abs()<1e-7,"{mode}: phase error={phase_error}");
+            let maximum=whole.iter().zip(&split).map(|(x,y)|(*x as f64-*y as f64).abs()).fold(0.0_f64,f64::max);
+            assert!(maximum<2e-4,"{mode}: max chunk error={maximum}");
+        }
     }
     #[test]
     fn ssb_reset_and_empty_chunks_preserve_the_stream_contract(){
@@ -1284,6 +1304,29 @@ mod tests {
         demod.reset();let reset=demod.process(&iq);let mut fresh=VfoDemodulator::new(64000.0,8000.0,2700.0,"USB",32000);let expected=fresh.process(&iq);
         assert_eq!(reset.len(),expected.len());assert!(reset.iter().zip(expected).all(|(x,y)|(*x-y).abs()<1e-6));
         assert_eq!(demod.afc_status()["afc_status"],"unsupported_mode");
+    }
+    #[test]
+    fn flush_emits_the_filter_tail_without_padding_audio(){
+        let fs=64000.0;let reference=8000.0;let length=64000;let burst=320;
+        for(mode,sign)in [("USB",1.0),("LSB",-1.0)]{
+            let mut iq=vec![Complex32::new(0.0,0.0);length-burst];iq.extend(ssb_test_iq(burst,fs,&[(reference+sign*1000.0,0.1)]));
+            let mut demod=VfoDemodulator::new(fs,reference,2700.0,mode,32000);let mut audio=demod.process(&iq);let streamed=audio.len();
+            let delay=demod.group_delay_samples();assert_eq!(delay,(demod.channel_filter.taps as u64-1)/2+(demod.sideband_filter.as_ref().unwrap().taps as u64-1)/2);
+            let rms=|part:&[f32]|(part.iter().map(|v|(*v as f64).powi(2)).sum::<f64>()/part.len()as f64).sqrt();
+            assert!(rms(&audio[streamed-160..])<0.005,"{mode}: burst must still be held in the filters");
+            audio.extend(demod.flush());
+            let limit=((length as u64+delay)*32000).div_ceil(64000)as usize;assert_eq!(audio.len(),limit,"{mode}");
+            // The 5 ms burst maps to [length+delay-burst, length+delay) input samples; skip 1 ms edges.
+            let first=(length as u64+delay-burst as u64)as usize/2+32;let burst_rms=rms(&audio[first..first+96]);
+            assert!((0.06..0.08).contains(&burst_rms),"{mode}: burst rms={burst_rms}");
+        }
+        for(mode,bw)in [("AM",12000.0),("NFM",25000.0),("WFM",200000.0)]{
+            let fs=512000.0;let iq=analog_signal(0,51200,fs,74000.0,0.0,mode);let mut demod=VfoDemodulator::new(fs,74000.0,bw,mode,32000);
+            let mut audio=demod.process(&iq);let streamed=audio.len();audio.extend(demod.flush());
+            let limit=((51200+demod.group_delay_samples())*32000).div_ceil(512000)as usize;
+            assert!(audio.len()>streamed&&audio.len()<=limit&&audio.iter().all(|v|v.is_finite()),"{mode}: {streamed} {} {limit}",audio.len());
+        }
+        let mut idle=VfoDemodulator::new(fs,reference,2700.0,"USB",32000);assert!(idle.flush().is_empty());
     }
     #[test]
     fn ssb_predecimator_rejects_a_tone_that_would_alias_into_audio(){

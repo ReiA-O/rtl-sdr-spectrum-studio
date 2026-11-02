@@ -433,6 +433,23 @@ impl Engine {
         self.invalidate_modulation("stopped");
         self.reset_frontend_state();
         self.running=false;self.audio_epoch=self.audio_epoch.saturating_add(1);self.audio_chunks.clear();self.trigger.disarm();
+        if reason!="input_change"{
+            // The WAV closes here: drain the demodulator filter tail first.
+            let mut issues=vec![];
+            for v in &mut self.vfos{
+                let(Some(writer),Some(demod))=(v.wav.as_mut().filter(|w|w.active),v.demod.as_mut())else{continue;};
+                let tail=demod.flush();if tail.is_empty(){continue;}
+                let before=v.audio_processor.status();let processed=v.audio_processor.process(&tail,before["rf_dbfs"].as_f64().unwrap_or(f64::NAN));
+                let after=v.audio_processor.status();let mut observation=json!({"observed_audio_samples":tail.len(),"demod_overrange_samples":tail.iter().filter(|a|a.is_finite()&&a.abs()>1.0).count()});
+                for key in ["pre_overload_samples","limited_samples","muted_samples","invalid_samples","boundary_repairs"]{
+                    observation[key]=json!(after[key].as_u64().unwrap_or(0).saturating_sub(before[key].as_u64().unwrap_or(0)));
+                }
+                writer.observe_processing(&observation);
+                let audio=if v.reception.wav_audio=="processed"{&processed}else{&tail};
+                if let Err(error)=writer.write(audio){issues.push(format!("VFO {}のWAV保存を停止：{error}",v.id));}
+            }
+            for issue in issues{self.notify(&issue,"warning");}
+        }
         for v in &mut self.vfos{v.audio_processor.note_gap();if let Some(d)=v.demod.as_mut(){d.reset();}v.reception_status=json!({"available":false,"reason":"stopped"});}
         if let Some(writer)=self.iq.as_mut().filter(|r|r.active){self.iq_last=writer.stop(reason);}
         self.iq_triggered=false;self.iq_start_sample=None;
@@ -1295,6 +1312,16 @@ mod tests{
         let previous:Value=serde_json::from_slice(&fs::read(old_meta).unwrap()).unwrap();assert_eq!(previous["stop_reason"],"conditions_changed");
         assert_eq!(previous["conditions"]["reception"]["audio_gain_db"],6.0);assert_eq!(previous["route"],"demod");assert!(previous["processing_summary"]["observed_audio_samples"].as_u64().unwrap()>0);
         e.process_block(65536,&reception_fm_iq(32768)).unwrap();assert_eq!(e.vfos[0].wav.as_ref().unwrap().processing_summary["observed_blocks"],1);e.on_stop("test");
+    }
+    #[test]
+    fn closing_stop_writes_demodulator_tail_to_wav_but_input_change_does_not(){
+        let mut e=engine();e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();
+        e.apply(&json!({"action":"wav_start","id":1})).unwrap();e.process_block(0,&reception_fm_iq(65536)).unwrap();
+        let streamed=e.vfos[0].wav.as_ref().unwrap().samples_written;e.on_stop("input_change");assert_eq!(e.vfos[0].wav.as_ref().unwrap().samples_written,streamed);
+        e.on_start("demo",json!({"sample_rate":2048000,"center_hz":32256000})).unwrap();e.process_block(0,&reception_fm_iq(65536)).unwrap();
+        let streamed=e.vfos[0].wav.as_ref().unwrap().samples_written;let delay=e.vfos[0].demod.as_ref().unwrap().group_delay_samples();e.on_stop("manual");
+        let wav=e.vfos[0].wav.as_ref().unwrap();assert!(!wav.active);assert!(wav.samples_written>streamed);
+        assert!(wav.samples_written<=streamed+(delay*AUDIO_RATE as u64).div_ceil(2048000)+1,"{} {streamed} {delay}",wav.samples_written);
     }
     #[test]
     fn wav_split_destination_failure_returns_applied_configuration_with_explicit_recording_error(){
